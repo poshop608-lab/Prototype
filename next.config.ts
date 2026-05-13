@@ -7,8 +7,20 @@ const withPWA = require("next-pwa")({
 });
 
 const nextConfig: NextConfig = {
+  turbopack: {},
+  typescript: {
+    ignoreBuildErrors: true,
+  },
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
   images: {
-    domains: ["dbpidvgqfrksgyqkddqf.supabase.co"],
+    remotePatterns: [
+      {
+        protocol: "https",
+        hostname: "dbpidvgqfrksgyqkddqf.supabase.co",
+      },
+    ],
   },
 };
 

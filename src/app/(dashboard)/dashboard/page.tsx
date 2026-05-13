@@ -21,18 +21,21 @@ export default async function DashboardPage() {
       .single(),
   ]);
 
+  const scans = (scansResult.data || []) as any[];
+  const profile = profileResult.data as any;
+
   const stats = {
-    total: scansResult.data?.length || 0,
-    completed: scansResult.data?.filter((s) => s.status === "completed").length || 0,
-    processing: scansResult.data?.filter((s) => s.status === "processing").length || 0,
-    pending: scansResult.data?.filter((s) => s.status === "pending").length || 0,
+    total: scans.length,
+    completed: scans.filter((s: any) => s.status === "completed").length,
+    processing: scans.filter((s: any) => s.status === "processing").length,
+    pending: scans.filter((s: any) => s.status === "pending").length,
   };
 
   return (
     <DashboardClient
-      recentScans={scansResult.data || []}
+      recentScans={scans}
       stats={stats}
-      profile={profileResult.data}
+      profile={profile}
     />
   );
 }

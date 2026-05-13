@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { createServerClient } from "@/lib/supabase/server";
 import { AdminClient } from "./admin-client";
+import type { UserRole } from "@/types/database";
 
 export default async function AdminPage() {
   const supabase = createServerClient();
@@ -8,17 +9,19 @@ export default async function AdminPage() {
     data: { session },
   } = await supabase.auth.getSession();
 
-  const { data: profile } = await supabase
+  const { data: profileData } = await supabase
     .from("profiles")
     .select("role")
     .eq("id", session!.user.id)
     .single();
 
+  const profile = profileData as { role: UserRole } | null;
+
   if (profile?.role !== "admin") {
     redirect("/dashboard");
   }
 
-  const [scansResult, usersResult, statsResult] = await Promise.all([
+  const [scansResult, usersResult] = await Promise.all([
     supabase
       .from("scans")
       .select(`
@@ -32,13 +35,10 @@ export default async function AdminPage() {
       .from("profiles")
       .select("*")
       .order("created_at", { ascending: false }),
-    supabase
-      .from("scans")
-      .select("status", { count: "exact" }),
   ]);
 
-  const scans = scansResult.data || [];
-  const users = usersResult.data || [];
+  const scans = (scansResult.data || []) as any[];
+  const users = (usersResult.data || []) as any[];
 
   const stats = {
     total: scans.length,

@@ -17,32 +17,142 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// MediaPipe model URL — EfficientDet-Lite0, ~4MB, works offline after first load
-const MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite";
+// Wait for OpenCV.js WASM to be ready (loaded via <script> in layout.tsx)
+function waitForOpenCV(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("OpenCV.js timed out")), 20000);
+    function check() {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const cv = (window as any).cv;
+      if (cv && cv.Mat) { clearTimeout(timeout); resolve(); return; }
+      // cv may exist but still loading (has onRuntimeInitialized)
+      if (cv && cv.onRuntimeInitialized !== undefined) {
+        cv.onRuntimeInitialized = () => { clearTimeout(timeout); resolve(); };
+        return;
+      }
+      setTimeout(check, 200);
+    }
+    check();
+  });
+}
 
-// Classes that could represent a shoe on a factory floor
-const SHOE_CLASSES = new Set([
-  "shoe", "sneaker", "boot", "sandal", "slipper",
-  // fallback: anything that can sit on a floor
-  "sports ball", "bottle", "cup", "vase", "bowl",
-  "handbag", "backpack", "suitcase", "clock", "book",
-  "laptop", "keyboard", "remote", "mouse", "cell phone",
-  "teddy bear", "potted plant", "chair",
-]);
+// ── OpenCV.js shoe detector ────────────────────────────────────────────────
+// Pipeline: GaussianBlur → Canny edge → dilate → findContours → boundingRect
+// Pick top-2 largest contours with good aspect ratio, separated horizontally
+function detectWithOpenCV(canvas: HTMLCanvasElement): { left: BBox; right: BBox } | null {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const cv = (window as any).cv;
+  if (!cv || !cv.Mat) return null;
+
+  const vw = canvas.width;
+  const vh = canvas.height;
+
+  // Work at 50% scale for speed
+  const SCALE = 0.5;
+  const sw = Math.round(vw * SCALE);
+  const sh = Math.round(vh * SCALE);
+
+  const small = document.createElement("canvas");
+  small.width = sw; small.height = sh;
+  small.getContext("2d")!.drawImage(canvas, 0, 0, sw, sh);
+
+  let src: unknown, gray: unknown, blurred: unknown, edges: unknown, dilated: unknown, contours: unknown, hierarchy: unknown;
+
+  try {
+    src      = cv.imread(small);
+    gray     = new cv.Mat();
+    blurred  = new cv.Mat();
+    edges    = new cv.Mat();
+    dilated  = new cv.Mat();
+    contours = new cv.MatVector();
+    hierarchy= new cv.Mat();
+
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.GaussianBlur(gray, blurred, new cv.Size(7, 7), 0);
+    cv.Canny(blurred, edges, 30, 100);
+
+    // Dilate to connect broken edges
+    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
+    cv.dilate(edges, dilated, kernel);
+    kernel.delete();
+
+    cv.findContours(dilated, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    const minArea = sw * sh * 0.015; // at least 1.5% of frame
+    const candidates: { rect: { x: number; y: number; width: number; height: number }; area: number }[] = [];
+
+    for (let i = 0; i < contours.size(); i++) {
+      const cnt = contours.get(i);
+      const area = cv.contourArea(cnt);
+      if (area < minArea) { cnt.delete(); continue; }
+
+      const rect = cv.boundingRect(cnt);
+      const aspect = rect.width / rect.height;
+      const centerY = rect.y + rect.height / 2;
+
+      // Shoes: wider than tall (aspect > 0.8), in bottom 80% of frame
+      if (aspect > 0.5 && centerY > sh * 0.15) {
+        candidates.push({ rect, area });
+      }
+      cnt.delete();
+    }
+
+    if (candidates.length < 2) return null;
+
+    // Sort by area desc, pick top 6
+    candidates.sort((a, b) => b.area - a.area);
+    const top = candidates.slice(0, 6);
+
+    // Find pair with max horizontal separation
+    let bestA = top[0], bestB = top[1], bestSep = 0;
+    for (let i = 0; i < top.length; i++) {
+      for (let j = i + 1; j < top.length; j++) {
+        const ca = top[i].rect.x + top[i].rect.width / 2;
+        const cb = top[j].rect.x + top[j].rect.width / 2;
+        const sep = Math.abs(ca - cb);
+        if (sep > bestSep) { bestSep = sep; bestA = top[i]; bestB = top[j]; }
+      }
+    }
+
+    // Minimum separation: shoes must be at least 5% of width apart
+    if (bestSep < sw * 0.05) return null;
+
+    // Sort left → right
+    const pair = [bestA, bestB].sort((a, b) => a.rect.x - b.rect.x);
+
+    const PAD = Math.round(8 / SCALE);
+    function toFull(r: { x: number; y: number; width: number; height: number }): BBox {
+      return {
+        minX: Math.max(0, Math.round(r.x / SCALE) - PAD),
+        maxX: Math.min(vw, Math.round((r.x + r.width) / SCALE) + PAD),
+        minY: Math.max(0, Math.round(r.y / SCALE) - PAD),
+        maxY: Math.min(vh, Math.round((r.y + r.height) / SCALE) + PAD),
+      };
+    }
+
+    return { left: toFull(pair[0].rect), right: toFull(pair[1].rect) };
+  } catch (e) {
+    console.error("[OpenCV detect]", e);
+    return null;
+  } finally {
+    // Always clean up cv.Mat objects to avoid WASM memory leaks
+    const mats = [src, gray, blurred, edges, dilated, contours, hierarchy];
+    for (const m of mats) {
+      try { if (m && (m as { delete?: () => void }).delete) (m as { delete: () => void }).delete(); } catch {}
+    }
+  }
+}
 
 export function CameraView({ onCapture, onError }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const detectorRef = useRef<any>(null);
 
   const [isReady, setIsReady] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [modelLoading, setModelLoading] = useState(false);
-  const [modelReady, setModelReady] = useState(false);
+  const [cvReady, setCvReady] = useState(false);
+  const [cvLoading, setCvLoading] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [isPortrait, setIsPortrait] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
@@ -62,11 +172,7 @@ export function CameraView({ onCapture, onError }: Props) {
     async function startCamera() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: "environment" },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-          },
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
           audio: false,
         });
         streamRef.current = stream;
@@ -85,49 +191,14 @@ export function CameraView({ onCapture, onError }: Props) {
     return () => { streamRef.current?.getTracks().forEach((t) => t.stop()); };
   }, [onError]);
 
-  // Load MediaPipe model eagerly once camera is ready
+  // Wait for OpenCV.js to finish loading (async script in layout)
   useEffect(() => {
-    if (!isReady || detectorRef.current || modelLoading) return;
-    async function loadModel() {
-      setModelLoading(true);
-      try {
-        const { ObjectDetector, FilesetResolver } =
-          await import("@mediapipe/tasks-vision");
-        const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-        );
-        detectorRef.current = await ObjectDetector.createFromOptions(vision, {
-          baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
-          scoreThreshold: 0.2,
-          maxResults: 10,
-          runningMode: "IMAGE",
-        });
-        setModelReady(true);
-      } catch (e) {
-        console.error("[MediaPipe load]", e);
-        // Try CPU fallback
-        try {
-          const { ObjectDetector, FilesetResolver } =
-            await import("@mediapipe/tasks-vision");
-          const vision = await FilesetResolver.forVisionTasks(
-            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-          );
-          detectorRef.current = await ObjectDetector.createFromOptions(vision, {
-            baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
-            scoreThreshold: 0.2,
-            maxResults: 10,
-            runningMode: "IMAGE",
-          });
-          setModelReady(true);
-        } catch (e2) {
-          console.error("[MediaPipe CPU fallback failed]", e2);
-        }
-      } finally {
-        setModelLoading(false);
-      }
-    }
-    loadModel();
-  }, [isReady, modelLoading]);
+    if (!isReady || cvReady || cvLoading) return;
+    setCvLoading(true);
+    waitForOpenCV()
+      .then(() => { setCvReady(true); setCvLoading(false); })
+      .catch((e) => { console.error("[OpenCV load]", e); setCvLoading(false); });
+  }, [isReady, cvReady, cvLoading]);
 
   const handleCapture = useCallback(async () => {
     const video = videoRef.current;
@@ -136,24 +207,14 @@ export function CameraView({ onCapture, onError }: Props) {
 
     setIsCapturing(true);
 
-    // Load model on-demand if eager load hasn't finished
-    if (!detectorRef.current) {
-      setStatusMsg("Loading AI model (~4MB)...");
+    // Wait for OpenCV if still loading
+    if (!cvReady) {
+      setStatusMsg("Waiting for OpenCV...");
       try {
-        const { ObjectDetector, FilesetResolver } =
-          await import("@mediapipe/tasks-vision");
-        const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-        );
-        detectorRef.current = await ObjectDetector.createFromOptions(vision, {
-          baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
-          scoreThreshold: 0.2,
-          maxResults: 10,
-          runningMode: "IMAGE",
-        });
-        setModelReady(true);
-      } catch (e) {
-        onError(`AI model failed to load: ${e instanceof Error ? e.message : "network error"}`);
+        await waitForOpenCV();
+        setCvReady(true);
+      } catch {
+        onError("OpenCV.js failed to load. Check internet connection and reload.");
         setIsCapturing(false);
         setStatusMsg("");
         return;
@@ -170,95 +231,29 @@ export function CameraView({ onCapture, onError }: Props) {
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, vw, vh);
 
-    let detections: { bbox: BBox; score: number; label: string }[] = [];
+    // Yield to let UI update before heavy computation
+    await new Promise(r => setTimeout(r, 30));
 
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const result = detectorRef.current.detect(canvas) as any;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const raw: any[] = result.detections ?? [];
-
-      detections = raw.map((d) => {
-        const bb = d.boundingBox;
-        return {
-          label: d.categories?.[0]?.categoryName ?? "object",
-          score: d.categories?.[0]?.score ?? 0,
-          bbox: {
-            minX: Math.round(bb.originX),
-            minY: Math.round(bb.originY),
-            maxX: Math.round(bb.originX + bb.width),
-            maxY: Math.round(bb.originY + bb.height),
-          },
-        };
-      });
-
-      console.log("[MediaPipe]", detections.length, "detections:", detections.map(d => `${d.label}(${(d.score*100).toFixed(0)}%)`));
-    } catch (e) {
-      setIsAnalyzing(false);
-      setIsCapturing(false);
-      setStatusMsg("");
-      onError(`Detection failed: ${e instanceof Error ? e.message : "unknown"}`);
-      return;
-    }
+    const result = detectWithOpenCV(canvas);
 
     setIsAnalyzing(false);
     setStatusMsg("");
 
-    if (detections.length === 0) {
-      setIsCapturing(false);
-      onError("No objects detected. Make sure shoes are well-lit and clearly visible.");
-      return;
-    }
-
-    // Prefer shoe-class detections; fallback to all detections by area
-    let shoes = detections.filter(d => SHOE_CLASSES.has(d.label.toLowerCase()));
-    if (shoes.length < 2) shoes = detections;
-
-    // Remove duplicates (IoU > 0.5)
-    function iou(a: BBox, b: BBox) {
-      const ix = Math.max(0, Math.min(a.maxX, b.maxX) - Math.max(a.minX, b.minX));
-      const iy = Math.max(0, Math.min(a.maxY, b.maxY) - Math.max(a.minY, b.minY));
-      const inter = ix * iy;
-      const aA = (a.maxX - a.minX) * (a.maxY - a.minY);
-      const bA = (b.maxX - b.minX) * (b.maxY - b.minY);
-      return inter / (aA + bA - inter + 1e-6);
-    }
-    const sorted = [...shoes].sort((a, b) => b.score - a.score);
-    const deduped: typeof sorted = [];
-    for (const d of sorted) {
-      if (!deduped.some(k => iou(k.bbox, d.bbox) > 0.5)) deduped.push(d);
-    }
-
-    if (deduped.length < 2) {
+    if (!result) {
       setIsCapturing(false);
       onError(
-        `Only found ${deduped.length} object(s). Both shoes must be fully visible, side-by-side with a gap between them.`
+        "Could not detect two shoes. Tips: ensure good lighting, shoes on contrasting surface, clear gap between them, camera level."
       );
       return;
     }
 
-    // Pick best pair: max horizontal separation among top-4
-    const top4 = deduped.slice(0, 4);
-    let bestA = top4[0], bestB = top4[1], bestSep = 0;
-    for (let i = 0; i < top4.length; i++) {
-      for (let j = i + 1; j < top4.length; j++) {
-        const ca = (top4[i].bbox.minX + top4[i].bbox.maxX) / 2;
-        const cb = (top4[j].bbox.minX + top4[j].bbox.maxX) / 2;
-        const sep = Math.abs(ca - cb);
-        if (sep > bestSep) { bestSep = sep; bestA = top4[i]; bestB = top4[j]; }
-      }
-    }
-
-    // Sort left → right
-    const [leftDet, rightDet] = [bestA, bestB].sort((a, b) => a.bbox.minX - b.bbox.minX);
-    const lb = leftDet.bbox;
-    const rb = rightDet.bbox;
+    const { left: lb, right: rb } = result;
 
     // Tilt check
     const bottomDiff = Math.abs(lb.maxY - rb.maxY);
     if (bottomDiff > vh * 0.12) {
       setIsCapturing(false);
-      onError(`Camera tilted — shoe baselines differ by ${Math.round(bottomDiff)}px. Level the camera.`);
+      onError(`Camera tilted — shoe baselines differ by ${Math.round(bottomDiff)}px. Level the camera and retake.`);
       return;
     }
 
@@ -337,7 +332,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
     ctx.font = "11px monospace";
     ctx.fillStyle = "rgba(0,0,0,0.7)";
-    const stamp = `MP | L:${leftResult.hMm}mm R:${rightResult.hMm}mm | ${leftDet.label}/${rightDet.label}`;
+    const stamp = `OpenCV | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
     ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
     ctx.fillStyle = GREEN;
     ctx.textAlign = "left";
@@ -369,7 +364,7 @@ export function CameraView({ onCapture, onError }: Props) {
       setIsCapturing(false);
       setStatusMsg("");
     }
-  }, [isCapturing, isAnalyzing, onCapture, onError]);
+  }, [isCapturing, isAnalyzing, cvReady, onCapture, onError]);
 
   if (isPortrait) {
     return (
@@ -394,19 +389,19 @@ export function CameraView({ onCapture, onError }: Props) {
         </div>
       )}
 
-      {/* Model loading indicator (subtle, top bar) */}
-      {isReady && modelLoading && (
-        <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-center gap-2 py-2"
-          style={{ background: "rgba(0,0,0,0.7)" }}>
+      {/* OpenCV status bar */}
+      {isReady && cvLoading && (
+        <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-center gap-2 py-1.5"
+          style={{ background: "rgba(0,0,0,0.75)" }}>
           <Loader2 className="w-3 h-3 animate-spin" style={{ color: CYAN }} />
-          <span className="text-xs font-medium" style={{ color: CYAN }}>Loading AI model...</span>
+          <span className="text-xs font-medium" style={{ color: CYAN }}>Loading OpenCV.js...</span>
         </div>
       )}
-      {isReady && modelReady && !modelLoading && !isCapturing && (
+      {isReady && cvReady && !cvLoading && !isCapturing && (
         <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-center gap-2 py-1.5"
-          style={{ background: "rgba(34,197,94,0.15)" }}>
+          style={{ background: "rgba(34,197,94,0.12)" }}>
           <div className="w-1.5 h-1.5 rounded-full" style={{ background: GREEN }} />
-          <span className="text-[10px] font-semibold" style={{ color: GREEN }}>AI Ready</span>
+          <span className="text-[10px] font-semibold" style={{ color: GREEN }}>OpenCV Ready</span>
         </div>
       )}
 
@@ -419,7 +414,7 @@ export function CameraView({ onCapture, onError }: Props) {
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
             <p className="text-base font-bold" style={{ color: CYAN }}>Detecting shoes...</p>
-            <p className="text-xs mt-1" style={{ color: "#666" }}>MediaPipe EfficientDet</p>
+            <p className="text-xs mt-1" style={{ color: "#666" }}>OpenCV Canny + findContours</p>
           </motion.div>
         )}
       </AnimatePresence>
@@ -437,7 +432,7 @@ export function CameraView({ onCapture, onError }: Props) {
         <div className="absolute top-10 left-1/2 -translate-x-1/2 z-10">
           <div className="px-4 py-2 rounded-full text-xs font-semibold text-center whitespace-nowrap"
             style={{ background: "rgba(0,0,0,0.7)", border: `1px solid ${CYAN}40`, color: "#ccc", backdropFilter: "blur(6px)" }}>
-            Shoes side-by-side · landscape · well-lit
+            Shoes side-by-side · contrasting surface · landscape
           </div>
         </div>
       )}

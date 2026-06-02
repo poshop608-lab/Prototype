@@ -55,11 +55,7 @@ export default function RootLayout({
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} ${inter.variable} ${spaceGrotesk.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">
-        {children}
-        {/* OpenCV.js — loaded async, available as window.cv */}
-        <script async src="https://docs.opencv.org/4.10.0/opencv.js" />
-      </body>
+      <body className="min-h-full flex flex-col">{children}</body>
     </html>
   );
 }

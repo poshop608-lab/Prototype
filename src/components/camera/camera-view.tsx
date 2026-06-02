@@ -17,11 +17,11 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// ── Guaranteed split-frame detector ───────────────────────────────────────
-// Splits frame into left/right halves. In each half, finds the tightest
-// bounding box around foreground pixels using pixel luminance analysis.
-// Falls back to 80% of half-frame if no clear foreground found.
-// NEVER fails — always returns two boxes.
+// ── Split-frame shoe detector ─────────────────────────────────────────────
+// Per-half: scans only the middle vertical band (20%-80% of frame height)
+// to skip table/surface at bottom and ceiling/wall at top.
+// Background sampled from top-center strip (plain wall area).
+// Each shoe gets its own independent bottom — no shared groundY.
 function detectShoes(
   canvas: HTMLCanvasElement,
   vw: number,
@@ -37,32 +37,34 @@ function detectShoes(
   tctx.drawImage(canvas, 0, 0, tw, th);
   const { data } = tctx.getImageData(0, 0, tw, th);
 
-  // Sample background luminance from top strip (sky/wall above shoes)
+  function pixLum(x: number, y: number): number {
+    const i = (y * tw + x) * 4;
+    return 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+  }
+
+  // Sample background from top-center strip — avoids shoe pixels on sides
   let bgLum = 0, bgN = 0;
-  const topStrip = Math.round(th * 0.15);
-  for (let y = 0; y < topStrip; y++) {
-    for (let x = 0; x < tw; x++) {
-      const i = (y * tw + x) * 4;
-      bgLum += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-      bgN++;
+  const bgY0 = 0, bgY1 = Math.round(th * 0.18);
+  const bgX0 = Math.round(tw * 0.2), bgX1 = Math.round(tw * 0.8);
+  for (let y = bgY0; y < bgY1; y++) {
+    for (let x = bgX0; x < bgX1; x++) {
+      bgLum += pixLum(x, y); bgN++;
     }
   }
   bgLum /= bgN;
 
-  // For each half, find tight bbox of pixels that differ from background
   function halfBBox(fromX: number, toX: number): BBox {
-    let minX = toX, maxX = fromX, minY = th, maxY = 0;
+    // Scan only middle 15%–78% vertically — skip ceiling and table/mat
+    const scanY0 = Math.round(th * 0.15);
+    const scanY1 = Math.round(th * 0.78);
+    const THRESH = 28;
+
+    let minX = toX, maxX = fromX, minY = scanY1, maxY = scanY0;
     let found = false;
 
-    // Threshold: pixel is "shoe" if luminance differs enough from bg
-    // Use both dark-object-on-light and light-object-on-dark detection
-    const THRESH = 35;
-
-    for (let y = Math.round(th * 0.1); y < th; y++) {
+    for (let y = scanY0; y < scanY1; y++) {
       for (let x = fromX; x < toX; x++) {
-        const i = (y * tw + x) * 4;
-        const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-        if (Math.abs(lum - bgLum) > THRESH) {
+        if (Math.abs(pixLum(x, y) - bgLum) > THRESH) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
@@ -72,19 +74,18 @@ function detectShoes(
       }
     }
 
-    if (!found || maxX - minX < tw * 0.03 || maxY - minY < th * 0.03) {
-      // Fallback: use central 80% of the half
-      const pad = Math.round((toX - fromX) * 0.10);
-      const vpad = Math.round(th * 0.10);
+    const halfW = toX - fromX;
+    if (!found || maxX - minX < halfW * 0.05 || maxY - minY < th * 0.04) {
+      // Fallback — use safe central region of this half
       return {
-        minX: Math.round((fromX + pad) / SCALE),
-        maxX: Math.round((toX - pad) / SCALE),
-        minY: Math.round(vpad / SCALE),
-        maxY: Math.round((th - vpad) / SCALE),
+        minX: Math.round((fromX + halfW * 0.08) / SCALE),
+        maxX: Math.round((toX - halfW * 0.08) / SCALE),
+        minY: Math.round(th * 0.20 / SCALE),
+        maxY: Math.round(th * 0.75 / SCALE),
       };
     }
 
-    const PAD = 4;
+    const PAD = 3;
     return {
       minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
       maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
@@ -165,9 +166,14 @@ export function CameraView({ onCapture, onError }: Props) {
     const { left: lb, right: rb } = detectShoes(canvas, vw, vh);
     setIsAnalyzing(false);
 
-    const groundY = Math.max(lb.maxY, rb.maxY);
-
+    // Each shoe uses its OWN bottom as baseline — no shared groundY
+    // This prevents raised-surface artifacts from inflating one shoe's height
     function drawBox(bounds: BBox, label: string) {
+      const boxBottom = bounds.maxY; // independent per shoe
+      const midX = (bounds.minX + bounds.maxX) / 2;
+      const midY = (bounds.minY + boxBottom) / 2;
+      const rX = Math.min(bounds.maxX + 8, vw - 90);
+
       ctx.beginPath();
       ctx.rect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
       ctx.fillStyle = `${GREEN}22`;
@@ -179,14 +185,11 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.stroke();
       ctx.shadowBlur = 0;
 
-      const heightPx = groundY - bounds.minY;
-      const widthPx = bounds.maxX - bounds.minX;
+      const heightPx = boxBottom - bounds.minY;
       const hMm = pxToMm(heightPx);
-      const wMm = pxToMm(widthPx);
-      const midX = (bounds.minX + bounds.maxX) / 2;
-      const midY = (bounds.minY + groundY) / 2;
-      const rX = Math.min(bounds.maxX + 8, vw - 90);
+      const wMm = pxToMm(bounds.maxX - bounds.minX);
 
+      // Height label
       ctx.font = "bold 16px monospace";
       const hl = `${hMm}mm`;
       ctx.fillStyle = "rgba(0,0,0,0.85)";
@@ -195,27 +198,22 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.textAlign = "left";
       ctx.fillText(hl, rX + 2, midY + 4);
 
-      const wl = `${wMm}mm`;
-      ctx.fillStyle = "rgba(0,0,0,0.85)";
-      ctx.fillRect(midX - ctx.measureText(wl).width / 2 - 4, Math.max(bounds.minY - 26, 0), ctx.measureText(wl).width + 8, 18);
-      ctx.fillStyle = GREEN;
-      ctx.textAlign = "center";
-      ctx.fillText(wl, midX, Math.max(bounds.minY - 10, 14));
-
+      // LEFT/RIGHT badge
       ctx.font = "bold 13px monospace";
       const bw = ctx.measureText(label).width + 14;
       ctx.fillStyle = `${GREEN}cc`;
-      ctx.fillRect(midX - bw / 2, Math.min(groundY + 6, vh - 22), bw, 18);
+      ctx.fillRect(midX - bw / 2, Math.min(boxBottom + 6, vh - 22), bw, 18);
       ctx.fillStyle = "#000";
       ctx.textAlign = "center";
-      ctx.fillText(label, midX, Math.min(groundY + 19, vh - 8));
+      ctx.fillText(label, midX, Math.min(boxBottom + 19, vh - 8));
 
+      // Bottom baseline tick
       ctx.strokeStyle = `${GREEN}80`;
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 4]);
       ctx.beginPath();
-      ctx.moveTo(bounds.minX, groundY);
-      ctx.lineTo(bounds.maxX, groundY);
+      ctx.moveTo(bounds.minX, boxBottom);
+      ctx.lineTo(bounds.maxX, boxBottom);
       ctx.stroke();
       ctx.setLineDash([]);
 

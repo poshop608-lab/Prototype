@@ -19,8 +19,6 @@ export function ScanDetailClient({ scan, image }: Props) {
   const rows = [
     { label: "Left Shoe Height", value: scan.left_height_mm != null ? `${scan.left_height_mm} mm` : "—", highlight: false },
     { label: "Right Shoe Height", value: scan.right_height_mm != null ? `${scan.right_height_mm} mm` : "—", highlight: false },
-    { label: "Left Shoe Width", value: scan.left_width_mm != null ? `${scan.left_width_mm} mm` : "—", highlight: false },
-    { label: "Right Shoe Width", value: scan.right_width_mm != null ? `${scan.right_width_mm} mm` : "—", highlight: false },
     { label: "Height Difference", value: scan.height_diff_mm != null ? `${scan.height_diff_mm} mm` : "—", highlight: true },
   ];
 

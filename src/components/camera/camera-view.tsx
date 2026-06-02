@@ -17,11 +17,12 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// ── Guaranteed split-frame detector ───────────────────────────────────────
-// Splits frame into left/right halves. In each half, finds the tightest
-// bounding box around foreground pixels using pixel luminance analysis.
-// Falls back to 80% of half-frame if no clear foreground found.
-// NEVER fails — always returns two boxes.
+// ── Bottom-anchored shoe detector ─────────────────────────────────────────
+// Key insight: shoes sit ON a surface. The shoe occupies the region just
+// ABOVE the surface/table line. We scan from bottom up to find:
+//   1. The surface line (first row of uniform horizontal color = table)
+//   2. The shoe mass above it (darkest / most different from bg wall)
+// This ignores wall/background above the shoe entirely.
 function detectShoes(
   canvas: HTMLCanvasElement,
   vw: number,
@@ -37,59 +38,97 @@ function detectShoes(
   tctx.drawImage(canvas, 0, 0, tw, th);
   const { data } = tctx.getImageData(0, 0, tw, th);
 
-  // Sample background luminance from top strip (sky/wall above shoes)
-  let bgLum = 0, bgN = 0;
-  const topStrip = Math.round(th * 0.15);
-  for (let y = 0; y < topStrip; y++) {
+  function lum(x: number, y: number) {
+    const i = (y * tw + x) * 4;
+    return 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+  }
+
+  // Sample wall/background: top 20% of frame (above shoe area)
+  let wallLum = 0, wallN = 0;
+  for (let y = 0; y < Math.round(th * 0.20); y++) {
     for (let x = 0; x < tw; x++) {
-      const i = (y * tw + x) * 4;
-      bgLum += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-      bgN++;
+      wallLum += lum(x, y); wallN++;
     }
   }
-  bgLum /= bgN;
+  wallLum /= wallN;
 
-  // For each half, find tight bbox of pixels that differ from background
+  // Find surface/table line by scanning bottom-up:
+  // The surface row is the first row (from bottom) where the entire row
+  // has uniform-ish luminance (low stddev = flat surface, not shoe texture)
+  function findSurfaceY(fromX: number, toX: number): number {
+    for (let y = th - 1; y > th * 0.5; y--) {
+      const lums: number[] = [];
+      for (let x = fromX; x < toX; x++) lums.push(lum(x, y));
+      const mean = lums.reduce((a, b) => a + b, 0) / lums.length;
+      const variance = lums.reduce((s, v) => s + (v - mean) ** 2, 0) / lums.length;
+      const stddev = Math.sqrt(variance);
+      // Uniform row = surface (stddev < 18 means it's a flat table/floor)
+      if (stddev < 18) return y;
+    }
+    // Fallback: bottom 15% of frame
+    return Math.round(th * 0.85);
+  }
+
+  // Within each half, find the shoe bbox:
+  // Scan from surfaceY upward, mark pixels that differ from wall background
+  // Stop scanning upward when we hit 3+ consecutive rows with NO shoe pixels
+  // (= we've exited the shoe and hit background wall)
   function halfBBox(fromX: number, toX: number): BBox {
-    let minX = toX, maxX = fromX, minY = th, maxY = 0;
-    let found = false;
+    const surfaceY = findSurfaceY(fromX, toX);
+    const THRESH = 28; // differs from wall bg by this much = shoe pixel
+    const halfW = toX - fromX;
 
-    // Threshold: pixel is "shoe" if luminance differs enough from bg
-    // Use both dark-object-on-light and light-object-on-dark detection
-    const THRESH = 35;
+    let shoeTop = surfaceY;
+    let consecutiveEmpty = 0;
 
-    for (let y = Math.round(th * 0.1); y < th; y++) {
+    for (let y = surfaceY - 1; y >= Math.round(th * 0.05); y--) {
+      let rowShoePixels = 0;
       for (let x = fromX; x < toX; x++) {
-        const i = (y * tw + x) * 4;
-        const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-        if (Math.abs(lum - bgLum) > THRESH) {
+        if (Math.abs(lum(x, y) - wallLum) > THRESH) rowShoePixels++;
+      }
+      const density = rowShoePixels / halfW;
+      if (density > 0.08) {
+        // This row has shoe content
+        shoeTop = y;
+        consecutiveEmpty = 0;
+      } else {
+        consecutiveEmpty++;
+        // 4 consecutive empty rows above shoe = we've cleared the shoe top
+        if (consecutiveEmpty >= 4) break;
+      }
+    }
+
+    // Now find left/right extent within shoeTop..surfaceY
+    let minX = toX, maxX = fromX;
+    for (let y = shoeTop; y <= surfaceY; y++) {
+      for (let x = fromX; x < toX; x++) {
+        if (Math.abs(lum(x, y) - wallLum) > THRESH) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-          found = true;
         }
       }
     }
 
-    if (!found || maxX - minX < tw * 0.03 || maxY - minY < th * 0.03) {
-      // Fallback: use central 80% of the half
-      const pad = Math.round((toX - fromX) * 0.10);
-      const vpad = Math.round(th * 0.10);
+    // Sanity check — fallback to reasonable default if result is tiny
+    const boxW = maxX - minX;
+    const boxH = surfaceY - shoeTop;
+    if (boxW < halfW * 0.15 || boxH < th * 0.05) {
+      // Use middle 70% of half, top 30%–bottom 85%
+      const pad = Math.round(halfW * 0.15);
       return {
         minX: Math.round((fromX + pad) / SCALE),
         maxX: Math.round((toX - pad) / SCALE),
-        minY: Math.round(vpad / SCALE),
-        maxY: Math.round((th - vpad) / SCALE),
+        minY: Math.round(th * 0.30 / SCALE),
+        maxY: Math.round(surfaceY / SCALE),
       };
     }
 
-    const PAD = 4;
+    const PAD = 3;
     return {
       minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
       maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
-      minY: Math.max(0, Math.round((minY - PAD) / SCALE)),
-      maxY: Math.min(vh, Math.round((maxY + PAD) / SCALE)),
+      minY: Math.max(0, Math.round((shoeTop - PAD) / SCALE)),
+      maxY: Math.min(vh, Math.round((surfaceY + PAD) / SCALE)),
     };
   }
 

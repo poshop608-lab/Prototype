@@ -17,23 +17,17 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// ── Row-variance shoe detector ────────────────────────────────────────────
-// Uses per-row variance (texture) to separate shoe from flat wall/surface.
-// Shoe rows have HIGH variance (texture, edges, laces).
-// Wall rows have LOW variance (plain flat color).
-// Surface/table rows also have LOW variance but are at the bottom.
-//
-// Algorithm per half:
-//  1. Compute per-row variance score from bottom up
-//  2. Find surface line = first low-variance region from bottom
-//  3. Find shoe top = last high-variance row above surface
-//  4. Use that exact range for bbox — ignores flat wall above shoe
+// ── Guaranteed split-frame detector ───────────────────────────────────────
+// Splits frame into left/right halves. In each half, finds the tightest
+// bounding box around foreground pixels using pixel luminance analysis.
+// Falls back to 80% of half-frame if no clear foreground found.
+// NEVER fails — always returns two boxes.
 function detectShoes(
   canvas: HTMLCanvasElement,
   vw: number,
   vh: number
 ): { left: BBox; right: BBox } {
-  const SCALE = 0.3;
+  const SCALE = 0.25;
   const tw = Math.round(vw * SCALE);
   const th = Math.round(vh * SCALE);
 
@@ -43,113 +37,59 @@ function detectShoes(
   tctx.drawImage(canvas, 0, 0, tw, th);
   const { data } = tctx.getImageData(0, 0, tw, th);
 
-  function lum(x: number, y: number): number {
-    const i = (y * tw + x) * 4;
-    return 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-  }
-
-  // Compute luminance variance for a horizontal slice
-  function rowVariance(y: number, fromX: number, toX: number): number {
-    let sum = 0, sum2 = 0, n = toX - fromX;
-    for (let x = fromX; x < toX; x++) {
-      const l = lum(x, y);
-      sum += l; sum2 += l * l;
+  // Sample background luminance from top strip (sky/wall above shoes)
+  let bgLum = 0, bgN = 0;
+  const topStrip = Math.round(th * 0.15);
+  for (let y = 0; y < topStrip; y++) {
+    for (let x = 0; x < tw; x++) {
+      const i = (y * tw + x) * 4;
+      bgLum += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+      bgN++;
     }
-    return sum2 / n - (sum / n) ** 2; // variance = E[x²] - E[x]²
   }
+  bgLum /= bgN;
 
-  // Per-half detection
+  // For each half, find tight bbox of pixels that differ from background
   function halfBBox(fromX: number, toX: number): BBox {
-    const halfW = toX - fromX;
+    let minX = toX, maxX = fromX, minY = th, maxY = 0;
+    let found = false;
 
-    // Step 1: build row variance array for this half
-    const varRow: number[] = new Array(th);
-    for (let y = 0; y < th; y++) varRow[y] = rowVariance(y, fromX, toX);
+    // Threshold: pixel is "shoe" if luminance differs enough from bg
+    // Use both dark-object-on-light and light-object-on-dark detection
+    const THRESH = 35;
 
-    // Step 2: find surface line scanning from bottom up
-    // Surface = consecutive low-variance rows (variance < 120 = flat table)
-    const SURFACE_VAR = 120;
-    let surfaceY = Math.round(th * 0.88); // default bottom area
-    let lowCount = 0;
-    for (let y = th - 1; y > th * 0.4; y--) {
-      if (varRow[y] < SURFACE_VAR) {
-        lowCount++;
-        if (lowCount >= 2) { surfaceY = y + 2; break; }
-      } else {
-        lowCount = 0;
-      }
-    }
-
-    // Step 3: find shoe top scanning upward from surfaceY
-    // Shoe = high variance rows. Wall = low variance rows above shoe.
-    // WALL_VAR threshold: wall is very uniform (variance < 200)
-    const WALL_VAR = 200;
-    let shoeTop = surfaceY;
-    let blankRows = 0;
-
-    for (let y = surfaceY - 1; y >= Math.round(th * 0.03); y--) {
-      if (varRow[y] > WALL_VAR) {
-        shoeTop = y;
-        blankRows = 0;
-      } else {
-        blankRows++;
-        // 5 consecutive flat rows = entered wall/background, stop
-        if (blankRows >= 5) break;
-      }
-    }
-
-    // Step 4: find horizontal extent within shoeTop..surfaceY
-    // Use column-sum to find where shoe pixels are horizontally
-    const colHasShoe: boolean[] = new Array(toX - fromX).fill(false);
-    for (let y = shoeTop; y <= surfaceY; y++) {
-      if (varRow[y] <= WALL_VAR) continue; // skip wall rows
-      // For high-variance rows, mark columns with non-background pixels
-      // Sample background from top strip of this half
+    for (let y = Math.round(th * 0.1); y < th; y++) {
       for (let x = fromX; x < toX; x++) {
-        // mark column as shoe if this row has texture
-        colHasShoe[x - fromX] = true;
-      }
-    }
-
-    // Find left/right bounds of shoe columns
-    let minCol = halfW, maxCol = 0;
-    // Scan column by column: a shoe column has multiple high-variance rows
-    for (let x = fromX; x < toX; x++) {
-      let shoeRowCount = 0;
-      for (let y = shoeTop; y <= surfaceY; y++) {
-        // Check if this pixel differs significantly from its neighbors (edge pixel)
-        if (x > fromX && x < toX - 1) {
-          const diff = Math.abs(lum(x, y) - lum(x - 1, y)) + Math.abs(lum(x, y) - lum(x + 1, y));
-          if (diff > 15) shoeRowCount++;
+        const i = (y * tw + x) * 4;
+        const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+        if (Math.abs(lum - bgLum) > THRESH) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+          found = true;
         }
       }
-      if (shoeRowCount > (surfaceY - shoeTop) * 0.05) {
-        const col = x - fromX;
-        if (col < minCol) minCol = col;
-        if (col > maxCol) maxCol = col;
-      }
     }
 
-    // Sanity: if column detection failed, use full half width
-    if (maxCol - minCol < halfW * 0.2) { minCol = 0; maxCol = halfW - 1; }
-
-    const boxH = surfaceY - shoeTop;
-    // Sanity: if height too small, use default
-    if (boxH < th * 0.08) {
+    if (!found || maxX - minX < tw * 0.03 || maxY - minY < th * 0.03) {
+      // Fallback: use central 80% of the half
+      const pad = Math.round((toX - fromX) * 0.10);
+      const vpad = Math.round(th * 0.10);
       return {
-        minX: Math.round((fromX + halfW * 0.05) / SCALE),
-        maxX: Math.round((toX - halfW * 0.05) / SCALE),
-        minY: Math.round(th * 0.25 / SCALE),
-        maxY: Math.round(surfaceY / SCALE),
+        minX: Math.round((fromX + pad) / SCALE),
+        maxX: Math.round((toX - pad) / SCALE),
+        minY: Math.round(vpad / SCALE),
+        maxY: Math.round((th - vpad) / SCALE),
       };
     }
 
-    const PAD = 2;
+    const PAD = 4;
     return {
-      minX: Math.max(0, Math.round((fromX + minCol - PAD) / SCALE)),
-      maxX: Math.min(vw, Math.round((fromX + maxCol + PAD) / SCALE)),
-      minY: Math.max(0, Math.round((shoeTop - PAD) / SCALE)),
-      maxY: Math.min(vh, Math.round((surfaceY + PAD) / SCALE)),
+      minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
+      maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
+      minY: Math.max(0, Math.round((minY - PAD) / SCALE)),
+      maxY: Math.min(vh, Math.round((maxY + PAD) / SCALE)),
     };
   }
 

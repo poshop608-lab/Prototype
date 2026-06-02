@@ -54,29 +54,57 @@ function detectShoes(
   bgLum /= bgN;
 
   function halfBBox(fromX: number, toX: number): BBox {
-    // Scan only middle 15%–78% vertically — skip ceiling and table/mat
-    const scanY0 = Math.round(th * 0.15);
-    const scanY1 = Math.round(th * 0.78);
-    const THRESH = 28;
+    const halfW = toX - fromX;
+    const THRESH = 25;
 
-    let minX = toX, maxX = fromX, minY = scanY1, maxY = scanY0;
-    let found = false;
+    // Step 1: build per-row foreground density (fraction of pixels differing from bg)
+    const rowDensity: number[] = new Array(th).fill(0);
+    for (let y = 0; y < th; y++) {
+      let fg = 0;
+      for (let x = fromX; x < toX; x++) {
+        if (Math.abs(pixLum(x, y) - bgLum) > THRESH) fg++;
+      }
+      rowDensity[y] = fg / halfW;
+    }
 
-    for (let y = scanY0; y < scanY1; y++) {
+    // Step 2: find shoe BOTTOM — last row with decent density scanning from 80% down
+    // (ignore bottom 20% = table/mat)
+    const searchBottom = Math.round(th * 0.80);
+    let shoeBottom = Math.round(th * 0.70); // default
+    for (let y = searchBottom; y >= Math.round(th * 0.30); y--) {
+      if (rowDensity[y] > 0.12) { shoeBottom = y; break; }
+    }
+
+    // Step 3: find shoe TOP by scanning upward from shoeBottom
+    // Stop when we hit 5 consecutive rows with density < threshold (= entered wall)
+    const WALL_DENSITY = 0.06;
+    let shoeTop = shoeBottom;
+    let emptyStreak = 0;
+    for (let y = shoeBottom - 1; y >= 0; y--) {
+      if (rowDensity[y] > WALL_DENSITY) {
+        shoeTop = y;
+        emptyStreak = 0;
+      } else {
+        emptyStreak++;
+        if (emptyStreak >= 5) break;
+      }
+    }
+
+    // Step 4: find horizontal extent within shoeTop..shoeBottom
+    let minX = toX, maxX = fromX;
+    for (let y = shoeTop; y <= shoeBottom; y++) {
       for (let x = fromX; x < toX; x++) {
         if (Math.abs(pixLum(x, y) - bgLum) > THRESH) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-          found = true;
         }
       }
     }
 
-    const halfW = toX - fromX;
-    if (!found || maxX - minX < halfW * 0.05 || maxY - minY < th * 0.04) {
-      // Fallback — use safe central region of this half
+    // Sanity check
+    const boxH = shoeBottom - shoeTop;
+    const boxW = maxX - minX;
+    if (boxH < th * 0.05 || boxW < halfW * 0.05) {
       return {
         minX: Math.round((fromX + halfW * 0.08) / SCALE),
         maxX: Math.round((toX - halfW * 0.08) / SCALE),
@@ -89,8 +117,8 @@ function detectShoes(
     return {
       minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
       maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
-      minY: Math.max(0, Math.round((minY - PAD) / SCALE)),
-      maxY: Math.min(vh, Math.round((maxY + PAD) / SCALE)),
+      minY: Math.max(0, Math.round((shoeTop - PAD) / SCALE)),
+      maxY: Math.min(vh, Math.round((shoeBottom + PAD) / SCALE)),
     };
   }
 

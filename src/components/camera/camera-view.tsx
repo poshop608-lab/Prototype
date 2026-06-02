@@ -37,8 +37,8 @@ function waitForOpenCV(): Promise<void> {
 }
 
 // ── OpenCV.js shoe detector ────────────────────────────────────────────────
-// Pipeline: GaussianBlur → Canny edge → dilate → findContours → boundingRect
-// Pick top-2 largest contours with good aspect ratio, separated horizontally
+// Multi-strategy: tries several Canny thresholds + OTSU threshold fallback
+// Picks top-2 largest spatially separated contours
 function detectWithOpenCV(canvas: HTMLCanvasElement): { left: BBox; right: BBox } | null {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const cv = (window as any).cv;
@@ -47,8 +47,7 @@ function detectWithOpenCV(canvas: HTMLCanvasElement): { left: BBox; right: BBox 
   const vw = canvas.width;
   const vh = canvas.height;
 
-  // Work at 50% scale for speed
-  const SCALE = 0.5;
+  const SCALE = 0.4;
   const sw = Math.round(vw * SCALE);
   const sh = Math.round(vh * SCALE);
 
@@ -56,66 +55,123 @@ function detectWithOpenCV(canvas: HTMLCanvasElement): { left: BBox; right: BBox 
   small.width = sw; small.height = sh;
   small.getContext("2d")!.drawImage(canvas, 0, 0, sw, sh);
 
-  let src: unknown, gray: unknown, blurred: unknown, edges: unknown, dilated: unknown, contours: unknown, hierarchy: unknown;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mats: any[] = [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function mat<T>(v: T): T { mats.push(v); return v; }
 
   try {
-    src      = cv.imread(small);
-    gray     = new cv.Mat();
-    blurred  = new cv.Mat();
-    edges    = new cv.Mat();
-    dilated  = new cv.Mat();
-    contours = new cv.MatVector();
-    hierarchy= new cv.Mat();
+    const src     = mat(cv.imread(small));
+    const gray    = mat(new cv.Mat());
+    const blurred = mat(new cv.Mat());
 
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-    cv.GaussianBlur(gray, blurred, new cv.Size(7, 7), 0);
-    cv.Canny(blurred, edges, 30, 100);
+    cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
 
-    // Dilate to connect broken edges
-    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
-    cv.dilate(edges, dilated, kernel);
-    kernel.delete();
+    type Rect = { x: number; y: number; width: number; height: number };
+    type Candidate = { rect: Rect; area: number };
 
-    cv.findContours(dilated, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    // Try multiple detection strategies, return first that finds 2 candidates
+    function tryStrategy(edgeMat: unknown): Candidate[] {
+      const dilated   = mat(new cv.Mat());
+      const closed    = mat(new cv.Mat());
+      const contours  = mat(new cv.MatVector());
+      const hierarchy = mat(new cv.Mat());
 
-    const minArea = sw * sh * 0.015; // at least 1.5% of frame
-    const candidates: { rect: { x: number; y: number; width: number; height: number }; area: number }[] = [];
+      const k1 = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(7, 7));
+      const k2 = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(11, 11));
+      mats.push(k1, k2);
+      cv.dilate(edgeMat, dilated, k1);
+      cv.morphologyEx(dilated, closed, cv.MORPH_CLOSE, k2);
+      cv.findContours(closed, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-    for (let i = 0; i < contours.size(); i++) {
-      const cnt = contours.get(i);
-      const area = cv.contourArea(cnt);
-      if (area < minArea) { cnt.delete(); continue; }
+      const minArea = sw * sh * 0.008; // 0.8% of frame — very permissive
+      const found: Candidate[] = [];
 
-      const rect = cv.boundingRect(cnt);
-      const aspect = rect.width / rect.height;
-      const centerY = rect.y + rect.height / 2;
-
-      // Shoes: wider than tall (aspect > 0.8), in bottom 80% of frame
-      if (aspect > 0.5 && centerY > sh * 0.15) {
-        candidates.push({ rect, area });
+      for (let i = 0; i < contours.size(); i++) {
+        const cnt = contours.get(i);
+        const area = cv.contourArea(cnt);
+        cnt.delete();
+        if (area < minArea) continue;
+        const rect = cv.boundingRect(contours.get(i));
+        contours.get(i).delete();
+        const centerY = rect.y + rect.height / 2;
+        // Very relaxed: any object in lower 90% of frame with reasonable size
+        if (centerY > sh * 0.10 && rect.width > sw * 0.04 && rect.height > sh * 0.04) {
+          found.push({ rect, area });
+        }
       }
-      cnt.delete();
+      return found;
+    }
+
+    let candidates: Candidate[] = [];
+
+    // Strategy 1: loose Canny (works for most lighting)
+    if (candidates.length < 2) {
+      const e = mat(new cv.Mat());
+      cv.Canny(blurred, e, 20, 60);
+      candidates = tryStrategy(e);
+    }
+    // Strategy 2: medium Canny
+    if (candidates.length < 2) {
+      const e = mat(new cv.Mat());
+      cv.Canny(blurred, e, 40, 120);
+      candidates = tryStrategy(e);
+    }
+    // Strategy 3: tight Canny
+    if (candidates.length < 2) {
+      const e = mat(new cv.Mat());
+      cv.Canny(blurred, e, 10, 40);
+      candidates = tryStrategy(e);
+    }
+    // Strategy 4: OTSU binary threshold (works when background and shoe contrast)
+    if (candidates.length < 2) {
+      const binary = mat(new cv.Mat());
+      cv.threshold(blurred, binary, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+      candidates = tryStrategy(binary);
+    }
+    // Strategy 5: adaptive threshold (works in uneven lighting)
+    if (candidates.length < 2) {
+      const adaptive = mat(new cv.Mat());
+      cv.adaptiveThreshold(blurred, adaptive, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
+      candidates = tryStrategy(adaptive);
     }
 
     if (candidates.length < 2) return null;
 
-    // Sort by area desc, pick top 6
+    // Sort by area desc, pick top 8
     candidates.sort((a, b) => b.area - a.area);
-    const top = candidates.slice(0, 6);
+    const top = candidates.slice(0, 8);
+
+    // Merge overlapping rects (IoU > 0.3) — keep larger
+    const merged: Candidate[] = [];
+    for (const c of top) {
+      const overlap = merged.find(m => {
+        const ix = Math.max(0, Math.min(m.rect.x+m.rect.width, c.rect.x+c.rect.width) - Math.max(m.rect.x, c.rect.x));
+        const iy = Math.max(0, Math.min(m.rect.y+m.rect.height, c.rect.y+c.rect.height) - Math.max(m.rect.y, c.rect.y));
+        const inter = ix * iy;
+        const uni = m.rect.width*m.rect.height + c.rect.width*c.rect.height - inter;
+        return inter / uni > 0.3;
+      });
+      if (!overlap) merged.push(c);
+      if (merged.length >= 6) break;
+    }
+
+    if (merged.length < 2) return null;
 
     // Find pair with max horizontal separation
-    let bestA = top[0], bestB = top[1], bestSep = 0;
-    for (let i = 0; i < top.length; i++) {
-      for (let j = i + 1; j < top.length; j++) {
-        const ca = top[i].rect.x + top[i].rect.width / 2;
-        const cb = top[j].rect.x + top[j].rect.width / 2;
+    let bestA = merged[0], bestB = merged[1], bestSep = 0;
+    for (let i = 0; i < merged.length; i++) {
+      for (let j = i + 1; j < merged.length; j++) {
+        const ca = merged[i].rect.x + merged[i].rect.width / 2;
+        const cb = merged[j].rect.x + merged[j].rect.width / 2;
         const sep = Math.abs(ca - cb);
-        if (sep > bestSep) { bestSep = sep; bestA = top[i]; bestB = top[j]; }
+        if (sep > bestSep) { bestSep = sep; bestA = merged[i]; bestB = merged[j]; }
       }
     }
 
-    // Minimum separation: shoes must be at least 5% of width apart
-    if (bestSep < sw * 0.05) return null;
+    // Require at least 3% width separation (very relaxed)
+    if (bestSep < sw * 0.03) return null;
 
     // Sort left → right
     const pair = [bestA, bestB].sort((a, b) => a.rect.x - b.rect.x);
@@ -135,10 +191,8 @@ function detectWithOpenCV(canvas: HTMLCanvasElement): { left: BBox; right: BBox 
     console.error("[OpenCV detect]", e);
     return null;
   } finally {
-    // Always clean up cv.Mat objects to avoid WASM memory leaks
-    const mats = [src, gray, blurred, edges, dilated, contours, hierarchy];
     for (const m of mats) {
-      try { if (m && (m as { delete?: () => void }).delete) (m as { delete: () => void }).delete(); } catch {}
+      try { if (m && m.delete) m.delete(); } catch {}
     }
   }
 }

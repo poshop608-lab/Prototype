@@ -1,0 +1,37 @@
+{
+  "name": "StrideVision",
+  "short_name": "StrideVision",
+  "description": "AI-powered shoe measurement platform",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0A0A0A",
+  "theme_color": "#0A0A0A",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["productivity", "utilities"],
+  "shortcuts": [
+    {
+      "name": "New Scan",
+      "url": "/scan",
+      "description": "Start a new shoe scan"
+    },
+    {
+      "name": "Scan History",
+      "url": "/scans",
+      "description": "View all scans"
+    }
+  ]
+}

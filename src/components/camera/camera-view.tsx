@@ -17,103 +17,186 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// ── Pure-canvas shoe detector ──────────────────────────────────────────────
-// Strategy: downsample frame, find non-background pixel clusters via
-// column/row projection, split into left/right halves, bounding-box each.
-// No model download. Runs in <100ms on any device.
+// ── Blob-based shoe detector ───────────────────────────────────────────────
+// 1. Downsample to thumbnail
+// 2. Compute per-pixel foreground mask vs adaptive background
+// 3. Run connected-component labeling (flood fill) on fg mask
+// 4. Pick top-2 largest blobs that are spatially separated
+// 5. Return their bounding boxes in original resolution
 function detectShoes(
   video: HTMLVideoElement,
   vw: number,
   vh: number
 ): { left: BBox; right: BBox } | null {
-  // Work on a small thumbnail for speed
-  const SCALE = 0.25;
+
+  const SCALE = 0.2; // 20% size — fast enough, enough detail
   const tw = Math.round(vw * SCALE);
   const th = Math.round(vh * SCALE);
 
   const thumb = document.createElement("canvas");
-  thumb.width = tw;
-  thumb.height = th;
+  thumb.width = tw; thumb.height = th;
   const tctx = thumb.getContext("2d", { willReadFrequently: true })!;
   tctx.drawImage(video, 0, 0, tw, th);
   const { data } = tctx.getImageData(0, 0, tw, th);
 
-  // Sample background from top-left 8x8 corner
-  let bgR = 0, bgG = 0, bgB = 0, bgN = 0;
-  for (let y = 0; y < Math.min(8, th); y++) {
-    for (let x = 0; x < Math.min(8, tw); x++) {
-      const i = (y * tw + x) * 4;
-      bgR += data[i]; bgG += data[i + 1]; bgB += data[i + 2];
-      bgN++;
+  // ── Adaptive background: sample 4 corners (avoid shoe area) ──
+  function sampleCorner(cx: number, cy: number, r = 6) {
+    let sr = 0, sg = 0, sb = 0, n = 0;
+    for (let y = cy; y < cy + r && y < th; y++) {
+      for (let x = cx; x < cx + r && x < tw; x++) {
+        const i = (y * tw + x) * 4;
+        sr += data[i]; sg += data[i+1]; sb += data[i+2]; n++;
+      }
     }
+    return n ? [sr/n, sg/n, sb/n] : [128, 128, 128];
   }
-  bgR /= bgN; bgG /= bgN; bgB /= bgN;
+  const corners = [
+    sampleCorner(0, 0), sampleCorner(tw-7, 0),
+    sampleCorner(0, th-7), sampleCorner(tw-7, th-7),
+  ];
+  const bgR = corners.reduce((s,c) => s+c[0], 0) / 4;
+  const bgG = corners.reduce((s,c) => s+c[1], 0) / 4;
+  const bgB = corners.reduce((s,c) => s+c[2], 0) / 4;
 
-  // Mark foreground pixels (differ from BG by >threshold or are dark enough to be shoes)
-  const FG_THRESH = 30;
-  const fg: boolean[] = new Array(tw * th).fill(false);
+  // ── Foreground mask ──
+  // A pixel is foreground if it differs enough from background
+  const FG_THRESH = 28;
+  const fg = new Uint8Array(tw * th);
   for (let y = 0; y < th; y++) {
     for (let x = 0; x < tw; x++) {
       const i = (y * tw + x) * 4;
-      const r = data[i], g = data[i + 1], b = data[i + 2];
+      const r = data[i], g = data[i+1], b = data[i+2];
       const diff = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
-      // Either differs from background OR is significantly dark (shoes are often dark)
-      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-      fg[y * tw + x] = diff > FG_THRESH || lum < 80;
+      fg[y * tw + x] = diff > FG_THRESH ? 1 : 0;
     }
   }
 
-  // Focus on bottom 70% of frame (shoes are on the ground)
-  const startY = Math.round(th * 0.30);
+  // ── Morphological close: dilate then erode to fill small holes ──
+  function dilate(src: Uint8Array, r = 1): Uint8Array {
+    const dst = new Uint8Array(tw * th);
+    for (let y = 0; y < th; y++) {
+      for (let x = 0; x < tw; x++) {
+        let v = 0;
+        outer: for (let dy = -r; dy <= r; dy++) {
+          for (let dx = -r; dx <= r; dx++) {
+            const ny = y+dy, nx = x+dx;
+            if (ny >= 0 && ny < th && nx >= 0 && nx < tw && src[ny*tw+nx]) { v = 1; break outer; }
+          }
+        }
+        dst[y*tw+x] = v;
+      }
+    }
+    return dst;
+  }
+  function erode(src: Uint8Array, r = 1): Uint8Array {
+    const dst = new Uint8Array(tw * th);
+    for (let y = 0; y < th; y++) {
+      for (let x = 0; x < tw; x++) {
+        let v = 1;
+        for (let dy = -r; dy <= r && v; dy++) {
+          for (let dx = -r; dx <= r && v; dx++) {
+            const ny = y+dy, nx = x+dx;
+            if (ny < 0 || ny >= th || nx < 0 || nx >= tw || !src[ny*tw+nx]) v = 0;
+          }
+        }
+        dst[y*tw+x] = v;
+      }
+    }
+    return dst;
+  }
+  const closed = erode(dilate(fg, 2), 2);
 
-  // Split into left half and right half, find bounding box in each
-  function getBBoxHalf(fromX: number, toX: number): BBox | null {
-    let minX = toX, maxX = fromX, minY = th, maxY = startY;
-    let count = 0;
-    for (let y = startY; y < th; y++) {
-      for (let x = fromX; x < toX; x++) {
-        if (fg[y * tw + x]) {
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-          count++;
+  // ── Connected components (BFS) ──
+  const label = new Int32Array(tw * th).fill(-1);
+  const blobs: { pixels: number[]; minX: number; maxX: number; minY: number; maxY: number }[] = [];
+
+  for (let start = 0; start < tw * th; start++) {
+    if (!closed[start] || label[start] !== -1) continue;
+    const queue = [start];
+    label[start] = blobs.length;
+    const blob = { pixels: [] as number[], minX: tw, maxX: 0, minY: th, maxY: 0 };
+    let head = 0;
+    while (head < queue.length) {
+      const idx = queue[head++];
+      const x = idx % tw, y = Math.floor(idx / tw);
+      blob.pixels.push(idx);
+      if (x < blob.minX) blob.minX = x;
+      if (x > blob.maxX) blob.maxX = x;
+      if (y < blob.minY) blob.minY = y;
+      if (y > blob.maxY) blob.maxY = y;
+      const neighbors = [idx-1, idx+1, idx-tw, idx+tw];
+      for (const n of neighbors) {
+        const nx = n % tw, ny = Math.floor(n / tw);
+        if (n >= 0 && n < tw*th && nx >= 0 && nx < tw && ny >= 0 && ny < th && closed[n] && label[n] === -1) {
+          label[n] = blobs.length;
+          queue.push(n);
         }
       }
     }
-    // Require at least 1% of half to be foreground
-    const area = (toX - fromX) * (th - startY);
-    if (count < area * 0.01) return null;
-    // Require reasonable aspect ratio (shoe is wider than it is tall generally)
-    const w = maxX - minX;
-    const h = maxY - minY;
-    if (w < 4 || h < 4) return null;
-    return {
-      minX: Math.round(minX / SCALE),
-      maxX: Math.round(maxX / SCALE),
-      minY: Math.round(minY / SCALE),
-      maxY: Math.round(maxY / SCALE),
-    };
+    blobs.push(blob);
   }
 
-  const midX = Math.round(tw / 2);
-  const leftBBox = getBBoxHalf(0, midX);
-  const rightBBox = getBBoxHalf(midX, tw);
+  if (blobs.length === 0) return null;
 
-  if (!leftBBox || !rightBBox) return null;
+  // ── Filter blobs: min size, must be in lower 80% of frame ──
+  const minArea = tw * th * 0.02; // at least 2% of frame
+  const validBlobs = blobs.filter(b => {
+    const area = b.pixels.length;
+    const centerY = (b.minY + b.maxY) / 2;
+    return area >= minArea && centerY > th * 0.2;
+  });
 
-  // Add small padding
-  const PAD = 8;
-  function pad(b: BBox): BBox {
-    return {
-      minX: Math.max(0, b.minX - PAD),
-      maxX: Math.min(vw, b.maxX + PAD),
-      minY: Math.max(0, b.minY - PAD),
-      maxY: Math.min(vh, b.maxY + PAD),
-    };
+  if (validBlobs.length < 2) {
+    // Relax constraints if we can't find 2
+    const relaxed = blobs
+      .filter(b => b.pixels.length >= tw * th * 0.005)
+      .sort((a, b) => b.pixels.length - a.pixels.length)
+      .slice(0, 2);
+    if (relaxed.length < 2) return null;
+    relaxed.sort((a, b) => a.minX - b.minX); // left→right
+    return bboxPair(relaxed[0], relaxed[1], SCALE, vw, vh);
   }
 
-  return { left: pad(leftBBox), right: pad(rightBBox) };
+  // Sort by size, take top 4, then pick the best left+right pair
+  const top = validBlobs
+    .sort((a, b) => b.pixels.length - a.pixels.length)
+    .slice(0, 4);
+
+  // Find pair that maximises horizontal separation
+  let bestPair: [typeof top[0], typeof top[0]] | null = null;
+  let bestSep = 0;
+  for (let i = 0; i < top.length; i++) {
+    for (let j = i+1; j < top.length; j++) {
+      const sep = Math.abs(
+        (top[i].minX + top[i].maxX)/2 - (top[j].minX + top[j].maxX)/2
+      );
+      if (sep > bestSep) { bestSep = sep; bestPair = [top[i], top[j]]; }
+    }
+  }
+  if (!bestPair) return null;
+
+  // Ensure left is left
+  bestPair.sort((a, b) => a.minX - b.minX);
+  return bboxPair(bestPair[0], bestPair[1], SCALE, vw, vh);
+}
+
+function bboxPair(
+  a: { minX: number; maxX: number; minY: number; maxY: number },
+  b: { minX: number; maxX: number; minY: number; maxY: number },
+  scale: number,
+  vw: number,
+  vh: number
+): { left: BBox; right: BBox } {
+  const PAD = 10;
+  function toFull(bbox: typeof a): BBox {
+    return {
+      minX: Math.max(0, Math.round(bbox.minX / scale) - PAD),
+      maxX: Math.min(vw, Math.round(bbox.maxX / scale) + PAD),
+      minY: Math.max(0, Math.round(bbox.minY / scale) - PAD),
+      maxY: Math.min(vh, Math.round(bbox.maxY / scale) + PAD),
+    };
+  }
+  return { left: toFull(a), right: toFull(b) };
 }
 
 export function CameraView({ onCapture, onError }: Props) {
@@ -178,7 +261,9 @@ export function CameraView({ onCapture, onError }: Props) {
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, vw, vh);
 
-    // Run detection synchronously (pure canvas, no async needed)
+    // Yield to let UI update before heavy computation
+    await new Promise(r => setTimeout(r, 30));
+
     const result = detectShoes(video, vw, vh);
 
     setIsAnalyzing(false);
@@ -186,30 +271,29 @@ export function CameraView({ onCapture, onError }: Props) {
     if (!result) {
       setIsCapturing(false);
       setStatusMsg("");
-      onError("Could not detect two shoes. Ensure both shoes are on a contrasting surface in landscape mode, then retry.");
+      onError("Could not find two distinct shoes. Place both shoes on a contrasting surface with clear separation, then retry.");
       return;
     }
 
     const { left: lb, right: rb } = result;
 
-    // Tilt check — baselines must be within 8% of frame height
+    // Tilt check
     const bottomDiff = Math.abs(lb.maxY - rb.maxY);
-    if (bottomDiff > vh * 0.08) {
+    if (bottomDiff > vh * 0.10) {
       setIsCapturing(false);
       setStatusMsg("");
-      onError(`Camera tilted — shoe baselines differ by ${Math.round(bottomDiff)}px. Level the phone and retake.`);
+      onError(`Camera tilted — shoe baselines differ by ${Math.round(bottomDiff)}px. Level the camera and retake.`);
       return;
     }
 
+    // Shared ground baseline = lower of the two box bottoms
     const groundY = Math.max(lb.maxY, rb.maxY);
 
     function drawBox(bounds: BBox, label: string) {
-      // Fill
       ctx.beginPath();
       ctx.rect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
       ctx.fillStyle = `${GREEN}22`;
       ctx.fill();
-      // Stroke with glow
       ctx.strokeStyle = GREEN;
       ctx.lineWidth = 3;
       ctx.shadowColor = GREEN;
@@ -217,6 +301,7 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.stroke();
       ctx.shadowBlur = 0;
 
+      // Height = from top of shoe bbox to shared ground
       const heightPx = groundY - bounds.minY;
       const widthPx = bounds.maxX - bounds.minX;
       const hMm = pxToMm(heightPx);
@@ -225,7 +310,6 @@ export function CameraView({ onCapture, onError }: Props) {
       const midY = (bounds.minY + groundY) / 2;
       const rX = Math.min(bounds.maxX + 8, vw - 90);
 
-      // Height label
       ctx.font = "bold 16px monospace";
       const hl = `${hMm}mm`;
       ctx.fillStyle = "rgba(0,0,0,0.85)";
@@ -234,24 +318,21 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.textAlign = "left";
       ctx.fillText(hl, rX + 2, midY + 4);
 
-      // Width label
       const wl = `${wMm}mm`;
       ctx.fillStyle = "rgba(0,0,0,0.85)";
-      ctx.fillRect(midX - ctx.measureText(wl).width / 2 - 4, Math.max(bounds.minY - 26, 0), ctx.measureText(wl).width + 8, 18);
+      ctx.fillRect(midX - ctx.measureText(wl).width/2 - 4, Math.max(bounds.minY - 26, 0), ctx.measureText(wl).width + 8, 18);
       ctx.fillStyle = GREEN;
       ctx.textAlign = "center";
       ctx.fillText(wl, midX, Math.max(bounds.minY - 10, 14));
 
-      // LEFT/RIGHT badge
       ctx.font = "bold 13px monospace";
       const bw = ctx.measureText(label).width + 14;
       ctx.fillStyle = `${GREEN}cc`;
-      ctx.fillRect(midX - bw / 2, Math.min(groundY + 6, vh - 22), bw, 18);
+      ctx.fillRect(midX - bw/2, Math.min(groundY + 6, vh - 22), bw, 18);
       ctx.fillStyle = "#000";
       ctx.textAlign = "center";
       ctx.fillText(label, midX, Math.min(groundY + 19, vh - 8));
 
-      // Ground baseline dashes
       ctx.strokeStyle = `${GREEN}80`;
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 4]);
@@ -270,7 +351,6 @@ export function CameraView({ onCapture, onError }: Props) {
     const diff = parseFloat(Math.abs(leftResult.hMm - rightResult.hMm).toFixed(1));
     const passed = diff <= 3;
 
-    // Result banner
     ctx.fillStyle = `${passed ? GREEN : RED}ee`;
     ctx.fillRect(0, vh - 48, vw, 48);
     ctx.font = "bold 20px monospace";
@@ -281,10 +361,9 @@ export function CameraView({ onCapture, onError }: Props) {
       vw / 2, vh - 16
     );
 
-    // Method stamp
     ctx.font = "11px monospace";
     ctx.fillStyle = "rgba(0,0,0,0.7)";
-    const stamp = `CV: instant detection | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
+    const stamp = `CV | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
     ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
     ctx.fillStyle = GREEN;
     ctx.textAlign = "left";
@@ -310,10 +389,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
       setShowSuccess(true);
       setStatusMsg("");
-      setTimeout(() => {
-        setShowSuccess(false);
-        setIsCapturing(false);
-      }, 1200);
+      setTimeout(() => { setShowSuccess(false); setIsCapturing(false); }, 1200);
     } catch {
       onError("Failed to compress image");
       setIsCapturing(false);
@@ -335,11 +411,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
   return (
     <div className="relative w-full h-full bg-black overflow-hidden">
-      <video
-        ref={videoRef}
-        className="absolute inset-0 w-full h-full object-cover"
-        playsInline muted autoPlay
-      />
+      <video ref={videoRef} className="absolute inset-0 w-full h-full object-cover" playsInline muted autoPlay />
       <canvas ref={captureCanvasRef} className="hidden" />
 
       {!isReady && (
@@ -357,7 +429,7 @@ export function CameraView({ onCapture, onError }: Props) {
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
             <p className="text-base font-bold" style={{ color: CYAN }}>Detecting shoes...</p>
-            <p className="text-xs mt-1" style={{ color: "#666" }}>Instant — no model download</p>
+            <p className="text-xs mt-1" style={{ color: "#666" }}>Blob detection — instant</p>
           </motion.div>
         )}
       </AnimatePresence>
@@ -377,7 +449,7 @@ export function CameraView({ onCapture, onError }: Props) {
             className="px-4 py-2 rounded-full text-xs font-semibold text-center whitespace-nowrap"
             style={{ background: "rgba(0,0,0,0.7)", border: `1px solid ${CYAN}40`, color: "#ccc", backdropFilter: "blur(6px)" }}
           >
-            Place both shoes side-by-side on a flat surface · landscape mode
+            Shoes side-by-side · contrasting surface · landscape
           </div>
         </div>
       )}

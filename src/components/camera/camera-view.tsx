@@ -75,16 +75,17 @@ function detectShoes(
     }
 
     // Step 2: Find shoe TOP — scan upward from bottom
-    // Stop at 4 consecutive empty rows (= entered wall/background)
+    // Stop at 3 consecutive empty rows (= entered wall/background)
+    // Use lower threshold (0.04) to catch narrow curved top of shoe
     let shoeTop = shoeBottom;
     let emptyStreak = 0;
     for (let y = shoeBottom - 1; y >= 0; y--) {
-      if (density[y] > 0.07) {
+      if (density[y] > 0.04) {
         shoeTop = y;
         emptyStreak = 0;
       } else {
         emptyStreak++;
-        if (emptyStreak >= 4) break;
+        if (emptyStreak >= 3) break;
       }
     }
 
@@ -379,7 +380,7 @@ export function CameraView({ onCapture, onError }: Props) {
         <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
           <div className="px-4 py-1.5 rounded-full text-xs font-semibold text-center whitespace-nowrap"
             style={{ background: "rgba(0,0,0,0.75)", border: `1px solid ${CYAN}40`, color: "#ccc" }}>
-            One shoe each side of the line · landscape · tap capture
+            Side view · both toes facing same way · landscape
           </div>
         </div>
       )}

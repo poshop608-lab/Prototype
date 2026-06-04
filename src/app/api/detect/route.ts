@@ -29,10 +29,17 @@ If you cannot find two shoes, return {"shoes":[]}.`;
     generationConfig: { temperature: 0, maxOutputTokens: 256 }
   };
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+  // Try gemini-2.0-flash first (current), fall back to 1.5-flash
+  let res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
     { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
   );
+  if (res.status === 404) {
+    res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+    );
+  }
 
   if (!res.ok) {
     const text = await res.text();

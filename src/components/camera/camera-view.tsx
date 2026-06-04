@@ -17,10 +17,11 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// ── Sobel + luminance shoe detector ───────────────────────────────────────
-// Shoe pixels = high Sobel edge gradient (texture/outline) OR lum diff from bg
-// Wall = flat = low gradient → excluded even if lum matches shoe
-// Bottom-anchored: find shoe base first, scan up, stop at flat wall gap
+// ── Guaranteed split-frame detector ───────────────────────────────────────
+// Splits frame into left/right halves. In each half, finds the tightest
+// bounding box around foreground pixels using pixel luminance analysis.
+// Falls back to 80% of half-frame if no clear foreground found.
+// NEVER fails — always returns two boxes.
 function detectShoes(
   canvas: HTMLCanvasElement,
   vw: number,
@@ -36,97 +37,59 @@ function detectShoes(
   tctx.drawImage(canvas, 0, 0, tw, th);
   const { data } = tctx.getImageData(0, 0, tw, th);
 
-  // Grayscale array
-  const gray = new Float32Array(tw * th);
-  for (let y = 0; y < th; y++) {
+  // Sample background luminance from top strip (sky/wall above shoes)
+  let bgLum = 0, bgN = 0;
+  const topStrip = Math.round(th * 0.15);
+  for (let y = 0; y < topStrip; y++) {
     for (let x = 0; x < tw; x++) {
       const i = (y * tw + x) * 4;
-      gray[y * tw + x] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-    }
-  }
-
-  // Background lum: top-center strip (wall)
-  let bgLum = 0, bgN = 0;
-  for (let y = 0; y < Math.round(th * 0.18); y++) {
-    for (let x = Math.round(tw * 0.05); x < Math.round(tw * 0.95); x++) {
-      bgLum += gray[y * tw + x]; bgN++;
+      bgLum += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+      bgN++;
     }
   }
   bgLum /= bgN;
 
-  // Sobel gradient magnitude at each pixel
-  const SOBEL_THRESH = 18;
-  const LUM_THRESH   = 22;
-  const isFg = new Uint8Array(tw * th);
-  for (let y = 1; y < th - 1; y++) {
-    for (let x = 1; x < tw - 1; x++) {
-      const gx =
-        -gray[(y-1)*tw+(x-1)] - 2*gray[y*tw+(x-1)] - gray[(y+1)*tw+(x-1)]
-        +gray[(y-1)*tw+(x+1)] + 2*gray[y*tw+(x+1)] + gray[(y+1)*tw+(x+1)];
-      const gy =
-        -gray[(y-1)*tw+(x-1)] - 2*gray[(y-1)*tw+x] - gray[(y-1)*tw+(x+1)]
-        +gray[(y+1)*tw+(x-1)] + 2*gray[(y+1)*tw+x] + gray[(y+1)*tw+(x+1)];
-      const mag = Math.sqrt(gx * gx + gy * gy);
-      const lumDiff = Math.abs(gray[y * tw + x] - bgLum);
-      // Shoe pixel = strong edge OR clear lum diff (not in top 12% = not wall)
-      isFg[y * tw + x] = (mag > SOBEL_THRESH || (lumDiff > LUM_THRESH && y > th * 0.12)) ? 1 : 0;
-    }
-  }
-
+  // For each half, find tight bbox of pixels that differ from background
   function halfBBox(fromX: number, toX: number): BBox {
-    const halfW = toX - fromX;
+    let minX = toX, maxX = fromX, minY = th, maxY = 0;
+    let found = false;
 
-    // Per-row density from combined fg mask
-    const density = new Float32Array(th);
-    for (let y = 0; y < th; y++) {
-      let fg = 0;
-      for (let x = fromX; x < toX; x++) fg += isFg[y * tw + x];
-      density[y] = fg / halfW;
-    }
+    // Threshold: pixel is "shoe" if luminance differs enough from bg
+    // Use both dark-object-on-light and light-object-on-dark detection
+    const THRESH = 35;
 
-    // Find shoe BOTTOM: scan from 88% of frame upward, first dense row
-    let shoeBottom = Math.round(th * 0.78);
-    for (let y = Math.round(th * 0.88); y >= Math.round(th * 0.20); y--) {
-      if (density[y] > 0.12) { shoeBottom = y; break; }
-    }
-
-    // Find shoe TOP: scan up from bottom, stop at 3 consecutive empty rows
-    let shoeTop = shoeBottom;
-    let empty = 0;
-    for (let y = shoeBottom - 1; y >= 0; y--) {
-      if (density[y] > 0.05) { shoeTop = y; empty = 0; }
-      else if (++empty >= 3) break;
-    }
-
-    // Horizontal extent within shoe band only
-    let minX = toX, maxX = fromX;
-    for (let y = shoeTop; y <= shoeBottom; y++) {
+    for (let y = Math.round(th * 0.1); y < th; y++) {
       for (let x = fromX; x < toX; x++) {
-        if (isFg[y * tw + x]) {
+        const i = (y * tw + x) * 4;
+        const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+        if (Math.abs(lum - bgLum) > THRESH) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+          found = true;
         }
       }
     }
 
-    const boxH = shoeBottom - shoeTop;
-    const boxW = maxX - minX;
-    if (boxH < th * 0.05 || boxW < halfW * 0.05) {
-      const pad = Math.round(halfW * 0.08);
+    if (!found || maxX - minX < tw * 0.03 || maxY - minY < th * 0.03) {
+      // Fallback: use central 80% of the half
+      const pad = Math.round((toX - fromX) * 0.10);
+      const vpad = Math.round(th * 0.10);
       return {
         minX: Math.round((fromX + pad) / SCALE),
         maxX: Math.round((toX - pad) / SCALE),
-        minY: Math.round(th * 0.15 / SCALE),
-        maxY: Math.round(shoeBottom / SCALE),
+        minY: Math.round(vpad / SCALE),
+        maxY: Math.round((th - vpad) / SCALE),
       };
     }
 
-    const PAD = 3;
+    const PAD = 4;
     return {
       minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
       maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
-      minY: Math.max(0, Math.round((shoeTop - PAD) / SCALE)),
-      maxY: Math.min(vh, Math.round((shoeBottom + PAD) / SCALE)),
+      minY: Math.max(0, Math.round((minY - PAD) / SCALE)),
+      maxY: Math.min(vh, Math.round((maxY + PAD) / SCALE)),
     };
   }
 
@@ -387,7 +350,7 @@ export function CameraView({ onCapture, onError }: Props) {
         <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
           <div className="px-4 py-1.5 rounded-full text-xs font-semibold text-center whitespace-nowrap"
             style={{ background: "rgba(0,0,0,0.75)", border: `1px solid ${CYAN}40`, color: "#ccc" }}>
-            Side view · both toes facing same way · landscape
+            One shoe each side of the line · landscape · tap capture
           </div>
         </div>
       )}

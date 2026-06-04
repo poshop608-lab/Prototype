@@ -17,6 +17,113 @@ interface Props {
   onError: (msg: string) => void;
 }
 
+// ── Green-background shoe detector ────────────────────────────────────────
+// Detects bright green background pixels, everything non-green = shoe.
+// Works on any shoe color. Split left/right halves for two shoes.
+// Falls back to luminance diff if background is not green enough.
+function detectShoes(canvas: HTMLCanvasElement, vw: number, vh: number): { left: BBox; right: BBox } {
+  const SCALE = 0.25;
+  const tw = Math.round(vw * SCALE);
+  const th = Math.round(vh * SCALE);
+
+  const thumb = document.createElement("canvas");
+  thumb.width = tw; thumb.height = th;
+  const tctx = thumb.getContext("2d", { willReadFrequently: true })!;
+  tctx.drawImage(canvas, 0, 0, tw, th);
+  const { data } = tctx.getImageData(0, 0, tw, th);
+
+  // Check if background is green: sample corners + edges
+  function isGreenPixel(r: number, g: number, b: number): boolean {
+    // Green dominant: g > r*1.3 AND g > b*1.3 AND g > 80
+    return g > r * 1.25 && g > b * 1.25 && g > 80;
+  }
+
+  // Sample many background points to determine if green bg is present
+  let greenCount = 0, sampleCount = 0;
+  const samplePoints = [
+    [0, 0], [tw - 1, 0], [0, th - 1], [tw - 1, th - 1],
+    [Math.round(tw * 0.25), 0], [Math.round(tw * 0.75), 0],
+    [0, Math.round(th * 0.25)], [tw - 1, Math.round(th * 0.25)],
+  ];
+  for (const [x, y] of samplePoints) {
+    const i = (y * tw + x) * 4;
+    if (isGreenPixel(data[i], data[i + 1], data[i + 2])) greenCount++;
+    sampleCount++;
+  }
+  const hasGreenBg = greenCount / sampleCount >= 0.4;
+
+  function halfBBox(fromX: number, toX: number): BBox {
+    let minX = toX, maxX = fromX, minY = th, maxY = 0;
+    let found = false;
+    const scanY0 = Math.round(th * 0.05);
+    const scanY1 = Math.round(th * 0.90);
+
+    if (hasGreenBg) {
+      // Non-green pixels = shoe
+      for (let y = scanY0; y < scanY1; y++) {
+        for (let x = fromX; x < toX; x++) {
+          const i = (y * tw + x) * 4;
+          const r = data[i], g = data[i + 1], b = data[i + 2];
+          if (!isGreenPixel(r, g, b)) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+            found = true;
+          }
+        }
+      }
+    } else {
+      // Fallback: luminance diff from top-strip background
+      let bgLum = 0, bgN = 0;
+      for (let y = 0; y < Math.round(th * 0.15); y++) {
+        for (let x = fromX; x < toX; x++) {
+          const i = (y * tw + x) * 4;
+          bgLum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          bgN++;
+        }
+      }
+      bgLum /= bgN;
+
+      for (let y = scanY0; y < scanY1; y++) {
+        for (let x = fromX; x < toX; x++) {
+          const i = (y * tw + x) * 4;
+          const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          if (Math.abs(lum - bgLum) > 30) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+            found = true;
+          }
+        }
+      }
+    }
+
+    const halfW = toX - fromX;
+    if (!found || maxX - minX < halfW * 0.05 || maxY - minY < th * 0.04) {
+      const pad = Math.round(halfW * 0.08);
+      return {
+        minX: Math.round((fromX + pad) / SCALE),
+        maxX: Math.round((toX - pad) / SCALE),
+        minY: Math.round(th * 0.15 / SCALE),
+        maxY: Math.round(th * 0.85 / SCALE),
+      };
+    }
+
+    const PAD = 4;
+    return {
+      minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
+      maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
+      minY: Math.max(0, Math.round((minY - PAD) / SCALE)),
+      maxY: Math.min(vh, Math.round((maxY + PAD) / SCALE)),
+    };
+  }
+
+  const mid = Math.round(tw / 2);
+  return { left: halfBBox(0, mid), right: halfBBox(mid, tw) };
+}
+
 export function CameraView({ onCapture, onError }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -27,7 +134,6 @@ export function CameraView({ onCapture, onError }: Props) {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [isPortrait, setIsPortrait] = useState(false);
-  const [statusMsg, setStatusMsg] = useState("");
 
   useEffect(() => {
     function check() { setIsPortrait(window.innerHeight > window.innerWidth); }
@@ -70,7 +176,6 @@ export function CameraView({ onCapture, onError }: Props) {
 
     setIsCapturing(true);
     setIsAnalyzing(true);
-    setStatusMsg("Analyzing with AI...");
 
     const vw = video.videoWidth || 1280;
     const vh = video.videoHeight || 720;
@@ -79,68 +184,10 @@ export function CameraView({ onCapture, onError }: Props) {
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, vw, vh);
 
-    // Encode frame to base64 JPEG at 800px width for API
-    const encCanvas = document.createElement("canvas");
-    const encW = 800;
-    const encH = Math.round(vh * (encW / vw));
-    encCanvas.width = encW; encCanvas.height = encH;
-    encCanvas.getContext("2d")!.drawImage(canvas, 0, 0, encW, encH);
-    const b64 = encCanvas.toDataURL("image/jpeg", 0.85).split(",")[1];
+    await new Promise(r => setTimeout(r, 20));
 
-    let lb: BBox, rb: BBox;
-
-    try {
-      const res = await fetch("/api/detect", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageBase64: b64 }),
-        signal: AbortSignal.timeout(15000),
-      });
-      const data = await res.json();
-
-      if (!res.ok || !data.shoes || data.shoes.length < 2) {
-        throw new Error(data.error ?? `Only ${data.shoes?.length ?? 0} shoes detected`);
-      }
-
-      // Gemini returns [y1, x1, y2, x2] normalized 0-1000
-      function toPixelBBox(box: number[]): BBox {
-        const [y1, x1, y2, x2] = box;
-        return {
-          minX: Math.round((x1 / 1000) * vw),
-          maxX: Math.round((x2 / 1000) * vw),
-          minY: Math.round((y1 / 1000) * vh),
-          maxY: Math.round((y2 / 1000) * vh),
-        };
-      }
-
-      // Sort by x center to ensure left/right order
-      const sorted = [...data.shoes].sort((a: {box: number[]}, b: {box: number[]}) => {
-        const ca = (a.box[1] + a.box[3]) / 2;
-        const cb = (b.box[1] + b.box[3]) / 2;
-        return ca - cb;
-      });
-
-      lb = toPixelBBox(sorted[0].box);
-      rb = toPixelBBox(sorted[1].box);
-
-    } catch (e) {
-      setIsAnalyzing(false);
-      setIsCapturing(false);
-      setStatusMsg("");
-      onError(`Detection failed: ${e instanceof Error ? e.message : "unknown"}. Ensure both shoes are clearly visible.`);
-      return;
-    }
-
+    const { left: lb, right: rb } = detectShoes(canvas, vw, vh);
     setIsAnalyzing(false);
-    setStatusMsg("");
-
-    // Tilt check
-    const bottomDiff = Math.abs(lb.maxY - rb.maxY);
-    if (bottomDiff > vh * 0.12) {
-      setIsCapturing(false);
-      onError(`Camera tilted — shoe baselines differ by ${Math.round(bottomDiff)}px. Level the camera.`);
-      return;
-    }
 
     const groundY = Math.max(lb.maxY, rb.maxY);
 
@@ -194,6 +241,16 @@ export function CameraView({ onCapture, onError }: Props) {
     const leftResult = drawBox(lb, "LEFT");
     const rightResult = drawBox(rb, "RIGHT");
 
+    // Center divider
+    ctx.strokeStyle = `${CYAN}60`;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([6, 6]);
+    ctx.beginPath();
+    ctx.moveTo(vw / 2, 0);
+    ctx.lineTo(vw / 2, vh);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
     const diff = parseFloat(Math.abs(leftResult.hMm - rightResult.hMm).toFixed(1));
     const passed = diff <= 3;
 
@@ -209,7 +266,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
     ctx.font = "11px monospace";
     ctx.fillStyle = "rgba(0,0,0,0.7)";
-    const stamp = `Gemini | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
+    const stamp = `CV | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
     ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
     ctx.fillStyle = GREEN;
     ctx.textAlign = "left";
@@ -234,12 +291,10 @@ export function CameraView({ onCapture, onError }: Props) {
       });
 
       setShowSuccess(true);
-      setStatusMsg("");
       setTimeout(() => { setShowSuccess(false); setIsCapturing(false); }, 1200);
     } catch {
       onError("Failed to compress image");
       setIsCapturing(false);
-      setStatusMsg("");
     }
   }, [isCapturing, isAnalyzing, onCapture, onError]);
 
@@ -271,37 +326,42 @@ export function CameraView({ onCapture, onError }: Props) {
           <motion.div
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
             className="absolute inset-0 flex flex-col items-center justify-center z-30"
-            style={{ background: "rgba(0,0,0,0.65)", backdropFilter: "blur(4px)" }}
+            style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
-            <p className="text-base font-bold" style={{ color: CYAN }}>AI Analyzing...</p>
-            <p className="text-xs mt-1" style={{ color: "#666" }}>Gemini Vision detecting shoes</p>
+            <p className="text-base font-bold" style={{ color: CYAN }}>Measuring shoes...</p>
           </motion.div>
         )}
       </AnimatePresence>
 
       {isReady && !isCapturing && (
         <div className="absolute inset-0 pointer-events-none">
-          <div className="absolute top-8 left-8 w-12 h-12" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
-          <div className="absolute top-8 right-8 w-12 h-12" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
-          <div className="absolute bottom-24 left-8 w-12 h-12" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
-          <div className="absolute bottom-24 right-8 w-12 h-12" style={{ borderBottom: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
+          <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-40"
+            style={{ background: `repeating-linear-gradient(to bottom, ${CYAN} 0px, ${CYAN} 8px, transparent 8px, transparent 16px)` }} />
+          <div className="absolute left-4 top-1/2 -translate-y-1/2">
+            <div className="px-3 py-1 rounded-full text-xs font-bold"
+              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
+              LEFT SHOE
+            </div>
+          </div>
+          <div className="absolute right-4 top-1/2 -translate-y-1/2">
+            <div className="px-3 py-1 rounded-full text-xs font-bold"
+              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
+              RIGHT SHOE
+            </div>
+          </div>
+          <div className="absolute top-8 left-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
+          <div className="absolute top-8 right-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
+          <div className="absolute bottom-24 left-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
+          <div className="absolute bottom-24 right-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
         </div>
       )}
 
       {isReady && !isCapturing && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10">
-          <div className="px-4 py-2 rounded-full text-xs font-semibold text-center whitespace-nowrap"
-            style={{ background: "rgba(0,0,0,0.7)", border: `1px solid ${CYAN}40`, color: "#ccc", backdropFilter: "blur(6px)" }}>
-            Place both shoes side-by-side · landscape · tap capture
-          </div>
-        </div>
-      )}
-
-      {statusMsg && (
-        <div className="absolute bottom-28 left-0 right-0 flex justify-center z-10">
-          <div className="px-4 py-2 rounded-full text-xs font-semibold" style={{ background: "rgba(0,0,0,0.7)", color: CYAN }}>
-            {statusMsg}
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
+          <div className="px-4 py-1.5 rounded-full text-xs font-semibold text-center whitespace-nowrap"
+            style={{ background: "rgba(0,0,0,0.75)", border: `1px solid ${CYAN}40`, color: "#ccc" }}>
+            Green paper bg · one shoe each side · landscape
           </div>
         </div>
       )}
@@ -337,7 +397,7 @@ export function CameraView({ onCapture, onError }: Props) {
           )}
         </button>
         <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.5)" }}>
-          {isAnalyzing ? "analyzing..." : isCapturing ? "processing..." : "tap to capture"}
+          {isAnalyzing ? "measuring..." : isCapturing ? "processing..." : "tap to capture"}
         </span>
       </div>
     </div>

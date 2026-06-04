@@ -89,16 +89,22 @@ function detectShoes(
       return { bbox: fb, polygon: bboxToPolygon(fb) };
     }
 
-    // Pass 2: refine minY bottom-up within detected x-range
+    // Pass 2: refine minY bottom-up within detected x-range.
+    // Threshold 0.20: actual shoe rows >0.35 density; wall marks <0.06.
+    // emptyStreak 2: 2 consecutive sub-threshold rows = above shoe, stop.
+    // Max-height clamp: shoe height cannot exceed 55% of frame.
     let refinedMinY = maxY;
     let emptyStreak = 0;
     for (let y = maxY - 1; y >= minY; y--) {
       let rowFg = 0;
       for (let x = minX; x <= maxX; x++) if (isFg(x, y)) rowFg++;
-      if (rowFg / (maxX - minX + 1) > 0.08) {
+      if (rowFg / (maxX - minX + 1) > 0.20) {
         refinedMinY = y; emptyStreak = 0;
-      } else if (++emptyStreak >= 4) break;
+      } else if (++emptyStreak >= 2) break;
     }
+    // Hard clamp: never let the box be taller than 55% of frame height
+    const maxBoxHeight = Math.round(th * 0.55);
+    if (maxY - refinedMinY > maxBoxHeight) refinedMinY = maxY - maxBoxHeight;
     minY = refinedMinY;
 
     // Pass 3: trace left + right edges row by row within shoe band
@@ -293,6 +299,17 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.lineTo(bbox.maxX, groundY);
       ctx.stroke();
       ctx.setLineDash([]);
+
+      // Debug: TOP point (cyan dot)
+      ctx.beginPath();
+      ctx.arc(midX, bbox.minY, 6, 0, Math.PI * 2);
+      ctx.fillStyle = CYAN;
+      ctx.fill();
+      // Debug: BOTTOM point (cyan dot)
+      ctx.beginPath();
+      ctx.arc(midX, bbox.maxY, 6, 0, Math.PI * 2);
+      ctx.fillStyle = CYAN;
+      ctx.fill();
 
       return { hMm, wMm };
     }

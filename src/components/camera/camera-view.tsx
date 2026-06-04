@@ -17,89 +17,6 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// ── Guaranteed split-frame detector ───────────────────────────────────────
-// Splits frame into left/right halves. In each half, finds the tightest
-// bounding box around foreground pixels using pixel luminance analysis.
-// Falls back to 80% of half-frame if no clear foreground found.
-// NEVER fails — always returns two boxes.
-function detectShoes(
-  canvas: HTMLCanvasElement,
-  vw: number,
-  vh: number
-): { left: BBox; right: BBox } {
-  const SCALE = 0.25;
-  const tw = Math.round(vw * SCALE);
-  const th = Math.round(vh * SCALE);
-
-  const thumb = document.createElement("canvas");
-  thumb.width = tw; thumb.height = th;
-  const tctx = thumb.getContext("2d", { willReadFrequently: true })!;
-  tctx.drawImage(canvas, 0, 0, tw, th);
-  const { data } = tctx.getImageData(0, 0, tw, th);
-
-  // Sample background luminance from top strip (sky/wall above shoes)
-  let bgLum = 0, bgN = 0;
-  const topStrip = Math.round(th * 0.15);
-  for (let y = 0; y < topStrip; y++) {
-    for (let x = 0; x < tw; x++) {
-      const i = (y * tw + x) * 4;
-      bgLum += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-      bgN++;
-    }
-  }
-  bgLum /= bgN;
-
-  // For each half, find tight bbox of pixels that differ from background
-  function halfBBox(fromX: number, toX: number): BBox {
-    let minX = toX, maxX = fromX, minY = th, maxY = 0;
-    let found = false;
-
-    // Threshold: pixel is "shoe" if luminance differs enough from bg
-    // Use both dark-object-on-light and light-object-on-dark detection
-    const THRESH = 35;
-
-    for (let y = Math.round(th * 0.1); y < th; y++) {
-      for (let x = fromX; x < toX; x++) {
-        const i = (y * tw + x) * 4;
-        const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-        if (Math.abs(lum - bgLum) > THRESH) {
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-          found = true;
-        }
-      }
-    }
-
-    if (!found || maxX - minX < tw * 0.03 || maxY - minY < th * 0.03) {
-      // Fallback: use central 80% of the half
-      const pad = Math.round((toX - fromX) * 0.10);
-      const vpad = Math.round(th * 0.10);
-      return {
-        minX: Math.round((fromX + pad) / SCALE),
-        maxX: Math.round((toX - pad) / SCALE),
-        minY: Math.round(vpad / SCALE),
-        maxY: Math.round((th - vpad) / SCALE),
-      };
-    }
-
-    const PAD = 4;
-    return {
-      minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
-      maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
-      minY: Math.max(0, Math.round((minY - PAD) / SCALE)),
-      maxY: Math.min(vh, Math.round((maxY + PAD) / SCALE)),
-    };
-  }
-
-  const mid = Math.round(tw / 2);
-  return {
-    left: halfBBox(0, mid),
-    right: halfBBox(mid, tw),
-  };
-}
-
 export function CameraView({ onCapture, onError }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -110,6 +27,7 @@ export function CameraView({ onCapture, onError }: Props) {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [isPortrait, setIsPortrait] = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
 
   useEffect(() => {
     function check() { setIsPortrait(window.innerHeight > window.innerWidth); }
@@ -152,6 +70,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
     setIsCapturing(true);
     setIsAnalyzing(true);
+    setStatusMsg("Analyzing with AI...");
 
     const vw = video.videoWidth || 1280;
     const vh = video.videoHeight || 720;
@@ -160,10 +79,68 @@ export function CameraView({ onCapture, onError }: Props) {
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, vw, vh);
 
-    await new Promise(r => setTimeout(r, 20));
+    // Encode frame to base64 JPEG at 800px width for API
+    const encCanvas = document.createElement("canvas");
+    const encW = 800;
+    const encH = Math.round(vh * (encW / vw));
+    encCanvas.width = encW; encCanvas.height = encH;
+    encCanvas.getContext("2d")!.drawImage(canvas, 0, 0, encW, encH);
+    const b64 = encCanvas.toDataURL("image/jpeg", 0.85).split(",")[1];
 
-    const { left: lb, right: rb } = detectShoes(canvas, vw, vh);
+    let lb: BBox, rb: BBox;
+
+    try {
+      const res = await fetch("/api/detect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: b64 }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const data = await res.json();
+
+      if (!res.ok || !data.shoes || data.shoes.length < 2) {
+        throw new Error(data.error ?? `Only ${data.shoes?.length ?? 0} shoes detected`);
+      }
+
+      // Gemini returns [y1, x1, y2, x2] normalized 0-1000
+      function toPixelBBox(box: number[]): BBox {
+        const [y1, x1, y2, x2] = box;
+        return {
+          minX: Math.round((x1 / 1000) * vw),
+          maxX: Math.round((x2 / 1000) * vw),
+          minY: Math.round((y1 / 1000) * vh),
+          maxY: Math.round((y2 / 1000) * vh),
+        };
+      }
+
+      // Sort by x center to ensure left/right order
+      const sorted = [...data.shoes].sort((a: {box: number[]}, b: {box: number[]}) => {
+        const ca = (a.box[1] + a.box[3]) / 2;
+        const cb = (b.box[1] + b.box[3]) / 2;
+        return ca - cb;
+      });
+
+      lb = toPixelBBox(sorted[0].box);
+      rb = toPixelBBox(sorted[1].box);
+
+    } catch (e) {
+      setIsAnalyzing(false);
+      setIsCapturing(false);
+      setStatusMsg("");
+      onError(`Detection failed: ${e instanceof Error ? e.message : "unknown"}. Ensure both shoes are clearly visible.`);
+      return;
+    }
+
     setIsAnalyzing(false);
+    setStatusMsg("");
+
+    // Tilt check
+    const bottomDiff = Math.abs(lb.maxY - rb.maxY);
+    if (bottomDiff > vh * 0.12) {
+      setIsCapturing(false);
+      onError(`Camera tilted — shoe baselines differ by ${Math.round(bottomDiff)}px. Level the camera.`);
+      return;
+    }
 
     const groundY = Math.max(lb.maxY, rb.maxY);
 
@@ -180,9 +157,8 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.shadowBlur = 0;
 
       const heightPx = groundY - bounds.minY;
-      const widthPx = bounds.maxX - bounds.minX;
       const hMm = pxToMm(heightPx);
-      const wMm = pxToMm(widthPx);
+      const wMm = pxToMm(bounds.maxX - bounds.minX);
       const midX = (bounds.minX + bounds.maxX) / 2;
       const midY = (bounds.minY + groundY) / 2;
       const rX = Math.min(bounds.maxX + 8, vw - 90);
@@ -194,13 +170,6 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.fillStyle = GREEN;
       ctx.textAlign = "left";
       ctx.fillText(hl, rX + 2, midY + 4);
-
-      const wl = `${wMm}mm`;
-      ctx.fillStyle = "rgba(0,0,0,0.85)";
-      ctx.fillRect(midX - ctx.measureText(wl).width / 2 - 4, Math.max(bounds.minY - 26, 0), ctx.measureText(wl).width + 8, 18);
-      ctx.fillStyle = GREEN;
-      ctx.textAlign = "center";
-      ctx.fillText(wl, midX, Math.max(bounds.minY - 10, 14));
 
       ctx.font = "bold 13px monospace";
       const bw = ctx.measureText(label).width + 14;
@@ -225,16 +194,6 @@ export function CameraView({ onCapture, onError }: Props) {
     const leftResult = drawBox(lb, "LEFT");
     const rightResult = drawBox(rb, "RIGHT");
 
-    // Draw center divider line so user can see the split
-    ctx.strokeStyle = `${CYAN}60`;
-    ctx.lineWidth = 1;
-    ctx.setLineDash([6, 6]);
-    ctx.beginPath();
-    ctx.moveTo(vw / 2, 0);
-    ctx.lineTo(vw / 2, vh);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
     const diff = parseFloat(Math.abs(leftResult.hMm - rightResult.hMm).toFixed(1));
     const passed = diff <= 3;
 
@@ -250,7 +209,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
     ctx.font = "11px monospace";
     ctx.fillStyle = "rgba(0,0,0,0.7)";
-    const stamp = `CV | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
+    const stamp = `Gemini | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
     ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
     ctx.fillStyle = GREEN;
     ctx.textAlign = "left";
@@ -275,10 +234,12 @@ export function CameraView({ onCapture, onError }: Props) {
       });
 
       setShowSuccess(true);
+      setStatusMsg("");
       setTimeout(() => { setShowSuccess(false); setIsCapturing(false); }, 1200);
     } catch {
       onError("Failed to compress image");
       setIsCapturing(false);
+      setStatusMsg("");
     }
   }, [isCapturing, isAnalyzing, onCapture, onError]);
 
@@ -310,47 +271,37 @@ export function CameraView({ onCapture, onError }: Props) {
           <motion.div
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
             className="absolute inset-0 flex flex-col items-center justify-center z-30"
-            style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
+            style={{ background: "rgba(0,0,0,0.65)", backdropFilter: "blur(4px)" }}
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
-            <p className="text-base font-bold" style={{ color: CYAN }}>Measuring shoes...</p>
+            <p className="text-base font-bold" style={{ color: CYAN }}>AI Analyzing...</p>
+            <p className="text-xs mt-1" style={{ color: "#666" }}>Gemini Vision detecting shoes</p>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Guide overlay — shows split line and shoe zones */}
       {isReady && !isCapturing && (
         <div className="absolute inset-0 pointer-events-none">
-          {/* Center divider */}
-          <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-40"
-            style={{ background: `repeating-linear-gradient(to bottom, ${CYAN} 0px, ${CYAN} 8px, transparent 8px, transparent 16px)` }} />
-          {/* Left zone label */}
-          <div className="absolute left-4 top-1/2 -translate-y-1/2">
-            <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-              LEFT SHOE
-            </div>
-          </div>
-          {/* Right zone label */}
-          <div className="absolute right-4 top-1/2 -translate-y-1/2">
-            <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-              RIGHT SHOE
-            </div>
-          </div>
-          {/* Corner guides */}
-          <div className="absolute top-8 left-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
-          <div className="absolute top-8 right-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
-          <div className="absolute bottom-24 left-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
-          <div className="absolute bottom-24 right-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
+          <div className="absolute top-8 left-8 w-12 h-12" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
+          <div className="absolute top-8 right-8 w-12 h-12" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
+          <div className="absolute bottom-24 left-8 w-12 h-12" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
+          <div className="absolute bottom-24 right-8 w-12 h-12" style={{ borderBottom: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
         </div>
       )}
 
       {isReady && !isCapturing && (
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
-          <div className="px-4 py-1.5 rounded-full text-xs font-semibold text-center whitespace-nowrap"
-            style={{ background: "rgba(0,0,0,0.75)", border: `1px solid ${CYAN}40`, color: "#ccc" }}>
-            One shoe each side of the line · landscape · tap capture
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10">
+          <div className="px-4 py-2 rounded-full text-xs font-semibold text-center whitespace-nowrap"
+            style={{ background: "rgba(0,0,0,0.7)", border: `1px solid ${CYAN}40`, color: "#ccc", backdropFilter: "blur(6px)" }}>
+            Place both shoes side-by-side · landscape · tap capture
+          </div>
+        </div>
+      )}
+
+      {statusMsg && (
+        <div className="absolute bottom-28 left-0 right-0 flex justify-center z-10">
+          <div className="px-4 py-2 rounded-full text-xs font-semibold" style={{ background: "rgba(0,0,0,0.7)", color: CYAN }}>
+            {statusMsg}
           </div>
         </div>
       )}
@@ -386,7 +337,7 @@ export function CameraView({ onCapture, onError }: Props) {
           )}
         </button>
         <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.5)" }}>
-          {isAnalyzing ? "measuring..." : isCapturing ? "processing..." : "tap to capture"}
+          {isAnalyzing ? "analyzing..." : isCapturing ? "processing..." : "tap to capture"}
         </span>
       </div>
     </div>

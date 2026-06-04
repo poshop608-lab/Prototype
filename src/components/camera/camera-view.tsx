@@ -12,19 +12,41 @@ const RED = "#ef4444";
 
 interface BBox { minX: number; maxX: number; minY: number; maxY: number; }
 interface Pt { x: number; y: number; }
-interface ShoeResult { bbox: BBox; polygon: Pt[]; }
+interface ShoeResult { bbox: BBox; polygon: Pt[]; topPt: Pt; bottomPt: Pt; }
 
 interface Props {
   onCapture: (result: CaptureResult) => void;
   onError: (msg: string) => void;
 }
 
-// ── Silhouette-polygon shoe detector ─────────────────────────────────────
-// Per half-frame:
-//  1. Build fg mask (lum diff from wall background)
-//  2. Refine vertical extent bottom-up (no wall above shoe)
-//  3. Trace left-edge + right-edge at every row → exact shoe silhouette polygon
-//  4. Subsample polygon to ~60 points for smooth drawing
+// ── Otsu threshold ────────────────────────────────────────────────────────
+// Finds optimal luminance split between dark shoe and light background.
+// Fully automatic — no background sampling required.
+function otsuThreshold(gray: Float32Array): number {
+  const hist = new Float64Array(256);
+  for (let i = 0; i < gray.length; i++) hist[Math.round(Math.min(255, gray[i]))]++;
+  const N = gray.length;
+  let total = 0;
+  for (let i = 0; i < 256; i++) total += i * hist[i];
+  let sumB = 0, wB = 0, best = 0, thresh = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (!wB) continue;
+    const wF = N - wB;
+    if (!wF) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB;
+    const mF = (total - sumB) / wF;
+    const between = wB * wF * (mB - mF) * (mB - mF);
+    if (between > best) { best = between; thresh = t; }
+  }
+  return thresh;
+}
+
+// ── Shoe silhouette detector ──────────────────────────────────────────────
+// 1. Otsu threshold → binary shoe mask (dark pixels = shoe)
+// 2. Bottom-anchored density scan → find exact shoe band (ignores wall marks)
+// 3. Row-by-row left/right edge trace → tight silhouette polygon
 function detectShoes(
   canvas: HTMLCanvasElement,
   vw: number,
@@ -40,81 +62,67 @@ function detectShoes(
   tctx.drawImage(canvas, 0, 0, tw, th);
   const { data } = tctx.getImageData(0, 0, tw, th);
 
-  // Background: top strip average
-  let bgLum = 0, bgN = 0;
-  for (let y = 0; y < Math.round(th * 0.15); y++) {
+  // Grayscale
+  const gray = new Float32Array(tw * th);
+  for (let y = 0; y < th; y++)
     for (let x = 0; x < tw; x++) {
       const i = (y * tw + x) * 4;
-      bgLum += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-      bgN++;
+      gray[y * tw + x] = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
     }
-  }
-  bgLum /= bgN;
-
-  const THRESH = 35;
-
-  function pixLum(x: number, y: number): number {
-    const i = (y * tw + x) * 4;
-    return 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-  }
-  function isFg(x: number, y: number): boolean {
-    return Math.abs(pixLum(x, y) - bgLum) > THRESH;
-  }
 
   function halfDetect(fromX: number, toX: number): ShoeResult {
     const halfW = toX - fromX;
 
-    // Pass 1: raw bbox
-    let minX = toX, maxX = fromX, minY = th, maxY = 0;
-    let found = false;
-    for (let y = Math.round(th * 0.1); y < th; y++) {
-      for (let x = fromX; x < toX; x++) {
-        if (isFg(x, y)) {
-          if (x < minX) minX = x; if (x > maxX) maxX = x;
-          if (y < minY) minY = y; if (y > maxY) maxY = y;
-          found = true;
-        }
-      }
+    // Extract half-frame gray values
+    const halfGray = new Float32Array(halfW * th);
+    for (let y = 0; y < th; y++)
+      for (let x = fromX; x < toX; x++)
+        halfGray[y * halfW + (x - fromX)] = gray[y * tw + x];
+
+    // Otsu threshold for this half
+    const thresh = otsuThreshold(halfGray);
+    // Pixels BELOW threshold = dark object = shoe
+    function isShoe(x: number, y: number): boolean {
+      return gray[y * tw + x] < thresh;
     }
 
-    if (!found || maxX - minX < halfW * 0.03 || maxY - minY < th * 0.03) {
-      const pad = Math.round(halfW * 0.10);
-      const vpad = Math.round(th * 0.10);
-      const fb: BBox = {
-        minX: Math.round((fromX + pad) / SCALE),
-        maxX: Math.round((toX - pad) / SCALE),
-        minY: Math.round(vpad / SCALE),
-        maxY: Math.round((th - vpad) / SCALE),
-      };
-      return { bbox: fb, polygon: bboxToPolygon(fb) };
+    // Per-row shoe density (fraction of half-width that is shoe)
+    const density = new Float32Array(th);
+    for (let y = 0; y < th; y++) {
+      let cnt = 0;
+      for (let x = fromX; x < toX; x++) if (isShoe(x, y)) cnt++;
+      density[y] = cnt / halfW;
     }
 
-    // Pass 2: refine minY bottom-up within detected x-range.
-    // Threshold 0.20: actual shoe rows >0.35 density; wall marks <0.06.
-    // emptyStreak 2: 2 consecutive sub-threshold rows = above shoe, stop.
-    // Max-height clamp: shoe height cannot exceed 55% of frame.
-    let refinedMinY = maxY;
-    let emptyStreak = 0;
-    for (let y = maxY - 1; y >= minY; y--) {
-      let rowFg = 0;
-      for (let x = minX; x <= maxX; x++) if (isFg(x, y)) rowFg++;
-      if (rowFg / (maxX - minX + 1) > 0.20) {
-        refinedMinY = y; emptyStreak = 0;
-      } else if (++emptyStreak >= 2) break;
+    // Step 1: Find shoe BOTTOM — scan from 90% of frame upward
+    // First row with density > 0.15 (shoe body, not just noise)
+    let shoeBottom = Math.round(th * 0.80);
+    for (let y = Math.round(th * 0.90); y >= Math.round(th * 0.20); y--) {
+      if (density[y] > 0.15) { shoeBottom = y; break; }
     }
-    // Hard clamp: never let the box be taller than 55% of frame height
-    const maxBoxHeight = Math.round(th * 0.55);
-    if (maxY - refinedMinY > maxBoxHeight) refinedMinY = maxY - maxBoxHeight;
-    minY = refinedMinY;
 
-    // Pass 3: trace left + right edges row by row within shoe band
-    const leftEdge: Pt[] = [];   // top → bottom
-    const rightEdge: Pt[] = [];  // top → bottom (reversed for polygon winding)
+    // Step 2: Find shoe TOP — scan upward from bottom
+    // Stop at 2 consecutive rows with density < 0.18
+    // Actual shoe rows: >0.35 density; wall marks: <0.05
+    let shoeTop = shoeBottom;
+    let empty = 0;
+    for (let y = shoeBottom - 1; y >= 0; y--) {
+      if (density[y] > 0.18) { shoeTop = y; empty = 0; }
+      else if (++empty >= 2) break;
+    }
 
-    for (let y = minY; y <= maxY; y++) {
+    // Hard clamp: shoe height max 55% of frame (safety)
+    const maxH = Math.round(th * 0.55);
+    if (shoeBottom - shoeTop > maxH) shoeTop = shoeBottom - maxH;
+
+    // Step 3: Trace left + right silhouette edges row by row
+    const leftEdge: Pt[] = [];
+    const rightEdge: Pt[] = [];
+
+    for (let y = shoeTop; y <= shoeBottom; y++) {
       let lx = -1, rx = -1;
       for (let x = fromX; x < toX; x++) {
-        if (isFg(x, y)) { if (lx === -1) lx = x; rx = x; }
+        if (isShoe(x, y)) { if (lx === -1) lx = x; rx = x; }
       }
       if (lx !== -1) {
         leftEdge.push({ x: Math.round(lx / SCALE), y: Math.round(y / SCALE) });
@@ -122,43 +130,55 @@ function detectShoes(
       }
     }
 
-    // Polygon = left edge top→bottom + right edge bottom→top
-    const rawPolygon: Pt[] = [...leftEdge, ...rightEdge.reverse()];
+    // Closed polygon: left top→bottom, right bottom→top
+    const rawPoly: Pt[] = [...leftEdge, ...rightEdge.reverse()];
+    const polygon = subsample(rawPoly, 80);
 
-    // Subsample to ~80 points for smooth rendering
-    const polygon = subsample(rawPolygon, 80);
+    // Bbox from actual shoe pixels only
+    let minX = toX, maxX = fromX;
+    for (let y = shoeTop; y <= shoeBottom; y++) {
+      for (let x = fromX; x < toX; x++) {
+        if (isShoe(x, y)) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+        }
+      }
+    }
 
-    const PAD = 4;
+    // Fallback if detection failed
+    if (maxX <= minX) {
+      const pad = Math.round(halfW * 0.08);
+      minX = fromX + pad; maxX = toX - pad;
+    }
+
+    const PAD = 3;
     const bbox: BBox = {
       minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
       maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
-      minY: Math.max(0, Math.round((minY - PAD) / SCALE)),
-      maxY: Math.min(vh, Math.round((maxY + PAD) / SCALE)),
+      minY: Math.max(0, Math.round((shoeTop - PAD) / SCALE)),
+      maxY: Math.min(vh, Math.round((shoeBottom + PAD) / SCALE)),
     };
 
-    return { bbox, polygon };
+    const topPt: Pt = {
+      x: Math.round(((minX + maxX) / 2) / SCALE),
+      y: Math.round(shoeTop / SCALE),
+    };
+    const bottomPt: Pt = {
+      x: Math.round(((minX + maxX) / 2) / SCALE),
+      y: Math.round(shoeBottom / SCALE),
+    };
+
+    return { bbox, polygon, topPt, bottomPt };
   }
 
   const mid = Math.round(tw / 2);
-  return {
-    left: halfDetect(0, mid),
-    right: halfDetect(mid, tw),
-  };
+  return { left: halfDetect(0, mid), right: halfDetect(mid, tw) };
 }
 
 function subsample(pts: Pt[], target: number): Pt[] {
   if (pts.length <= target) return pts;
   const step = pts.length / target;
-  const out: Pt[] = [];
-  for (let i = 0; i < target; i++) out.push(pts[Math.round(i * step)]);
-  return out;
-}
-
-function bboxToPolygon(b: BBox): Pt[] {
-  return [
-    { x: b.minX, y: b.minY }, { x: b.maxX, y: b.minY },
-    { x: b.maxX, y: b.maxY }, { x: b.minX, y: b.maxY },
-  ];
+  return Array.from({ length: target }, (_, i) => pts[Math.round(i * step)]);
 }
 
 export function CameraView({ onCapture, onError }: Props) {
@@ -177,10 +197,7 @@ export function CameraView({ onCapture, onError }: Props) {
     check();
     window.addEventListener("resize", check);
     window.addEventListener("orientationchange", check);
-    return () => {
-      window.removeEventListener("resize", check);
-      window.removeEventListener("orientationchange", check);
-    };
+    return () => { window.removeEventListener("resize", check); window.removeEventListener("orientationchange", check); };
   }, []);
 
   useEffect(() => {
@@ -198,12 +215,10 @@ export function CameraView({ onCapture, onError }: Props) {
         await new Promise<void>((res) => { video.onloadedmetadata = () => res(); });
         await video.play().catch(() => {});
         setIsReady(true);
-      } catch {
-        onError("Camera access denied. Allow camera permissions and reload.");
-      }
+      } catch { onError("Camera access denied. Allow camera permissions and reload."); }
     }
     startCamera();
-    return () => { streamRef.current?.getTracks().forEach((t) => t.stop()); };
+    return () => { streamRef.current?.getTracks().forEach(t => t.stop()); };
   }, [onError]);
 
   const handleCapture = useCallback(async () => {
@@ -216,8 +231,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
     const vw = video.videoWidth || 1280;
     const vh = video.videoHeight || 720;
-    canvas.width = vw;
-    canvas.height = vh;
+    canvas.width = vw; canvas.height = vh;
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, vw, vh);
 
@@ -229,9 +243,9 @@ export function CameraView({ onCapture, onError }: Props) {
     const groundY = Math.max(ls.bbox.maxY, rs.bbox.maxY);
 
     function drawShoe(result: ShoeResult, label: string) {
-      const { bbox, polygon } = result;
+      const { bbox, polygon, topPt, bottomPt } = result;
 
-      // Draw silhouette polygon
+      // Silhouette polygon
       if (polygon.length >= 3) {
         ctx.beginPath();
         ctx.moveTo(polygon[0].x, polygon[0].y);
@@ -245,21 +259,11 @@ export function CameraView({ onCapture, onError }: Props) {
         ctx.shadowBlur = 16;
         ctx.stroke();
         ctx.shadowBlur = 0;
-      } else {
-        // Fallback rect
-        ctx.beginPath();
-        ctx.rect(bbox.minX, bbox.minY, bbox.maxX - bbox.minX, bbox.maxY - bbox.minY);
-        ctx.fillStyle = `${GREEN}20`;
-        ctx.fill();
-        ctx.strokeStyle = GREEN;
-        ctx.lineWidth = 3;
-        ctx.stroke();
       }
 
       const heightPx = groundY - bbox.minY;
-      const widthPx = bbox.maxX - bbox.minX;
       const hMm = pxToMm(heightPx);
-      const wMm = pxToMm(widthPx);
+      const wMm = pxToMm(bbox.maxX - bbox.minX);
       const midX = (bbox.minX + bbox.maxX) / 2;
       const midY = (bbox.minY + groundY) / 2;
       const rX = Math.min(bbox.maxX + 8, vw - 90);
@@ -300,16 +304,16 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Debug: TOP point (cyan dot)
-      ctx.beginPath();
-      ctx.arc(midX, bbox.minY, 6, 0, Math.PI * 2);
-      ctx.fillStyle = CYAN;
-      ctx.fill();
-      // Debug: BOTTOM point (cyan dot)
-      ctx.beginPath();
-      ctx.arc(midX, bbox.maxY, 6, 0, Math.PI * 2);
-      ctx.fillStyle = CYAN;
-      ctx.fill();
+      // Debug: TOP point (cyan) + BOTTOM point (cyan)
+      for (const pt of [topPt, bottomPt]) {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 7, 0, Math.PI * 2);
+        ctx.fillStyle = CYAN;
+        ctx.fill();
+        ctx.strokeStyle = "#000";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
 
       return { hMm, wMm };
     }
@@ -342,7 +346,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
     ctx.font = "11px monospace";
     ctx.fillStyle = "rgba(0,0,0,0.7)";
-    const stamp = `CV-SEG | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
+    const stamp = `OTSU-SEG | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
     ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
     ctx.fillStyle = GREEN;
     ctx.textAlign = "left";
@@ -354,15 +358,10 @@ export function CameraView({ onCapture, onError }: Props) {
       if ("vibrate" in navigator) navigator.vibrate([60, 30, 60]);
 
       onCapture({
-        blob,
-        dataUrl: annotatedDataUrl,
-        annotatedDataUrl,
-        leftHeightMm: leftResult.hMm,
-        rightHeightMm: rightResult.hMm,
-        leftWidthMm: leftResult.wMm,
-        rightWidthMm: rightResult.wMm,
-        heightDiffMm: diff,
-        passed,
+        blob, dataUrl: annotatedDataUrl, annotatedDataUrl,
+        leftHeightMm: leftResult.hMm, rightHeightMm: rightResult.hMm,
+        leftWidthMm: leftResult.wMm, rightWidthMm: rightResult.wMm,
+        heightDiffMm: diff, passed,
         rejectionReason: passed ? null : `Height difference ${diff}mm exceeds 3mm tolerance`,
       });
 
@@ -405,7 +404,7 @@ export function CameraView({ onCapture, onError }: Props) {
             style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
-            <p className="text-base font-bold" style={{ color: CYAN }}>Tracing shoe silhouette...</p>
+            <p className="text-base font-bold" style={{ color: CYAN }}>Segmenting shoe...</p>
           </motion.div>
         )}
       </AnimatePresence>
@@ -416,15 +415,11 @@ export function CameraView({ onCapture, onError }: Props) {
             style={{ background: `repeating-linear-gradient(to bottom, ${CYAN} 0px, ${CYAN} 8px, transparent 8px, transparent 16px)` }} />
           <div className="absolute left-4 top-1/2 -translate-y-1/2">
             <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-              LEFT SHOE
-            </div>
+              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>LEFT SHOE</div>
           </div>
           <div className="absolute right-4 top-1/2 -translate-y-1/2">
             <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-              RIGHT SHOE
-            </div>
+              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>RIGHT SHOE</div>
           </div>
           <div className="absolute top-8 left-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
           <div className="absolute top-8 right-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
@@ -473,7 +468,7 @@ export function CameraView({ onCapture, onError }: Props) {
           )}
         </button>
         <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.5)" }}>
-          {isAnalyzing ? "tracing..." : isCapturing ? "processing..." : "tap to capture"}
+          {isAnalyzing ? "segmenting..." : isCapturing ? "processing..." : "tap to capture"}
         </span>
       </div>
     </div>

@@ -11,22 +11,25 @@ const GREEN = "#22c55e";
 const RED = "#ef4444";
 
 interface BBox { minX: number; maxX: number; minY: number; maxY: number; }
+interface Pt { x: number; y: number; }
+interface ShoeResult { bbox: BBox; polygon: Pt[]; }
 
 interface Props {
   onCapture: (result: CaptureResult) => void;
   onError: (msg: string) => void;
 }
 
-// ── Guaranteed split-frame detector ───────────────────────────────────────
-// Splits frame into left/right halves. In each half, finds the tightest
-// bounding box around foreground pixels using pixel luminance analysis.
-// Falls back to 80% of half-frame if no clear foreground found.
-// NEVER fails — always returns two boxes.
+// ── Silhouette-polygon shoe detector ─────────────────────────────────────
+// Per half-frame:
+//  1. Build fg mask (lum diff from wall background)
+//  2. Refine vertical extent bottom-up (no wall above shoe)
+//  3. Trace left-edge + right-edge at every row → exact shoe silhouette polygon
+//  4. Subsample polygon to ~60 points for smooth drawing
 function detectShoes(
   canvas: HTMLCanvasElement,
   vw: number,
   vh: number
-): { left: BBox; right: BBox } {
+): { left: ShoeResult; right: ShoeResult } {
   const SCALE = 0.25;
   const tw = Math.round(vw * SCALE);
   const th = Math.round(vh * SCALE);
@@ -37,10 +40,9 @@ function detectShoes(
   tctx.drawImage(canvas, 0, 0, tw, th);
   const { data } = tctx.getImageData(0, 0, tw, th);
 
-  // Sample background luminance from top strip (sky/wall above shoes)
+  // Background: top strip average
   let bgLum = 0, bgN = 0;
-  const topStrip = Math.round(th * 0.15);
-  for (let y = 0; y < topStrip; y++) {
+  for (let y = 0; y < Math.round(th * 0.15); y++) {
     for (let x = 0; x < tw; x++) {
       const i = (y * tw + x) * 4;
       bgLum += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
@@ -49,55 +51,108 @@ function detectShoes(
   }
   bgLum /= bgN;
 
-  // For each half, find tight bbox of pixels that differ from background
-  function halfBBox(fromX: number, toX: number): BBox {
+  const THRESH = 35;
+
+  function pixLum(x: number, y: number): number {
+    const i = (y * tw + x) * 4;
+    return 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+  }
+  function isFg(x: number, y: number): boolean {
+    return Math.abs(pixLum(x, y) - bgLum) > THRESH;
+  }
+
+  function halfDetect(fromX: number, toX: number): ShoeResult {
+    const halfW = toX - fromX;
+
+    // Pass 1: raw bbox
     let minX = toX, maxX = fromX, minY = th, maxY = 0;
     let found = false;
-
-    // Threshold: pixel is "shoe" if luminance differs enough from bg
-    // Use both dark-object-on-light and light-object-on-dark detection
-    const THRESH = 35;
-
     for (let y = Math.round(th * 0.1); y < th; y++) {
       for (let x = fromX; x < toX; x++) {
-        const i = (y * tw + x) * 4;
-        const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-        if (Math.abs(lum - bgLum) > THRESH) {
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
+        if (isFg(x, y)) {
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
           found = true;
         }
       }
     }
 
-    if (!found || maxX - minX < tw * 0.03 || maxY - minY < th * 0.03) {
-      // Fallback: use central 80% of the half
-      const pad = Math.round((toX - fromX) * 0.10);
+    if (!found || maxX - minX < halfW * 0.03 || maxY - minY < th * 0.03) {
+      const pad = Math.round(halfW * 0.10);
       const vpad = Math.round(th * 0.10);
-      return {
+      const fb: BBox = {
         minX: Math.round((fromX + pad) / SCALE),
         maxX: Math.round((toX - pad) / SCALE),
         minY: Math.round(vpad / SCALE),
         maxY: Math.round((th - vpad) / SCALE),
       };
+      return { bbox: fb, polygon: bboxToPolygon(fb) };
     }
 
+    // Pass 2: refine minY bottom-up within detected x-range
+    let refinedMinY = maxY;
+    let emptyStreak = 0;
+    for (let y = maxY - 1; y >= minY; y--) {
+      let rowFg = 0;
+      for (let x = minX; x <= maxX; x++) if (isFg(x, y)) rowFg++;
+      if (rowFg / (maxX - minX + 1) > 0.08) {
+        refinedMinY = y; emptyStreak = 0;
+      } else if (++emptyStreak >= 4) break;
+    }
+    minY = refinedMinY;
+
+    // Pass 3: trace left + right edges row by row within shoe band
+    const leftEdge: Pt[] = [];   // top → bottom
+    const rightEdge: Pt[] = [];  // top → bottom (reversed for polygon winding)
+
+    for (let y = minY; y <= maxY; y++) {
+      let lx = -1, rx = -1;
+      for (let x = fromX; x < toX; x++) {
+        if (isFg(x, y)) { if (lx === -1) lx = x; rx = x; }
+      }
+      if (lx !== -1) {
+        leftEdge.push({ x: Math.round(lx / SCALE), y: Math.round(y / SCALE) });
+        rightEdge.push({ x: Math.round(rx / SCALE), y: Math.round(y / SCALE) });
+      }
+    }
+
+    // Polygon = left edge top→bottom + right edge bottom→top
+    const rawPolygon: Pt[] = [...leftEdge, ...rightEdge.reverse()];
+
+    // Subsample to ~80 points for smooth rendering
+    const polygon = subsample(rawPolygon, 80);
+
     const PAD = 4;
-    return {
+    const bbox: BBox = {
       minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
       maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
       minY: Math.max(0, Math.round((minY - PAD) / SCALE)),
       maxY: Math.min(vh, Math.round((maxY + PAD) / SCALE)),
     };
+
+    return { bbox, polygon };
   }
 
   const mid = Math.round(tw / 2);
   return {
-    left: halfBBox(0, mid),
-    right: halfBBox(mid, tw),
+    left: halfDetect(0, mid),
+    right: halfDetect(mid, tw),
   };
+}
+
+function subsample(pts: Pt[], target: number): Pt[] {
+  if (pts.length <= target) return pts;
+  const step = pts.length / target;
+  const out: Pt[] = [];
+  for (let i = 0; i < target; i++) out.push(pts[Math.round(i * step)]);
+  return out;
+}
+
+function bboxToPolygon(b: BBox): Pt[] {
+  return [
+    { x: b.minX, y: b.minY }, { x: b.maxX, y: b.minY },
+    { x: b.maxX, y: b.maxY }, { x: b.minX, y: b.maxY },
+  ];
 }
 
 export function CameraView({ onCapture, onError }: Props) {
@@ -162,31 +217,48 @@ export function CameraView({ onCapture, onError }: Props) {
 
     await new Promise(r => setTimeout(r, 20));
 
-    const { left: lb, right: rb } = detectShoes(canvas, vw, vh);
+    const { left: ls, right: rs } = detectShoes(canvas, vw, vh);
     setIsAnalyzing(false);
 
-    const groundY = Math.max(lb.maxY, rb.maxY);
+    const groundY = Math.max(ls.bbox.maxY, rs.bbox.maxY);
 
-    function drawBox(bounds: BBox, label: string) {
-      ctx.beginPath();
-      ctx.rect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
-      ctx.fillStyle = `${GREEN}22`;
-      ctx.fill();
-      ctx.strokeStyle = GREEN;
-      ctx.lineWidth = 3;
-      ctx.shadowColor = GREEN;
-      ctx.shadowBlur = 14;
-      ctx.stroke();
-      ctx.shadowBlur = 0;
+    function drawShoe(result: ShoeResult, label: string) {
+      const { bbox, polygon } = result;
 
-      const heightPx = groundY - bounds.minY;
-      const widthPx = bounds.maxX - bounds.minX;
+      // Draw silhouette polygon
+      if (polygon.length >= 3) {
+        ctx.beginPath();
+        ctx.moveTo(polygon[0].x, polygon[0].y);
+        for (let i = 1; i < polygon.length; i++) ctx.lineTo(polygon[i].x, polygon[i].y);
+        ctx.closePath();
+        ctx.fillStyle = `${GREEN}20`;
+        ctx.fill();
+        ctx.strokeStyle = GREEN;
+        ctx.lineWidth = 3;
+        ctx.shadowColor = GREEN;
+        ctx.shadowBlur = 16;
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+      } else {
+        // Fallback rect
+        ctx.beginPath();
+        ctx.rect(bbox.minX, bbox.minY, bbox.maxX - bbox.minX, bbox.maxY - bbox.minY);
+        ctx.fillStyle = `${GREEN}20`;
+        ctx.fill();
+        ctx.strokeStyle = GREEN;
+        ctx.lineWidth = 3;
+        ctx.stroke();
+      }
+
+      const heightPx = groundY - bbox.minY;
+      const widthPx = bbox.maxX - bbox.minX;
       const hMm = pxToMm(heightPx);
       const wMm = pxToMm(widthPx);
-      const midX = (bounds.minX + bounds.maxX) / 2;
-      const midY = (bounds.minY + groundY) / 2;
-      const rX = Math.min(bounds.maxX + 8, vw - 90);
+      const midX = (bbox.minX + bbox.maxX) / 2;
+      const midY = (bbox.minY + groundY) / 2;
+      const rX = Math.min(bbox.maxX + 8, vw - 90);
 
+      // Height label
       ctx.font = "bold 16px monospace";
       const hl = `${hMm}mm`;
       ctx.fillStyle = "rgba(0,0,0,0.85)";
@@ -195,13 +267,15 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.textAlign = "left";
       ctx.fillText(hl, rX + 2, midY + 4);
 
+      // Width label
       const wl = `${wMm}mm`;
       ctx.fillStyle = "rgba(0,0,0,0.85)";
-      ctx.fillRect(midX - ctx.measureText(wl).width / 2 - 4, Math.max(bounds.minY - 26, 0), ctx.measureText(wl).width + 8, 18);
+      ctx.fillRect(midX - ctx.measureText(wl).width / 2 - 4, Math.max(bbox.minY - 26, 0), ctx.measureText(wl).width + 8, 18);
       ctx.fillStyle = GREEN;
       ctx.textAlign = "center";
-      ctx.fillText(wl, midX, Math.max(bounds.minY - 10, 14));
+      ctx.fillText(wl, midX, Math.max(bbox.minY - 10, 14));
 
+      // LEFT/RIGHT badge
       ctx.font = "bold 13px monospace";
       const bw = ctx.measureText(label).width + 14;
       ctx.fillStyle = `${GREEN}cc`;
@@ -210,23 +284,24 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.textAlign = "center";
       ctx.fillText(label, midX, Math.min(groundY + 19, vh - 8));
 
+      // Ground baseline
       ctx.strokeStyle = `${GREEN}80`;
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 4]);
       ctx.beginPath();
-      ctx.moveTo(bounds.minX, groundY);
-      ctx.lineTo(bounds.maxX, groundY);
+      ctx.moveTo(bbox.minX, groundY);
+      ctx.lineTo(bbox.maxX, groundY);
       ctx.stroke();
       ctx.setLineDash([]);
 
       return { hMm, wMm };
     }
 
-    const leftResult = drawBox(lb, "LEFT");
-    const rightResult = drawBox(rb, "RIGHT");
+    const leftResult = drawShoe(ls, "LEFT");
+    const rightResult = drawShoe(rs, "RIGHT");
 
-    // Draw center divider line so user can see the split
-    ctx.strokeStyle = `${CYAN}60`;
+    // Center divider
+    ctx.strokeStyle = `${CYAN}50`;
     ctx.lineWidth = 1;
     ctx.setLineDash([6, 6]);
     ctx.beginPath();
@@ -250,7 +325,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
     ctx.font = "11px monospace";
     ctx.fillStyle = "rgba(0,0,0,0.7)";
-    const stamp = `CV | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
+    const stamp = `CV-SEG | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
     ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
     ctx.fillStyle = GREEN;
     ctx.textAlign = "left";
@@ -313,32 +388,27 @@ export function CameraView({ onCapture, onError }: Props) {
             style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
-            <p className="text-base font-bold" style={{ color: CYAN }}>Measuring shoes...</p>
+            <p className="text-base font-bold" style={{ color: CYAN }}>Tracing shoe silhouette...</p>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Guide overlay — shows split line and shoe zones */}
       {isReady && !isCapturing && (
         <div className="absolute inset-0 pointer-events-none">
-          {/* Center divider */}
-          <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-40"
+          <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-30"
             style={{ background: `repeating-linear-gradient(to bottom, ${CYAN} 0px, ${CYAN} 8px, transparent 8px, transparent 16px)` }} />
-          {/* Left zone label */}
           <div className="absolute left-4 top-1/2 -translate-y-1/2">
             <div className="px-3 py-1 rounded-full text-xs font-bold"
               style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
               LEFT SHOE
             </div>
           </div>
-          {/* Right zone label */}
           <div className="absolute right-4 top-1/2 -translate-y-1/2">
             <div className="px-3 py-1 rounded-full text-xs font-bold"
               style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
               RIGHT SHOE
             </div>
           </div>
-          {/* Corner guides */}
           <div className="absolute top-8 left-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
           <div className="absolute top-8 right-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
           <div className="absolute bottom-24 left-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
@@ -350,7 +420,7 @@ export function CameraView({ onCapture, onError }: Props) {
         <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
           <div className="px-4 py-1.5 rounded-full text-xs font-semibold text-center whitespace-nowrap"
             style={{ background: "rgba(0,0,0,0.75)", border: `1px solid ${CYAN}40`, color: "#ccc" }}>
-            One shoe each side of the line · landscape · tap capture
+            Side view · one shoe each side · landscape
           </div>
         </div>
       )}
@@ -386,7 +456,7 @@ export function CameraView({ onCapture, onError }: Props) {
           )}
         </button>
         <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.5)" }}>
-          {isAnalyzing ? "measuring..." : isCapturing ? "processing..." : "tap to capture"}
+          {isAnalyzing ? "tracing..." : isCapturing ? "processing..." : "tap to capture"}
         </span>
       </div>
     </div>

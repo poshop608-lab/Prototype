@@ -17,9 +17,10 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// ── Bottom-anchored split-frame detector ──────────────────────────────────
-// KEY: anchors from shoe BOTTOM upward — stops at first gap above shoe.
-// Prevents wall/background above shoe from inflating bbox height.
+// ── Sobel + luminance shoe detector ───────────────────────────────────────
+// Shoe pixels = high Sobel edge gradient (texture/outline) OR lum diff from bg
+// Wall = flat = low gradient → excluded even if lum matches shoe
+// Bottom-anchored: find shoe base first, scan up, stop at flat wall gap
 function detectShoes(
   canvas: HTMLCanvasElement,
   vw: number,
@@ -35,65 +36,73 @@ function detectShoes(
   tctx.drawImage(canvas, 0, 0, tw, th);
   const { data } = tctx.getImageData(0, 0, tw, th);
 
-  // Sample background from top-center strip (wall color)
-  let bgLum = 0, bgN = 0;
-  const bgX0 = Math.round(tw * 0.1), bgX1 = Math.round(tw * 0.9);
-  for (let y = 0; y < Math.round(th * 0.18); y++) {
-    for (let x = bgX0; x < bgX1; x++) {
+  // Grayscale array
+  const gray = new Float32Array(tw * th);
+  for (let y = 0; y < th; y++) {
+    for (let x = 0; x < tw; x++) {
       const i = (y * tw + x) * 4;
-      bgLum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-      bgN++;
+      gray[y * tw + x] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    }
+  }
+
+  // Background lum: top-center strip (wall)
+  let bgLum = 0, bgN = 0;
+  for (let y = 0; y < Math.round(th * 0.18); y++) {
+    for (let x = Math.round(tw * 0.05); x < Math.round(tw * 0.95); x++) {
+      bgLum += gray[y * tw + x]; bgN++;
     }
   }
   bgLum /= bgN;
 
-  function pixFg(x: number, y: number, thresh: number): boolean {
-    const i = (y * tw + x) * 4;
-    const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-    return Math.abs(lum - bgLum) > thresh;
+  // Sobel gradient magnitude at each pixel
+  const SOBEL_THRESH = 18;
+  const LUM_THRESH   = 22;
+  const isFg = new Uint8Array(tw * th);
+  for (let y = 1; y < th - 1; y++) {
+    for (let x = 1; x < tw - 1; x++) {
+      const gx =
+        -gray[(y-1)*tw+(x-1)] - 2*gray[y*tw+(x-1)] - gray[(y+1)*tw+(x-1)]
+        +gray[(y-1)*tw+(x+1)] + 2*gray[y*tw+(x+1)] + gray[(y+1)*tw+(x+1)];
+      const gy =
+        -gray[(y-1)*tw+(x-1)] - 2*gray[(y-1)*tw+x] - gray[(y-1)*tw+(x+1)]
+        +gray[(y+1)*tw+(x-1)] + 2*gray[(y+1)*tw+x] + gray[(y+1)*tw+(x+1)];
+      const mag = Math.sqrt(gx * gx + gy * gy);
+      const lumDiff = Math.abs(gray[y * tw + x] - bgLum);
+      // Shoe pixel = strong edge OR clear lum diff (not in top 12% = not wall)
+      isFg[y * tw + x] = (mag > SOBEL_THRESH || (lumDiff > LUM_THRESH && y > th * 0.12)) ? 1 : 0;
+    }
   }
 
   function halfBBox(fromX: number, toX: number): BBox {
     const halfW = toX - fromX;
-    const THRESH = 28;
 
-    // Build per-row foreground density
-    const density: number[] = new Array(th).fill(0);
+    // Per-row density from combined fg mask
+    const density = new Float32Array(th);
     for (let y = 0; y < th; y++) {
       let fg = 0;
-      for (let x = fromX; x < toX; x++) {
-        if (pixFg(x, y, THRESH)) fg++;
-      }
+      for (let x = fromX; x < toX; x++) fg += isFg[y * tw + x];
       density[y] = fg / halfW;
     }
 
-    // Step 1: Find shoe BOTTOM — scan from 85% of frame upward
-    // Shoe base row has high density (>15% of row is shoe pixels)
+    // Find shoe BOTTOM: scan from 88% of frame upward, first dense row
     let shoeBottom = Math.round(th * 0.78);
-    for (let y = Math.round(th * 0.85); y >= Math.round(th * 0.25); y--) {
-      if (density[y] > 0.15) { shoeBottom = y; break; }
+    for (let y = Math.round(th * 0.88); y >= Math.round(th * 0.20); y--) {
+      if (density[y] > 0.12) { shoeBottom = y; break; }
     }
 
-    // Step 2: Find shoe TOP — scan upward from bottom
-    // Stop at 3 consecutive empty rows (= entered wall/background)
-    // Use lower threshold (0.04) to catch narrow curved top of shoe
+    // Find shoe TOP: scan up from bottom, stop at 3 consecutive empty rows
     let shoeTop = shoeBottom;
-    let emptyStreak = 0;
+    let empty = 0;
     for (let y = shoeBottom - 1; y >= 0; y--) {
-      if (density[y] > 0.04) {
-        shoeTop = y;
-        emptyStreak = 0;
-      } else {
-        emptyStreak++;
-        if (emptyStreak >= 3) break;
-      }
+      if (density[y] > 0.05) { shoeTop = y; empty = 0; }
+      else if (++empty >= 3) break;
     }
 
-    // Step 3: Horizontal extent — only within shoeTop..shoeBottom
+    // Horizontal extent within shoe band only
     let minX = toX, maxX = fromX;
     for (let y = shoeTop; y <= shoeBottom; y++) {
       for (let x = fromX; x < toX; x++) {
-        if (pixFg(x, y, THRESH)) {
+        if (isFg[y * tw + x]) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
         }
@@ -102,19 +111,17 @@ function detectShoes(
 
     const boxH = shoeBottom - shoeTop;
     const boxW = maxX - minX;
-
-    // Fallback if result is implausibly small
     if (boxH < th * 0.05 || boxW < halfW * 0.05) {
       const pad = Math.round(halfW * 0.08);
       return {
         minX: Math.round((fromX + pad) / SCALE),
         maxX: Math.round((toX - pad) / SCALE),
-        minY: Math.round(th * 0.20 / SCALE),
+        minY: Math.round(th * 0.15 / SCALE),
         maxY: Math.round(shoeBottom / SCALE),
       };
     }
 
-    const PAD = 4;
+    const PAD = 3;
     return {
       minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
       maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),

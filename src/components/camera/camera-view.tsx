@@ -17,11 +17,9 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// ── Guaranteed split-frame detector ───────────────────────────────────────
-// Splits frame into left/right halves. In each half, finds the tightest
-// bounding box around foreground pixels using pixel luminance analysis.
-// Falls back to 80% of half-frame if no clear foreground found.
-// NEVER fails — always returns two boxes.
+// ── Bottom-anchored split-frame detector ──────────────────────────────────
+// KEY: anchors from shoe BOTTOM upward — stops at first gap above shoe.
+// Prevents wall/background above shoe from inflating bbox height.
 function detectShoes(
   canvas: HTMLCanvasElement,
   vw: number,
@@ -37,50 +35,81 @@ function detectShoes(
   tctx.drawImage(canvas, 0, 0, tw, th);
   const { data } = tctx.getImageData(0, 0, tw, th);
 
-  // Sample background luminance from top strip (sky/wall above shoes)
+  // Sample background from top-center strip (wall color)
   let bgLum = 0, bgN = 0;
-  const topStrip = Math.round(th * 0.15);
-  for (let y = 0; y < topStrip; y++) {
-    for (let x = 0; x < tw; x++) {
+  const bgX0 = Math.round(tw * 0.1), bgX1 = Math.round(tw * 0.9);
+  for (let y = 0; y < Math.round(th * 0.18); y++) {
+    for (let x = bgX0; x < bgX1; x++) {
       const i = (y * tw + x) * 4;
-      bgLum += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+      bgLum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
       bgN++;
     }
   }
   bgLum /= bgN;
 
-  // For each half, find tight bbox of pixels that differ from background
+  function pixFg(x: number, y: number, thresh: number): boolean {
+    const i = (y * tw + x) * 4;
+    const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    return Math.abs(lum - bgLum) > thresh;
+  }
+
   function halfBBox(fromX: number, toX: number): BBox {
-    let minX = toX, maxX = fromX, minY = th, maxY = 0;
-    let found = false;
+    const halfW = toX - fromX;
+    const THRESH = 28;
 
-    // Threshold: pixel is "shoe" if luminance differs enough from bg
-    // Use both dark-object-on-light and light-object-on-dark detection
-    const THRESH = 35;
-
-    for (let y = Math.round(th * 0.1); y < th; y++) {
+    // Build per-row foreground density
+    const density: number[] = new Array(th).fill(0);
+    for (let y = 0; y < th; y++) {
+      let fg = 0;
       for (let x = fromX; x < toX; x++) {
-        const i = (y * tw + x) * 4;
-        const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-        if (Math.abs(lum - bgLum) > THRESH) {
+        if (pixFg(x, y, THRESH)) fg++;
+      }
+      density[y] = fg / halfW;
+    }
+
+    // Step 1: Find shoe BOTTOM — scan from 85% of frame upward
+    // Shoe base row has high density (>15% of row is shoe pixels)
+    let shoeBottom = Math.round(th * 0.78);
+    for (let y = Math.round(th * 0.85); y >= Math.round(th * 0.25); y--) {
+      if (density[y] > 0.15) { shoeBottom = y; break; }
+    }
+
+    // Step 2: Find shoe TOP — scan upward from bottom
+    // Stop at 4 consecutive empty rows (= entered wall/background)
+    let shoeTop = shoeBottom;
+    let emptyStreak = 0;
+    for (let y = shoeBottom - 1; y >= 0; y--) {
+      if (density[y] > 0.07) {
+        shoeTop = y;
+        emptyStreak = 0;
+      } else {
+        emptyStreak++;
+        if (emptyStreak >= 4) break;
+      }
+    }
+
+    // Step 3: Horizontal extent — only within shoeTop..shoeBottom
+    let minX = toX, maxX = fromX;
+    for (let y = shoeTop; y <= shoeBottom; y++) {
+      for (let x = fromX; x < toX; x++) {
+        if (pixFg(x, y, THRESH)) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-          found = true;
         }
       }
     }
 
-    if (!found || maxX - minX < tw * 0.03 || maxY - minY < th * 0.03) {
-      // Fallback: use central 80% of the half
-      const pad = Math.round((toX - fromX) * 0.10);
-      const vpad = Math.round(th * 0.10);
+    const boxH = shoeBottom - shoeTop;
+    const boxW = maxX - minX;
+
+    // Fallback if result is implausibly small
+    if (boxH < th * 0.05 || boxW < halfW * 0.05) {
+      const pad = Math.round(halfW * 0.08);
       return {
         minX: Math.round((fromX + pad) / SCALE),
         maxX: Math.round((toX - pad) / SCALE),
-        minY: Math.round(vpad / SCALE),
-        maxY: Math.round((th - vpad) / SCALE),
+        minY: Math.round(th * 0.20 / SCALE),
+        maxY: Math.round(shoeBottom / SCALE),
       };
     }
 
@@ -88,8 +117,8 @@ function detectShoes(
     return {
       minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
       maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
-      minY: Math.max(0, Math.round((minY - PAD) / SCALE)),
-      maxY: Math.min(vh, Math.round((maxY + PAD) / SCALE)),
+      minY: Math.max(0, Math.round((shoeTop - PAD) / SCALE)),
+      maxY: Math.min(vh, Math.round((shoeBottom + PAD) / SCALE)),
     };
   }
 

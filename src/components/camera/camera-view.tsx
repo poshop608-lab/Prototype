@@ -10,123 +10,16 @@ const CYAN = "#06b6d4";
 const GREEN = "#22c55e";
 const RED = "#ef4444";
 
-interface BBox { minX: number; maxX: number; minY: number; maxY: number; }
+interface RoboflowPoint { x: number; y: number; }
+interface RoboflowPrediction {
+  x: number; y: number; width: number; height: number;
+  confidence: number; class: string;
+  points?: RoboflowPoint[];
+}
 
 interface Props {
   onCapture: (result: CaptureResult) => void;
   onError: (msg: string) => void;
-}
-
-// ── Split-frame shoe detector ─────────────────────────────────────────────
-// Per-half: scans only the middle vertical band (20%-80% of frame height)
-// to skip table/surface at bottom and ceiling/wall at top.
-// Background sampled from top-center strip (plain wall area).
-// Each shoe gets its own independent bottom — no shared groundY.
-function detectShoes(
-  canvas: HTMLCanvasElement,
-  vw: number,
-  vh: number
-): { left: BBox; right: BBox } {
-  const SCALE = 0.25;
-  const tw = Math.round(vw * SCALE);
-  const th = Math.round(vh * SCALE);
-
-  const thumb = document.createElement("canvas");
-  thumb.width = tw; thumb.height = th;
-  const tctx = thumb.getContext("2d", { willReadFrequently: true })!;
-  tctx.drawImage(canvas, 0, 0, tw, th);
-  const { data } = tctx.getImageData(0, 0, tw, th);
-
-  function pixLum(x: number, y: number): number {
-    const i = (y * tw + x) * 4;
-    return 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-  }
-
-  // Sample background from top-center strip — avoids shoe pixels on sides
-  let bgLum = 0, bgN = 0;
-  const bgY0 = 0, bgY1 = Math.round(th * 0.18);
-  const bgX0 = Math.round(tw * 0.2), bgX1 = Math.round(tw * 0.8);
-  for (let y = bgY0; y < bgY1; y++) {
-    for (let x = bgX0; x < bgX1; x++) {
-      bgLum += pixLum(x, y); bgN++;
-    }
-  }
-  bgLum /= bgN;
-
-  function halfBBox(fromX: number, toX: number): BBox {
-    const halfW = toX - fromX;
-    const THRESH = 25;
-
-    // Step 1: build per-row foreground density (fraction of pixels differing from bg)
-    const rowDensity: number[] = new Array(th).fill(0);
-    for (let y = 0; y < th; y++) {
-      let fg = 0;
-      for (let x = fromX; x < toX; x++) {
-        if (Math.abs(pixLum(x, y) - bgLum) > THRESH) fg++;
-      }
-      rowDensity[y] = fg / halfW;
-    }
-
-    // Step 2: find shoe BOTTOM — last row with decent density scanning from 80% down
-    // (ignore bottom 20% = table/mat)
-    const searchBottom = Math.round(th * 0.80);
-    let shoeBottom = Math.round(th * 0.70); // default
-    for (let y = searchBottom; y >= Math.round(th * 0.30); y--) {
-      if (rowDensity[y] > 0.12) { shoeBottom = y; break; }
-    }
-
-    // Step 3: find shoe TOP by scanning upward from shoeBottom
-    // Stop when we hit 5 consecutive rows with density < threshold (= entered wall)
-    const WALL_DENSITY = 0.06;
-    let shoeTop = shoeBottom;
-    let emptyStreak = 0;
-    for (let y = shoeBottom - 1; y >= 0; y--) {
-      if (rowDensity[y] > WALL_DENSITY) {
-        shoeTop = y;
-        emptyStreak = 0;
-      } else {
-        emptyStreak++;
-        if (emptyStreak >= 5) break;
-      }
-    }
-
-    // Step 4: find horizontal extent within shoeTop..shoeBottom
-    let minX = toX, maxX = fromX;
-    for (let y = shoeTop; y <= shoeBottom; y++) {
-      for (let x = fromX; x < toX; x++) {
-        if (Math.abs(pixLum(x, y) - bgLum) > THRESH) {
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-        }
-      }
-    }
-
-    // Sanity check
-    const boxH = shoeBottom - shoeTop;
-    const boxW = maxX - minX;
-    if (boxH < th * 0.05 || boxW < halfW * 0.05) {
-      return {
-        minX: Math.round((fromX + halfW * 0.08) / SCALE),
-        maxX: Math.round((toX - halfW * 0.08) / SCALE),
-        minY: Math.round(th * 0.20 / SCALE),
-        maxY: Math.round(th * 0.75 / SCALE),
-      };
-    }
-
-    const PAD = 3;
-    return {
-      minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
-      maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
-      minY: Math.max(0, Math.round((shoeTop - PAD) / SCALE)),
-      maxY: Math.min(vh, Math.round((shoeBottom + PAD) / SCALE)),
-    };
-  }
-
-  const mid = Math.round(tw / 2);
-  return {
-    left: halfBBox(0, mid),
-    right: halfBBox(mid, tw),
-  };
 }
 
 export function CameraView({ onCapture, onError }: Props) {
@@ -139,6 +32,7 @@ export function CameraView({ onCapture, onError }: Props) {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [isPortrait, setIsPortrait] = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
 
   useEffect(() => {
     function check() { setIsPortrait(window.innerHeight > window.innerWidth); }
@@ -180,86 +74,209 @@ export function CameraView({ onCapture, onError }: Props) {
     if (!video || !canvas || isCapturing || isAnalyzing) return;
 
     setIsCapturing(true);
-    setIsAnalyzing(true);
+    setStatusMsg("Analyzing with AI...");
 
     const vw = video.videoWidth || 1280;
     const vh = video.videoHeight || 720;
     canvas.width = vw;
     canvas.height = vh;
-    const ctx = canvas.getContext("2d")!;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) { setIsCapturing(false); return; }
+
     ctx.drawImage(video, 0, 0, vw, vh);
+    setIsAnalyzing(true);
 
-    await new Promise(r => setTimeout(r, 20));
+    function encodeRegion(srcX: number, srcY: number, srcW: number, srcH: number, outW: number) {
+      const outH = Math.round(srcH * (outW / srcW));
+      const c = document.createElement("canvas");
+      c.width = outW; c.height = outH;
+      c.getContext("2d")?.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, outW, outH);
+      return {
+        b64: c.toDataURL("image/jpeg", 0.95).split(",")[1],
+        scaleX: srcW / outW,
+        scaleY: srcH / outH,
+        offsetX: srcX,
+        offsetY: srcY,
+      };
+    }
 
-    const { left: lb, right: rb } = detectShoes(canvas, vw, vh);
+    function remap(preds: RoboflowPrediction[], scaleX: number, scaleY: number, offsetX: number, offsetY: number): RoboflowPrediction[] {
+      return preds.map(p => ({
+        ...p,
+        x: offsetX + p.x * scaleX,
+        y: offsetY + p.y * scaleY,
+        width: p.width * scaleX,
+        height: p.height * scaleY,
+        points: p.points?.map(pt => ({ x: offsetX + pt.x * scaleX, y: offsetY + pt.y * scaleY })),
+      }));
+    }
+
+    async function callRF(b64: string): Promise<RoboflowPrediction[]> {
+      const res = await fetch("/api/roboflow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: b64 }),
+        signal: AbortSignal.timeout(12000),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(`RF ${res.status}: ${JSON.stringify(data)}`);
+      console.log("[Roboflow raw]", data.predictions?.length, "predictions");
+      return data.predictions ?? [];
+    }
+
+    let predictions: RoboflowPrediction[] = [];
+    try {
+      const full = encodeRegion(0, 0, vw, vh, 1280);
+      const fullPreds = remap(await callRF(full.b64), full.scaleX, full.scaleY, 0, 0);
+
+      let allPreds = fullPreds;
+
+      if (fullPreds.length < 2) {
+        const halfW = Math.floor(vw / 2);
+        const leftCrop = encodeRegion(0, 0, halfW, vh, 640);
+        const rightCrop = encodeRegion(halfW, 0, halfW, vh, 640);
+        const [lPreds, rPreds] = await Promise.all([
+          callRF(leftCrop.b64).then(p => remap(p, leftCrop.scaleX, leftCrop.scaleY, leftCrop.offsetX, leftCrop.offsetY)),
+          callRF(rightCrop.b64).then(p => remap(p, rightCrop.scaleX, rightCrop.scaleY, rightCrop.offsetX, rightCrop.offsetY)),
+        ]);
+        const bestLeft = lPreds.sort((a, b) => b.confidence - a.confidence)[0];
+        const bestRight = rPreds.sort((a, b) => b.confidence - a.confidence)[0];
+        allPreds = [
+          ...(bestLeft ? [bestLeft] : []),
+          ...(bestRight ? [bestRight] : []),
+        ];
+      }
+
+      predictions = allPreds;
+    } catch (e) {
+      console.error("[Roboflow failed]", e);
+      setIsAnalyzing(false);
+      setIsCapturing(false);
+      setStatusMsg("");
+      onError(`AI analysis failed: ${e instanceof Error ? e.message : "network error"}. Check console.`);
+      return;
+    }
+
     setIsAnalyzing(false);
 
-    // Each shoe uses its OWN bottom as baseline — no shared groundY
-    // This prevents raised-surface artifacts from inflating one shoe's height
-    function drawBox(bounds: BBox, label: string) {
-      const boxBottom = bounds.maxY; // independent per shoe
-      const midX = (bounds.minX + bounds.maxX) / 2;
-      const midY = (bounds.minY + boxBottom) / 2;
-      const rX = Math.min(bounds.maxX + 8, vw - 90);
+    if (predictions.length === 0) {
+      setIsCapturing(false);
+      setStatusMsg("");
+      onError("No shoes detected. Ensure both shoes are clearly visible and try again.");
+      return;
+    }
 
-      ctx.beginPath();
-      ctx.rect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
-      ctx.fillStyle = `${GREEN}22`;
-      ctx.fill();
-      ctx.strokeStyle = GREEN;
-      ctx.lineWidth = 3;
-      ctx.shadowColor = GREEN;
-      ctx.shadowBlur = 14;
-      ctx.stroke();
-      ctx.shadowBlur = 0;
+    const minCenterY = vh * 0.25;
+    const minHeight = vh * 0.10;
+    const minWidth = vw * 0.08;
+    const filtered = predictions.filter(p =>
+      p.y > minCenterY && p.height > minHeight && p.width > minWidth
+    );
+    const pool = filtered.length > 0 ? filtered : predictions;
 
-      const heightPx = boxBottom - bounds.minY;
+    function iou(a: RoboflowPrediction, b: RoboflowPrediction): number {
+      const ax1 = a.x - a.width / 2, ax2 = a.x + a.width / 2;
+      const ay1 = a.y - a.height / 2, ay2 = a.y + a.height / 2;
+      const bx1 = b.x - b.width / 2, bx2 = b.x + b.width / 2;
+      const by1 = b.y - b.height / 2, by2 = b.y + b.height / 2;
+      const ix = Math.max(0, Math.min(ax2, bx2) - Math.max(ax1, bx1));
+      const iy = Math.max(0, Math.min(ay2, by2) - Math.max(ay1, by1));
+      const inter = ix * iy;
+      const union = a.width * a.height + b.width * b.height - inter;
+      return union > 0 ? inter / union : 0;
+    }
+
+    const sorted = [...pool].sort((a, b) => b.confidence - a.confidence);
+    const deduped: RoboflowPrediction[] = [];
+    for (const pred of sorted) {
+      if (!deduped.some(kept => iou(kept, pred) > 0.5)) deduped.push(pred);
+    }
+
+    deduped.sort((a, b) => a.x - b.x);
+    const leftPred = deduped[0];
+    const rightPred = deduped.length >= 2 ? deduped[deduped.length - 1] : deduped[0];
+
+    function getPolyBounds(pred: RoboflowPrediction) {
+      const xs = pred.points && pred.points.length > 0 ? pred.points.map(p => p.x) : [pred.x - pred.width / 2, pred.x + pred.width / 2];
+      const ys = pred.points && pred.points.length > 0 ? pred.points.map(p => p.y) : [pred.y - pred.height / 2, pred.y + pred.height / 2];
+      return { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) };
+    }
+
+    if (deduped.length >= 2) {
+      const lb = getPolyBounds(leftPred);
+      const rb = getPolyBounds(rightPred);
+      const bottomDiff = Math.abs(lb.maxY - rb.maxY);
+      if (bottomDiff > vh * 0.06) {
+        setIsCapturing(false);
+        setStatusMsg("");
+        onError(`Camera tilted — shoe baselines differ by ${Math.round(bottomDiff)}px. Level the phone and retake.`);
+        return;
+      }
+    }
+
+    const lb = getPolyBounds(leftPred);
+    const rb = getPolyBounds(rightPred);
+    const groundY = Math.max(lb.maxY, rb.maxY);
+
+    function drawPrediction(pred: RoboflowPrediction, bounds: ReturnType<typeof getPolyBounds>, label: string) {
+      if (!pred.points || pred.points.length < 3) {
+        ctx!.beginPath();
+        ctx!.rect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
+      } else {
+        ctx!.beginPath();
+        pred.points.forEach((pt, i) => {
+          if (i === 0) ctx!.moveTo(pt.x, pt.y);
+          else ctx!.lineTo(pt.x, pt.y);
+        });
+        ctx!.closePath();
+      }
+      ctx!.fillStyle = `${GREEN}20`;
+      ctx!.fill();
+      ctx!.strokeStyle = GREEN;
+      ctx!.lineWidth = 3;
+      ctx!.shadowColor = GREEN;
+      ctx!.shadowBlur = 12;
+      ctx!.stroke();
+      ctx!.shadowBlur = 0;
+
+      const heightPx = groundY - bounds.minY;
+      const widthPx = bounds.maxX - bounds.minX;
       const hMm = pxToMm(heightPx);
-      const wMm = pxToMm(bounds.maxX - bounds.minX);
+      const wMm = pxToMm(widthPx);
+      const midX = (bounds.minX + bounds.maxX) / 2;
+      const midY = (bounds.minY + groundY) / 2;
+      const rX = Math.min(bounds.maxX + 8, vw - 88);
 
-      // Height label
-      ctx.font = "bold 16px monospace";
+      ctx!.font = "bold 16px monospace";
       const hl = `${hMm}mm`;
-      ctx.fillStyle = "rgba(0,0,0,0.85)";
-      ctx.fillRect(rX - 2, midY - 12, ctx.measureText(hl).width + 10, 20);
-      ctx.fillStyle = GREEN;
-      ctx.textAlign = "left";
-      ctx.fillText(hl, rX + 2, midY + 4);
+      ctx!.fillStyle = "rgba(0,0,0,0.85)";
+      ctx!.fillRect(rX - 2, midY - 12, ctx!.measureText(hl).width + 10, 20);
+      ctx!.fillStyle = GREEN;
+      ctx!.textAlign = "left";
+      ctx!.fillText(hl, rX + 2, midY + 4);
 
-      // LEFT/RIGHT badge
-      ctx.font = "bold 13px monospace";
-      const bw = ctx.measureText(label).width + 14;
-      ctx.fillStyle = `${GREEN}cc`;
-      ctx.fillRect(midX - bw / 2, Math.min(boxBottom + 6, vh - 22), bw, 18);
-      ctx.fillStyle = "#000";
-      ctx.textAlign = "center";
-      ctx.fillText(label, midX, Math.min(boxBottom + 19, vh - 8));
+      const bw = ctx!.measureText(label).width + 14;
+      ctx!.fillStyle = `${GREEN}cc`;
+      ctx!.fillRect(midX - bw / 2, Math.min(groundY + 6, vh - 22), bw, 18);
+      ctx!.font = "bold 13px monospace";
+      ctx!.fillStyle = "#000";
+      ctx!.textAlign = "center";
+      ctx!.fillText(label, midX, Math.min(groundY + 19, vh - 8));
 
-      // Bottom baseline tick
-      ctx.strokeStyle = `${GREEN}80`;
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      ctx.moveTo(bounds.minX, boxBottom);
-      ctx.lineTo(bounds.maxX, boxBottom);
-      ctx.stroke();
-      ctx.setLineDash([]);
+      ctx!.strokeStyle = `${GREEN}80`;
+      ctx!.lineWidth = 1;
+      ctx!.setLineDash([4, 4]);
+      ctx!.beginPath();
+      ctx!.moveTo(bounds.minX, groundY);
+      ctx!.lineTo(bounds.maxX, groundY);
+      ctx!.stroke();
+      ctx!.setLineDash([]);
 
       return { hMm, wMm };
     }
 
-    const leftResult = drawBox(lb, "LEFT");
-    const rightResult = drawBox(rb, "RIGHT");
-
-    // Draw center divider line so user can see the split
-    ctx.strokeStyle = `${CYAN}60`;
-    ctx.lineWidth = 1;
-    ctx.setLineDash([6, 6]);
-    ctx.beginPath();
-    ctx.moveTo(vw / 2, 0);
-    ctx.lineTo(vw / 2, vh);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    const leftResult = drawPrediction(leftPred, lb, "LEFT");
+    const rightResult = deduped.length >= 2 ? drawPrediction(rightPred, rb, "RIGHT") : leftResult;
 
     const diff = parseFloat(Math.abs(leftResult.hMm - rightResult.hMm).toFixed(1));
     const passed = diff <= 3;
@@ -276,11 +293,11 @@ export function CameraView({ onCapture, onError }: Props) {
 
     ctx.font = "11px monospace";
     ctx.fillStyle = "rgba(0,0,0,0.7)";
-    const stamp = `CV | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
-    ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
+    const confLabel = `RF: ${deduped.length} shoe(s) | conf ${(leftPred.confidence * 100).toFixed(0)}%`;
+    ctx.fillRect(4, 4, ctx.measureText(confLabel).width + 10, 18);
     ctx.fillStyle = GREEN;
     ctx.textAlign = "left";
-    ctx.fillText(stamp, 9, 17);
+    ctx.fillText(confLabel, 9, 17);
 
     try {
       const blob = await compressImage(canvas, 0.9);
@@ -301,10 +318,12 @@ export function CameraView({ onCapture, onError }: Props) {
       });
 
       setShowSuccess(true);
+      setStatusMsg("");
       setTimeout(() => { setShowSuccess(false); setIsCapturing(false); }, 1200);
     } catch {
       onError("Failed to compress image");
       setIsCapturing(false);
+      setStatusMsg("");
     }
   }, [isCapturing, isAnalyzing, onCapture, onError]);
 
@@ -336,47 +355,37 @@ export function CameraView({ onCapture, onError }: Props) {
           <motion.div
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
             className="absolute inset-0 flex flex-col items-center justify-center z-30"
-            style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
+            style={{ background: "rgba(0,0,0,0.65)", backdropFilter: "blur(4px)" }}
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
-            <p className="text-base font-bold" style={{ color: CYAN }}>Measuring shoes...</p>
+            <p className="text-base font-bold" style={{ color: CYAN }}>AI Analyzing...</p>
+            <p className="text-xs mt-1" style={{ color: "#666" }}>Detecting shoe outlines</p>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Guide overlay — shows split line and shoe zones */}
       {isReady && !isCapturing && (
         <div className="absolute inset-0 pointer-events-none">
-          {/* Center divider */}
-          <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-40"
-            style={{ background: `repeating-linear-gradient(to bottom, ${CYAN} 0px, ${CYAN} 8px, transparent 8px, transparent 16px)` }} />
-          {/* Left zone label */}
-          <div className="absolute left-4 top-1/2 -translate-y-1/2">
-            <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-              LEFT SHOE
-            </div>
-          </div>
-          {/* Right zone label */}
-          <div className="absolute right-4 top-1/2 -translate-y-1/2">
-            <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-              RIGHT SHOE
-            </div>
-          </div>
-          {/* Corner guides */}
-          <div className="absolute top-8 left-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
-          <div className="absolute top-8 right-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
-          <div className="absolute bottom-24 left-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
-          <div className="absolute bottom-24 right-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
+          <div className="absolute top-8 left-8 w-12 h-12" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
+          <div className="absolute top-8 right-8 w-12 h-12" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
+          <div className="absolute bottom-24 left-8 w-12 h-12" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
+          <div className="absolute bottom-24 right-8 w-12 h-12" style={{ borderBottom: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
         </div>
       )}
 
       {isReady && !isCapturing && (
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
-          <div className="px-4 py-1.5 rounded-full text-xs font-semibold text-center whitespace-nowrap"
-            style={{ background: "rgba(0,0,0,0.75)", border: `1px solid ${CYAN}40`, color: "#ccc" }}>
-            One shoe each side of the line · landscape · tap capture
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10">
+          <div className="px-4 py-2 rounded-full text-xs font-semibold text-center whitespace-nowrap"
+            style={{ background: "rgba(0,0,0,0.7)", border: `1px solid ${CYAN}40`, color: "#ccc", backdropFilter: "blur(6px)" }}>
+            Place both shoes side-by-side then tap capture
+          </div>
+        </div>
+      )}
+
+      {statusMsg && (
+        <div className="absolute bottom-28 left-0 right-0 flex justify-center z-10">
+          <div className="px-4 py-2 rounded-full text-xs font-semibold" style={{ background: "rgba(0,0,0,0.7)", color: CYAN }}>
+            {statusMsg}
           </div>
         </div>
       )}
@@ -412,7 +421,7 @@ export function CameraView({ onCapture, onError }: Props) {
           )}
         </button>
         <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.5)" }}>
-          {isAnalyzing ? "measuring..." : isCapturing ? "processing..." : "tap to capture"}
+          {isAnalyzing ? "analyzing..." : isCapturing ? "processing..." : "tap to capture"}
         </span>
       </div>
     </div>

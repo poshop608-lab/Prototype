@@ -174,6 +174,8 @@ export default function CapturePage() {
                 {[
                   { label: "Left Shoe Height", value: `${captured.leftHeightMm} mm`, accent: false },
                   { label: "Right Shoe Height", value: `${captured.rightHeightMm} mm`, accent: false },
+                  { label: "Left Shoe Width", value: `${captured.leftWidthMm} mm`, accent: false },
+                  { label: "Right Shoe Width", value: `${captured.rightWidthMm} mm`, accent: false },
                   { label: "Height Difference", value: `${captured.heightDiffMm} mm`, accent: true },
                 ].map(({ label, value, accent }) => (
                   <div key={label} className="flex items-center justify-between px-4 py-3">

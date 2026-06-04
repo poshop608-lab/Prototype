@@ -17,123 +17,35 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// ── Green-background shoe detector ────────────────────────────────────────
-// Detects bright green background pixels, everything non-green = shoe.
-// Works on any shoe color. Split left/right halves for two shoes.
-// Falls back to luminance diff if background is not green enough.
-function detectShoes(canvas: HTMLCanvasElement, vw: number, vh: number): { left: BBox; right: BBox } {
-  const SCALE = 0.25;
-  const tw = Math.round(vw * SCALE);
-  const th = Math.round(vh * SCALE);
+// MediaPipe model URL — EfficientDet-Lite0, ~4MB, works offline after first load
+const MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite";
 
-  const thumb = document.createElement("canvas");
-  thumb.width = tw; thumb.height = th;
-  const tctx = thumb.getContext("2d", { willReadFrequently: true })!;
-  tctx.drawImage(canvas, 0, 0, tw, th);
-  const { data } = tctx.getImageData(0, 0, tw, th);
-
-  // Check if background is green: sample corners + edges
-  function isGreenPixel(r: number, g: number, b: number): boolean {
-    // Green dominant: g > r*1.3 AND g > b*1.3 AND g > 80
-    return g > r * 1.25 && g > b * 1.25 && g > 80;
-  }
-
-  // Sample many background points to determine if green bg is present
-  let greenCount = 0, sampleCount = 0;
-  const samplePoints = [
-    [0, 0], [tw - 1, 0], [0, th - 1], [tw - 1, th - 1],
-    [Math.round(tw * 0.25), 0], [Math.round(tw * 0.75), 0],
-    [0, Math.round(th * 0.25)], [tw - 1, Math.round(th * 0.25)],
-  ];
-  for (const [x, y] of samplePoints) {
-    const i = (y * tw + x) * 4;
-    if (isGreenPixel(data[i], data[i + 1], data[i + 2])) greenCount++;
-    sampleCount++;
-  }
-  const hasGreenBg = greenCount / sampleCount >= 0.4;
-
-  function halfBBox(fromX: number, toX: number): BBox {
-    let minX = toX, maxX = fromX, minY = th, maxY = 0;
-    let found = false;
-    const scanY0 = Math.round(th * 0.05);
-    const scanY1 = Math.round(th * 0.90);
-
-    if (hasGreenBg) {
-      // Non-green pixels = shoe
-      for (let y = scanY0; y < scanY1; y++) {
-        for (let x = fromX; x < toX; x++) {
-          const i = (y * tw + x) * 4;
-          const r = data[i], g = data[i + 1], b = data[i + 2];
-          if (!isGreenPixel(r, g, b)) {
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-            found = true;
-          }
-        }
-      }
-    } else {
-      // Fallback: luminance diff from top-strip background
-      let bgLum = 0, bgN = 0;
-      for (let y = 0; y < Math.round(th * 0.15); y++) {
-        for (let x = fromX; x < toX; x++) {
-          const i = (y * tw + x) * 4;
-          bgLum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-          bgN++;
-        }
-      }
-      bgLum /= bgN;
-
-      for (let y = scanY0; y < scanY1; y++) {
-        for (let x = fromX; x < toX; x++) {
-          const i = (y * tw + x) * 4;
-          const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-          if (Math.abs(lum - bgLum) > 30) {
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-            found = true;
-          }
-        }
-      }
-    }
-
-    const halfW = toX - fromX;
-    if (!found || maxX - minX < halfW * 0.05 || maxY - minY < th * 0.04) {
-      const pad = Math.round(halfW * 0.08);
-      return {
-        minX: Math.round((fromX + pad) / SCALE),
-        maxX: Math.round((toX - pad) / SCALE),
-        minY: Math.round(th * 0.15 / SCALE),
-        maxY: Math.round(th * 0.85 / SCALE),
-      };
-    }
-
-    const PAD = 4;
-    return {
-      minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
-      maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
-      minY: Math.max(0, Math.round((minY - PAD) / SCALE)),
-      maxY: Math.min(vh, Math.round((maxY + PAD) / SCALE)),
-    };
-  }
-
-  const mid = Math.round(tw / 2);
-  return { left: halfBBox(0, mid), right: halfBBox(mid, tw) };
-}
+// Classes that could represent a shoe on a factory floor
+const SHOE_CLASSES = new Set([
+  "shoe", "sneaker", "boot", "sandal", "slipper",
+  // fallback: anything that can sit on a floor
+  "sports ball", "bottle", "cup", "vase", "bowl",
+  "handbag", "backpack", "suitcase", "clock", "book",
+  "laptop", "keyboard", "remote", "mouse", "cell phone",
+  "teddy bear", "potted plant", "chair",
+]);
 
 export function CameraView({ onCapture, onError }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const detectorRef = useRef<any>(null);
 
   const [isReady, setIsReady] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [modelLoading, setModelLoading] = useState(false);
+  const [modelReady, setModelReady] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [isPortrait, setIsPortrait] = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
 
   useEffect(() => {
     function check() { setIsPortrait(window.innerHeight > window.innerWidth); }
@@ -150,7 +62,11 @@ export function CameraView({ onCapture, onError }: Props) {
     async function startCamera() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          },
           audio: false,
         });
         streamRef.current = stream;
@@ -169,13 +85,83 @@ export function CameraView({ onCapture, onError }: Props) {
     return () => { streamRef.current?.getTracks().forEach((t) => t.stop()); };
   }, [onError]);
 
+  // Load MediaPipe model eagerly once camera is ready
+  useEffect(() => {
+    if (!isReady || detectorRef.current || modelLoading) return;
+    async function loadModel() {
+      setModelLoading(true);
+      try {
+        const { ObjectDetector, FilesetResolver } =
+          await import("@mediapipe/tasks-vision");
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+        );
+        detectorRef.current = await ObjectDetector.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
+          scoreThreshold: 0.2,
+          maxResults: 10,
+          runningMode: "IMAGE",
+        });
+        setModelReady(true);
+      } catch (e) {
+        console.error("[MediaPipe load]", e);
+        // Try CPU fallback
+        try {
+          const { ObjectDetector, FilesetResolver } =
+            await import("@mediapipe/tasks-vision");
+          const vision = await FilesetResolver.forVisionTasks(
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+          );
+          detectorRef.current = await ObjectDetector.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
+            scoreThreshold: 0.2,
+            maxResults: 10,
+            runningMode: "IMAGE",
+          });
+          setModelReady(true);
+        } catch (e2) {
+          console.error("[MediaPipe CPU fallback failed]", e2);
+        }
+      } finally {
+        setModelLoading(false);
+      }
+    }
+    loadModel();
+  }, [isReady, modelLoading]);
+
   const handleCapture = useCallback(async () => {
     const video = videoRef.current;
     const canvas = captureCanvasRef.current;
     if (!video || !canvas || isCapturing || isAnalyzing) return;
 
     setIsCapturing(true);
+
+    // Load model on-demand if eager load hasn't finished
+    if (!detectorRef.current) {
+      setStatusMsg("Loading AI model (~4MB)...");
+      try {
+        const { ObjectDetector, FilesetResolver } =
+          await import("@mediapipe/tasks-vision");
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+        );
+        detectorRef.current = await ObjectDetector.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
+          scoreThreshold: 0.2,
+          maxResults: 10,
+          runningMode: "IMAGE",
+        });
+        setModelReady(true);
+      } catch (e) {
+        onError(`AI model failed to load: ${e instanceof Error ? e.message : "network error"}`);
+        setIsCapturing(false);
+        setStatusMsg("");
+        return;
+      }
+    }
+
     setIsAnalyzing(true);
+    setStatusMsg("Detecting shoes...");
 
     const vw = video.videoWidth || 1280;
     const vh = video.videoHeight || 720;
@@ -184,10 +170,97 @@ export function CameraView({ onCapture, onError }: Props) {
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, vw, vh);
 
-    await new Promise(r => setTimeout(r, 20));
+    let detections: { bbox: BBox; score: number; label: string }[] = [];
 
-    const { left: lb, right: rb } = detectShoes(canvas, vw, vh);
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = detectorRef.current.detect(canvas) as any;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const raw: any[] = result.detections ?? [];
+
+      detections = raw.map((d) => {
+        const bb = d.boundingBox;
+        return {
+          label: d.categories?.[0]?.categoryName ?? "object",
+          score: d.categories?.[0]?.score ?? 0,
+          bbox: {
+            minX: Math.round(bb.originX),
+            minY: Math.round(bb.originY),
+            maxX: Math.round(bb.originX + bb.width),
+            maxY: Math.round(bb.originY + bb.height),
+          },
+        };
+      });
+
+      console.log("[MediaPipe]", detections.length, "detections:", detections.map(d => `${d.label}(${(d.score*100).toFixed(0)}%)`));
+    } catch (e) {
+      setIsAnalyzing(false);
+      setIsCapturing(false);
+      setStatusMsg("");
+      onError(`Detection failed: ${e instanceof Error ? e.message : "unknown"}`);
+      return;
+    }
+
     setIsAnalyzing(false);
+    setStatusMsg("");
+
+    if (detections.length === 0) {
+      setIsCapturing(false);
+      onError("No objects detected. Make sure shoes are well-lit and clearly visible.");
+      return;
+    }
+
+    // Prefer shoe-class detections; fallback to all detections by area
+    let shoes = detections.filter(d => SHOE_CLASSES.has(d.label.toLowerCase()));
+    if (shoes.length < 2) shoes = detections;
+
+    // Remove duplicates (IoU > 0.5)
+    function iou(a: BBox, b: BBox) {
+      const ix = Math.max(0, Math.min(a.maxX, b.maxX) - Math.max(a.minX, b.minX));
+      const iy = Math.max(0, Math.min(a.maxY, b.maxY) - Math.max(a.minY, b.minY));
+      const inter = ix * iy;
+      const aA = (a.maxX - a.minX) * (a.maxY - a.minY);
+      const bA = (b.maxX - b.minX) * (b.maxY - b.minY);
+      return inter / (aA + bA - inter + 1e-6);
+    }
+    const sorted = [...shoes].sort((a, b) => b.score - a.score);
+    const deduped: typeof sorted = [];
+    for (const d of sorted) {
+      if (!deduped.some(k => iou(k.bbox, d.bbox) > 0.5)) deduped.push(d);
+    }
+
+    if (deduped.length < 2) {
+      setIsCapturing(false);
+      onError(
+        `Only found ${deduped.length} object(s). Both shoes must be fully visible, side-by-side with a gap between them.`
+      );
+      return;
+    }
+
+    // Pick best pair: max horizontal separation among top-4
+    const top4 = deduped.slice(0, 4);
+    let bestA = top4[0], bestB = top4[1], bestSep = 0;
+    for (let i = 0; i < top4.length; i++) {
+      for (let j = i + 1; j < top4.length; j++) {
+        const ca = (top4[i].bbox.minX + top4[i].bbox.maxX) / 2;
+        const cb = (top4[j].bbox.minX + top4[j].bbox.maxX) / 2;
+        const sep = Math.abs(ca - cb);
+        if (sep > bestSep) { bestSep = sep; bestA = top4[i]; bestB = top4[j]; }
+      }
+    }
+
+    // Sort left → right
+    const [leftDet, rightDet] = [bestA, bestB].sort((a, b) => a.bbox.minX - b.bbox.minX);
+    const lb = leftDet.bbox;
+    const rb = rightDet.bbox;
+
+    // Tilt check
+    const bottomDiff = Math.abs(lb.maxY - rb.maxY);
+    if (bottomDiff > vh * 0.12) {
+      setIsCapturing(false);
+      onError(`Camera tilted — shoe baselines differ by ${Math.round(bottomDiff)}px. Level the camera.`);
+      return;
+    }
 
     const groundY = Math.max(lb.maxY, rb.maxY);
 
@@ -204,8 +277,9 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.shadowBlur = 0;
 
       const heightPx = groundY - bounds.minY;
+      const widthPx = bounds.maxX - bounds.minX;
       const hMm = pxToMm(heightPx);
-      const wMm = pxToMm(bounds.maxX - bounds.minX);
+      const wMm = pxToMm(widthPx);
       const midX = (bounds.minX + bounds.maxX) / 2;
       const midY = (bounds.minY + groundY) / 2;
       const rX = Math.min(bounds.maxX + 8, vw - 90);
@@ -217,6 +291,13 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.fillStyle = GREEN;
       ctx.textAlign = "left";
       ctx.fillText(hl, rX + 2, midY + 4);
+
+      const wl = `${wMm}mm`;
+      ctx.fillStyle = "rgba(0,0,0,0.85)";
+      ctx.fillRect(midX - ctx.measureText(wl).width / 2 - 4, Math.max(bounds.minY - 26, 0), ctx.measureText(wl).width + 8, 18);
+      ctx.fillStyle = GREEN;
+      ctx.textAlign = "center";
+      ctx.fillText(wl, midX, Math.max(bounds.minY - 10, 14));
 
       ctx.font = "bold 13px monospace";
       const bw = ctx.measureText(label).width + 14;
@@ -241,16 +322,6 @@ export function CameraView({ onCapture, onError }: Props) {
     const leftResult = drawBox(lb, "LEFT");
     const rightResult = drawBox(rb, "RIGHT");
 
-    // Center divider
-    ctx.strokeStyle = `${CYAN}60`;
-    ctx.lineWidth = 1;
-    ctx.setLineDash([6, 6]);
-    ctx.beginPath();
-    ctx.moveTo(vw / 2, 0);
-    ctx.lineTo(vw / 2, vh);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
     const diff = parseFloat(Math.abs(leftResult.hMm - rightResult.hMm).toFixed(1));
     const passed = diff <= 3;
 
@@ -266,7 +337,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
     ctx.font = "11px monospace";
     ctx.fillStyle = "rgba(0,0,0,0.7)";
-    const stamp = `CV | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
+    const stamp = `MP | L:${leftResult.hMm}mm R:${rightResult.hMm}mm | ${leftDet.label}/${rightDet.label}`;
     ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
     ctx.fillStyle = GREEN;
     ctx.textAlign = "left";
@@ -291,10 +362,12 @@ export function CameraView({ onCapture, onError }: Props) {
       });
 
       setShowSuccess(true);
+      setStatusMsg("");
       setTimeout(() => { setShowSuccess(false); setIsCapturing(false); }, 1200);
     } catch {
       onError("Failed to compress image");
       setIsCapturing(false);
+      setStatusMsg("");
     }
   }, [isCapturing, isAnalyzing, onCapture, onError]);
 
@@ -321,47 +394,59 @@ export function CameraView({ onCapture, onError }: Props) {
         </div>
       )}
 
+      {/* Model loading indicator (subtle, top bar) */}
+      {isReady && modelLoading && (
+        <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-center gap-2 py-2"
+          style={{ background: "rgba(0,0,0,0.7)" }}>
+          <Loader2 className="w-3 h-3 animate-spin" style={{ color: CYAN }} />
+          <span className="text-xs font-medium" style={{ color: CYAN }}>Loading AI model...</span>
+        </div>
+      )}
+      {isReady && modelReady && !modelLoading && !isCapturing && (
+        <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-center gap-2 py-1.5"
+          style={{ background: "rgba(34,197,94,0.15)" }}>
+          <div className="w-1.5 h-1.5 rounded-full" style={{ background: GREEN }} />
+          <span className="text-[10px] font-semibold" style={{ color: GREEN }}>AI Ready</span>
+        </div>
+      )}
+
       <AnimatePresence>
         {isAnalyzing && (
           <motion.div
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
             className="absolute inset-0 flex flex-col items-center justify-center z-30"
-            style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
+            style={{ background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)" }}
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
-            <p className="text-base font-bold" style={{ color: CYAN }}>Measuring shoes...</p>
+            <p className="text-base font-bold" style={{ color: CYAN }}>Detecting shoes...</p>
+            <p className="text-xs mt-1" style={{ color: "#666" }}>MediaPipe EfficientDet</p>
           </motion.div>
         )}
       </AnimatePresence>
 
       {isReady && !isCapturing && (
         <div className="absolute inset-0 pointer-events-none">
-          <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-40"
-            style={{ background: `repeating-linear-gradient(to bottom, ${CYAN} 0px, ${CYAN} 8px, transparent 8px, transparent 16px)` }} />
-          <div className="absolute left-4 top-1/2 -translate-y-1/2">
-            <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-              LEFT SHOE
-            </div>
-          </div>
-          <div className="absolute right-4 top-1/2 -translate-y-1/2">
-            <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-              RIGHT SHOE
-            </div>
-          </div>
-          <div className="absolute top-8 left-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
-          <div className="absolute top-8 right-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
-          <div className="absolute bottom-24 left-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
-          <div className="absolute bottom-24 right-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
+          <div className="absolute top-8 left-8 w-12 h-12" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
+          <div className="absolute top-8 right-8 w-12 h-12" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
+          <div className="absolute bottom-24 left-8 w-12 h-12" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
+          <div className="absolute bottom-24 right-8 w-12 h-12" style={{ borderBottom: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
         </div>
       )}
 
       {isReady && !isCapturing && (
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
-          <div className="px-4 py-1.5 rounded-full text-xs font-semibold text-center whitespace-nowrap"
-            style={{ background: "rgba(0,0,0,0.75)", border: `1px solid ${CYAN}40`, color: "#ccc" }}>
-            Green paper bg · one shoe each side · landscape
+        <div className="absolute top-10 left-1/2 -translate-x-1/2 z-10">
+          <div className="px-4 py-2 rounded-full text-xs font-semibold text-center whitespace-nowrap"
+            style={{ background: "rgba(0,0,0,0.7)", border: `1px solid ${CYAN}40`, color: "#ccc", backdropFilter: "blur(6px)" }}>
+            Shoes side-by-side · landscape · well-lit
+          </div>
+        </div>
+      )}
+
+      {statusMsg && (
+        <div className="absolute bottom-28 left-0 right-0 flex justify-center z-10">
+          <div className="px-4 py-2 rounded-full text-xs font-semibold"
+            style={{ background: "rgba(0,0,0,0.7)", color: CYAN }}>
+            {statusMsg}
           </div>
         </div>
       )}
@@ -397,7 +482,7 @@ export function CameraView({ onCapture, onError }: Props) {
           )}
         </button>
         <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.5)" }}>
-          {isAnalyzing ? "measuring..." : isCapturing ? "processing..." : "tap to capture"}
+          {isAnalyzing ? "analyzing..." : isCapturing ? "processing..." : "tap to capture"}
         </span>
       </div>
     </div>

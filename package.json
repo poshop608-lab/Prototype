@@ -31,6 +31,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "framer-motion": "^12.38.0",
+    "inferencejs": "^1.2.3",
     "lucide-react": "^1.14.0",
     "next": "16.2.6",
     "react": "19.2.4",

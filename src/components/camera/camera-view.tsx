@@ -11,22 +11,23 @@ const GREEN = "#22c55e";
 const RED = "#ef4444";
 
 interface BBox { minX: number; maxX: number; minY: number; maxY: number; }
+interface Pt { x: number; y: number; }
+interface ShoeResult { bbox: BBox; contour: Pt[] | null; }
 
 interface Props {
   onCapture: (result: CaptureResult) => void;
   onError: (msg: string) => void;
 }
 
-// ── Guaranteed split-frame detector ───────────────────────────────────────
-// Splits frame into left/right halves. In each half, finds the tightest
-// bounding box around foreground pixels using pixel luminance analysis.
-// Falls back to 80% of half-frame if no clear foreground found.
-// NEVER fails — always returns two boxes.
+// ── True silhouette extractor ─────────────────────────────────────────────
+// 1. Luminance threshold → initial binary mask
+// 2. Dilation fills gaps inside shoe
+// 3. BFS flood-fill from known background edges removes wall/floor blobs
+// 4. Row-by-row contour tracing gives exact left/right shoe outline
+// 5. Measurements derived from contour, not bounding box
 function detectShoes(
-  canvas: HTMLCanvasElement,
-  vw: number,
-  vh: number
-): { left: BBox; right: BBox } {
+  canvas: HTMLCanvasElement, vw: number, vh: number
+): { left: BBox; right: BBox; leftContour: Pt[] | null; rightContour: Pt[] | null } {
   const SCALE = 0.25;
   const tw = Math.round(vw * SCALE);
   const th = Math.round(vh * SCALE);
@@ -37,71 +38,131 @@ function detectShoes(
   tctx.drawImage(canvas, 0, 0, tw, th);
   const { data } = tctx.getImageData(0, 0, tw, th);
 
-  // Sample background luminance from top strip (sky/wall above shoes)
-  let bgLum = 0, bgN = 0;
-  const topStrip = Math.round(th * 0.15);
-  for (let y = 0; y < topStrip; y++) {
+  const gray = new Float32Array(tw * th);
+  for (let y = 0; y < th; y++)
     for (let x = 0; x < tw; x++) {
       const i = (y * tw + x) * 4;
-      bgLum += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-      bgN++;
+      gray[y * tw + x] = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
     }
-  }
-  bgLum /= bgN;
 
-  // For each half, find tight bbox of pixels that differ from background
-  function halfBBox(fromX: number, toX: number): BBox {
-    let minX = toX, maxX = fromX, minY = th, maxY = 0;
-    let found = false;
+  // Background: average of top 15% strip
+  let bgSum = 0, bgN = 0;
+  for (let y = 0; y < Math.round(th * 0.15); y++)
+    for (let x = 0; x < tw; x++) { bgSum += gray[y * tw + x]; bgN++; }
+  const bgLum = bgSum / bgN;
+  const THRESH = 28;
 
-    // Threshold: pixel is "shoe" if luminance differs enough from bg
-    // Use both dark-object-on-light and light-object-on-dark detection
-    const THRESH = 35;
+  function processHalf(fromX: number, toX: number): ShoeResult {
+    const halfW = toX - fromX;
 
-    for (let y = Math.round(th * 0.1); y < th; y++) {
-      for (let x = fromX; x < toX; x++) {
-        const i = (y * tw + x) * 4;
-        const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-        if (Math.abs(lum - bgLum) > THRESH) {
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
+    // ── Step 1: initial mask ───────────────────────────────────────────────
+    const mask = new Uint8Array(tw * th);
+    for (let y = 0; y < th; y++)
+      for (let x = fromX; x < toX; x++)
+        mask[y * tw + x] = Math.abs(gray[y * tw + x] - bgLum) > THRESH ? 1 : 0;
+
+    // ── Step 2: dilation (fill gaps/holes inside shoe) ────────────────────
+    const R = 2;
+    const dil = new Uint8Array(tw * th);
+    for (let y = R; y < th - R; y++)
+      for (let x = fromX + R; x < toX - R; x++) {
+        let f = false;
+        for (let dy = -R; dy <= R && !f; dy++)
+          for (let dx = -R; dx <= R && !f; dx++)
+            if (mask[(y+dy)*tw+(x+dx)]) f = true;
+        dil[y * tw + x] = f ? 1 : 0;
+      }
+
+    // ── Step 3: BFS flood-fill from background seeds ──────────────────────
+    const bg = new Uint8Array(tw * th);
+    const q: number[] = [];
+
+    function seed(x: number, y: number) {
+      if (x < fromX || x >= toX || y < 0 || y >= th) return;
+      const idx = y * tw + x;
+      if (bg[idx] || dil[idx]) return;
+      bg[idx] = 1; q.push(idx);
+    }
+
+    // Seeds: top 15% rows (wall), left/right borders of half, bottom row
+    for (let y = 0; y < Math.round(th * 0.15); y++)
+      for (let x = fromX; x < toX; x++) seed(x, y);
+    for (let y = 0; y < th; y++) { seed(fromX, y); seed(toX - 1, y); }
+    for (let x = fromX; x < toX; x++) seed(x, th - 1);
+
+    let qi = 0;
+    while (qi < q.length) {
+      const idx = q[qi++];
+      const y = Math.floor(idx / tw), x = idx % tw;
+      if (y > 0)       seed(x, y - 1);
+      if (y < th - 1)  seed(x, y + 1);
+      if (x > fromX)   seed(x - 1, y);
+      if (x < toX - 1) seed(x + 1, y);
+    }
+
+    // ── Step 4: clean mask = dilated AND not background ───────────────────
+    const clean = new Uint8Array(tw * th);
+    let minY = th, maxY = 0, hasShoe = false;
+    for (let y = 0; y < th; y++)
+      for (let x = fromX; x < toX; x++)
+        if (dil[y * tw + x] && !bg[y * tw + x]) {
+          clean[y * tw + x] = 1;
           if (y < minY) minY = y;
           if (y > maxY) maxY = y;
-          found = true;
+          hasShoe = true;
         }
-      }
-    }
 
-    if (!found || maxX - minX < tw * 0.03 || maxY - minY < th * 0.03) {
-      const pad = Math.round((toX - fromX) * 0.10);
-      const vpad = Math.round(th * 0.10);
+    // Fallback if nothing detected
+    if (!hasShoe || maxY - minY < th * 0.04) {
+      const pad = Math.round(halfW * 0.08);
       return {
-        minX: Math.round((fromX + pad) / SCALE),
-        maxX: Math.round((toX - pad) / SCALE),
-        minY: Math.round(vpad / SCALE),
-        maxY: Math.round((th - vpad) / SCALE),
+        bbox: {
+          minX: Math.round((fromX + pad) / SCALE),
+          maxX: Math.round((toX   - pad) / SCALE),
+          minY: Math.round(th * 0.15 / SCALE),
+          maxY: Math.round(th * 0.85 / SCALE),
+        },
+        contour: null,
       };
     }
 
-    // Clamp height: shoe can't be taller than 55% of frame height.
-    // Prevents wall pixels above shoe from inflating the box upward.
-    const maxHeightPx = Math.round(th * 0.55);
-    if (maxY - minY > maxHeightPx) minY = maxY - maxHeightPx;
+    // ── Step 5: row-by-row silhouette contour ─────────────────────────────
+    const leftEdge: Pt[] = [];
+    const rightEdge: Pt[] = [];
+    for (let y = minY; y <= maxY; y++) {
+      let lx = toX, rx = fromX - 1;
+      for (let x = fromX; x < toX; x++)
+        if (clean[y * tw + x]) { if (x < lx) lx = x; if (x > rx) rx = x; }
+      if (rx >= lx) {
+        leftEdge.push({ x: lx, y });
+        rightEdge.push({ x: rx, y });
+      }
+    }
 
-    const PAD = 4;
+    // Build closed polygon: left edge top→bottom + right edge bottom→top
+    const pts: Pt[] = [
+      ...leftEdge,
+      ...[...rightEdge].reverse(),
+    ].map(p => ({ x: Math.round(p.x / SCALE), y: Math.round(p.y / SCALE) }));
+
+    let minX = vw, maxX = 0;
+    for (const p of pts) { if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x; }
+
     return {
-      minX: Math.max(0, Math.round((minX - PAD) / SCALE)),
-      maxX: Math.min(vw, Math.round((maxX + PAD) / SCALE)),
-      minY: Math.max(0, Math.round((minY - PAD) / SCALE)),
-      maxY: Math.min(vh, Math.round((maxY + PAD) / SCALE)),
+      bbox: {
+        minX: Math.max(0, minX),
+        maxX: Math.min(vw, maxX),
+        minY: Math.max(0, Math.round(minY / SCALE)),
+        maxY: Math.min(vh, Math.round(maxY / SCALE)),
+      },
+      contour: pts,
     };
   }
 
   const mid = Math.round(tw / 2);
-  return {
-    left: halfBBox(0, mid),
-    right: halfBBox(mid, tw),
-  };
+  const L = processHalf(0, mid);
+  const R = processHalf(mid, tw);
+  return { left: L.bbox, right: R.bbox, leftContour: L.contour, rightContour: R.contour };
 }
 
 export function CameraView({ onCapture, onError }: Props) {
@@ -166,7 +227,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
     await new Promise(r => setTimeout(r, 20));
 
-    const { left: lb, right: rb } = detectShoes(canvas, vw, vh);
+    const { left: lb, right: rb, leftContour: lc, rightContour: rc } = detectShoes(canvas, vw, vh);
     setIsAnalyzing(false);
 
     const groundY = Math.max(lb.maxY, rb.maxY);
@@ -192,10 +253,15 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.textBaseline = "alphabetic";
     }
 
-    function drawBox(bounds: BBox, label: string) {
-      // Box fill + stroke
+    function drawBox(bounds: BBox, contour: Pt[] | null, label: string) {
+      // Draw silhouette contour if available, else fallback rect
       ctx.beginPath();
-      ctx.rect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
+      if (contour && contour.length > 2) {
+        contour.forEach((p, i) => { if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y); });
+        ctx.closePath();
+      } else {
+        ctx.rect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
+      }
       ctx.fillStyle = `${GREEN}1a`; ctx.fill();
       ctx.strokeStyle = GREEN; ctx.lineWidth = Math.max(2, vw * 0.002);
       ctx.shadowColor = GREEN; ctx.shadowBlur = 12; ctx.stroke(); ctx.shadowBlur = 0;
@@ -235,8 +301,8 @@ export function CameraView({ onCapture, onError }: Props) {
       return { hMm, wMm };
     }
 
-    const leftResult = drawBox(lb, "LEFT");
-    const rightResult = drawBox(rb, "RIGHT");
+    const leftResult  = drawBox(lb, lc, "LEFT");
+    const rightResult = drawBox(rb, rc, "RIGHT");
 
     // Draw center divider line so user can see the split
     ctx.strokeStyle = `${CYAN}60`;

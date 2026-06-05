@@ -83,23 +83,10 @@ function detectShoes(
       };
     }
 
-    // Refine minY: scan UP from maxY row-by-row within detected x-range.
-    // Wall above shoe = sparse rows → stop at 4 consecutive sparse rows.
-    // Prevents wall marks pulling the top edge into the background.
-    let refinedMinY = maxY;
-    let emptyStreak = 0;
-    for (let y = maxY - 1; y >= minY; y--) {
-      let rowFg = 0;
-      for (let x = minX; x <= maxX; x++) {
-        const ri = (y * tw + x) * 4;
-        const rl = 0.299 * data[ri] + 0.587 * data[ri + 1] + 0.114 * data[ri + 2];
-        if (Math.abs(rl - bgLum) > THRESH) rowFg++;
-      }
-      const rowDensity = rowFg / (maxX - minX + 1);
-      if (rowDensity > 0.15) { refinedMinY = y; emptyStreak = 0; }
-      else if (++emptyStreak >= 4) break;
-    }
-    minY = refinedMinY;
+    // Clamp height: shoe can't be taller than 55% of frame height.
+    // Prevents wall pixels above shoe from inflating the box upward.
+    const maxHeightPx = Math.round(th * 0.55);
+    if (maxY - minY > maxHeightPx) minY = maxY - maxHeightPx;
 
     const PAD = 4;
     return {

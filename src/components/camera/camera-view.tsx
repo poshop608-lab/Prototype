@@ -40,7 +40,7 @@ function loadInferencejs(): Promise<void> {
     }
     const s = document.createElement("script");
     s.id = "inferencejs-cdn";
-    s.src = "https://cdn.jsdelivr.net/npm/inferencejs/dist/inferencejs.min.js";
+    s.src = "https://cdn.jsdelivr.net/npm/inferencejs@1.2.3/dist/inference.js";
     s.onload = () => { window._rfEngineReady = true; resolve(); };
     s.onerror = () => reject(new Error("inferencejs CDN load failed"));
     document.head.appendChild(s);

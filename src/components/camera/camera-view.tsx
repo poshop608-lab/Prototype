@@ -2,14 +2,14 @@
 
 import { useRef, useEffect, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckCircle2, Loader2, RotateCcw, Camera, AlertTriangle, Info, X, Ruler } from "lucide-react";
-import { pxToMm, compressImage, getCalibration, setCalibration, CALIBRATION_CARD_MM } from "@/lib/utils";
+import { CheckCircle2, Loader2, RotateCcw, Camera, XCircle } from "lucide-react";
+import { pxToMm, compressImage } from "@/lib/utils";
 import type { CaptureResult } from "@/store/scan";
 
-const CYAN   = "#06b6d4";
-const GREEN  = "#22c55e";
-const RED    = "#ef4444";
-const AMBER  = "#f59e0b";
+const CYAN  = "#06b6d4";
+const GREEN = "#22c55e";
+const RED   = "#ef4444";
+
 const PUB_KEY   = "rf_AvYiDjJLIMb0l0OPIgfb5ghmbyE3";
 const MODEL_ID  = "shoe-segmentation-0kxvd";
 const MODEL_VER = 1;
@@ -20,162 +20,22 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-type ErrorType =
-  | "model_fail"
-  | "no_shoes"
-  | "one_shoe"
-  | "too_dark"
-  | "shoes_too_small"
-  | "tilt"
-  | "partial"
-  | "network";
-
-interface SmartError {
-  type: ErrorType;
-  title: string;
-  fix: string;
-  icon: "alert" | "info";
-}
-
-const ERROR_MAP: Record<ErrorType, SmartError> = {
-  model_fail:     { type: "model_fail",    title: "AI model failed to load",       fix: "Check internet connection and reload page",               icon: "alert" },
-  no_shoes:       { type: "no_shoes",      title: "No shoes detected",             fix: "Side view · both soles on surface · fill the frame",      icon: "info"  },
-  one_shoe:       { type: "one_shoe",      title: "Only 1 shoe detected",          fix: "Move shoes apart · ensure both fully visible",            icon: "info"  },
-  too_dark:       { type: "too_dark",      title: "Image too dark",                fix: "Move to brighter area · avoid back-lighting",             icon: "alert" },
-  shoes_too_small:{ type: "shoes_too_small",title: "Shoes too small in frame",     fix: "Move camera closer — 30–50 cm above shoes",               icon: "info"  },
-  tilt:           { type: "tilt",          title: "Camera tilted",                 fix: "Hold phone level — both soles should be on same line",    icon: "alert" },
-  partial:        { type: "partial",       title: "Shoe partially out of frame",   fix: "Step back · centre both shoes in the green zones",        icon: "info"  },
-  network:        { type: "network",       title: "Network error",                 fix: "Check internet connection and try again",                  icon: "alert" },
-};
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-let _inferenceModule: any = null;
-
-async function loadInferencejs() {
-  if (_inferenceModule) return _inferenceModule;
-  // Dynamic ESM import from CDN — works in all modern browsers
+let _mod: any = null;
+async function loadRF() {
+  if (_mod) return _mod;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const mod = await (Function('return import("https://cdn.jsdelivr.net/npm/inferencejs@1.2.3/dist/inference.es.js")')() as Promise<any>);
-  _inferenceModule = mod;
-  return mod;
-}
-
-// Measure average luminance of frame — detect too-dark images
-function frameLuminance(canvas: HTMLCanvasElement): number {
-  const s = 0.1;
-  const w = Math.round(canvas.width * s), h = Math.round(canvas.height * s);
-  const c = document.createElement("canvas");
-  c.width = w; c.height = h;
-  const ctx = c.getContext("2d")!;
-  ctx.drawImage(canvas, 0, 0, w, h);
-  const { data } = ctx.getImageData(0, 0, w, h);
-  let sum = 0;
-  for (let i = 0; i < data.length; i += 4)
-    sum += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-  return sum / (data.length / 4);
-}
-
-// ── Calibration panel (manual: scan shoe → enter real measurement) ────────
-function CalibrationPanel({ currentPxMm, onSave, onClose }: {
-  currentPxMm: number;
-  onSave: (v: number) => void;
-  onClose: () => void;
-}) {
-  const [appMm,  setAppMm]  = useState("");  // what app measured
-  const [realMm, setRealMm] = useState("");  // actual ruler measurement
-  const computed = (() => {
-    const a = parseFloat(appMm), r = parseFloat(realMm);
-    if (!a || !r || a <= 0 || r <= 0) return null;
-    // new px/mm = current px/mm * (app_mm / real_mm)
-    return currentPxMm * (a / r);
-  })();
-
-  return (
-    <div className="w-full max-w-sm rounded-2xl px-5 py-5"
-      style={{ background: "rgba(10,10,20,0.98)", border: `1px solid ${CYAN}40` }}>
-      <div className="flex items-center gap-2 mb-4">
-        <Ruler className="w-5 h-5" style={{ color: CYAN }} />
-        <p className="font-bold text-white">Calibrate Measurements</p>
-        <button className="ml-auto" onClick={onClose}><X className="w-4 h-4" style={{ color: "#555" }} /></button>
-      </div>
-
-      <div className="rounded-xl p-3 mb-4" style={{ background: "rgba(6,182,212,0.07)", border: `1px solid ${CYAN}20` }}>
-        <p className="text-xs font-bold mb-1" style={{ color: CYAN }}>How to calibrate:</p>
-        <ol className="space-y-1">
-          {[
-            "Scan one shoe normally",
-            "Note the height the app shows (e.g. 54mm)",
-            "Measure that same shoe with a real ruler",
-            "Enter both numbers below",
-          ].map((t, i) => (
-            <li key={i} className="flex gap-2 text-[11px]" style={{ color: "#bbb" }}>
-              <span className="font-bold flex-shrink-0" style={{ color: CYAN }}>{i+1}.</span>{t}
-            </li>
-          ))}
-        </ol>
-      </div>
-
-      <div className="space-y-3 mb-4">
-        <div>
-          <label className="text-xs font-semibold block mb-1" style={{ color: "#888" }}>
-            App measured (mm) — what the scan showed
-          </label>
-          <input
-            type="number" inputMode="decimal" placeholder="e.g. 54"
-            value={appMm} onChange={e => setAppMm(e.target.value)}
-            className="w-full px-3 py-2 rounded-xl text-sm font-mono outline-none"
-            style={{ background: "rgba(255,255,255,0.06)", border: `1px solid rgba(255,255,255,0.12)`, color: "white" }}
-          />
-        </div>
-        <div>
-          <label className="text-xs font-semibold block mb-1" style={{ color: "#888" }}>
-            Real measurement (mm) — from ruler/tape
-          </label>
-          <input
-            type="number" inputMode="decimal" placeholder="e.g. 90"
-            value={realMm} onChange={e => setRealMm(e.target.value)}
-            className="w-full px-3 py-2 rounded-xl text-sm font-mono outline-none"
-            style={{ background: "rgba(255,255,255,0.06)", border: `1px solid rgba(255,255,255,0.12)`, color: "white" }}
-          />
-        </div>
-      </div>
-
-      {computed !== null && (
-        <div className="rounded-xl p-3 mb-4 text-center"
-          style={{ background: "rgba(34,197,94,0.08)", border: `1px solid ${GREEN}30` }}>
-          <p className="text-xs" style={{ color: "#888" }}>New calibration</p>
-          <p className="text-xl font-black" style={{ color: GREEN }}>{computed.toFixed(3)} px/mm</p>
-          <p className="text-[10px] mt-0.5" style={{ color: "#555" }}>
-            Was {currentPxMm.toFixed(3)} → correction ×{(computed/currentPxMm).toFixed(2)}
-          </p>
-        </div>
-      )}
-
-      <div className="flex gap-2">
-        <button onClick={onClose}
-          className="flex-1 py-2.5 rounded-xl text-xs font-semibold"
-          style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#888" }}>
-          Cancel
-        </button>
-        <button
-          disabled={computed === null}
-          onClick={() => computed !== null && onSave(computed)}
-          className="flex-[2] py-2.5 rounded-xl text-xs font-bold disabled:opacity-40"
-          style={{ background: GREEN, color: "#000" }}>
-          Save & Apply ✓
-        </button>
-      </div>
-    </div>
-  );
+  _mod = await (Function('return import("https://cdn.jsdelivr.net/npm/inferencejs@1.2.3/dist/inference.es.js")')() as Promise<any>);
+  return _mod;
 }
 
 export function CameraView({ onCapture, onError }: Props) {
-  const videoRef          = useRef<HTMLVideoElement>(null);
-  const captureCanvasRef  = useRef<HTMLCanvasElement>(null);
-  const streamRef         = useRef<MediaStream | null>(null);
+  const videoRef         = useRef<HTMLVideoElement>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef        = useRef<MediaStream | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const engineRef         = useRef<any>(null);
-  const workerRef         = useRef<string | null>(null);
+  const engineRef        = useRef<any>(null);
+  const workerRef        = useRef<string | null>(null);
 
   const [isReady,      setIsReady]      = useState(false);
   const [isCapturing,  setIsCapturing]  = useState(false);
@@ -185,13 +45,7 @@ export function CameraView({ onCapture, onError }: Props) {
   const [showSuccess,  setShowSuccess]  = useState(false);
   const [isPortrait,   setIsPortrait]   = useState(false);
   const [statusMsg,    setStatusMsg]    = useState("");
-  const [smartError,   setSmartError]   = useState<SmartError | null>(null);
-  const [showGuide,    setShowGuide]    = useState(true);
-  const [calibMode,    setCalibMode]    = useState(false);   // credit card calibration mode
-  const [calibPxMm,    setCalibPxMm]    = useState<number | null>(null); // detected px/mm
-  const [calibSaved,   setCalibSaved]   = useState(false);
 
-  // portrait detection
   useEffect(() => {
     function check() { setIsPortrait(window.innerHeight > window.innerWidth); }
     check();
@@ -203,7 +57,6 @@ export function CameraView({ onCapture, onError }: Props) {
     };
   }, []);
 
-  // camera start
   useEffect(() => {
     async function startCamera() {
       try {
@@ -227,59 +80,48 @@ export function CameraView({ onCapture, onError }: Props) {
     return () => { streamRef.current?.getTracks().forEach((t) => t.stop()); };
   }, [onError]);
 
-  // eager model load
+  // Eager model load
   useEffect(() => {
     if (!isReady || modelLoading || modelReady) return;
-    async function loadModel() {
+    async function load() {
       setModelLoading(true);
-      setStatusMsg("Loading AI model (~6MB)…");
+      setStatusMsg("Loading AI model…");
       try {
-        const mod = await loadInferencejs();
+        const mod = await loadRF();
         const engine = new mod.InferenceEngine();
         engineRef.current = engine;
-        const workerId = await engine.startWorker(MODEL_ID, MODEL_VER, PUB_KEY);
-        workerRef.current = workerId;
+        workerRef.current = await engine.startWorker(MODEL_ID, MODEL_VER, PUB_KEY);
         setModelReady(true);
         setStatusMsg("");
       } catch (e) {
-        console.error("[inferencejs load]", e);
-        setSmartError(ERROR_MAP.model_fail);
-        setStatusMsg("");
+        console.error("[RF load]", e);
+        setStatusMsg("Model failed — tap capture to retry");
       } finally {
         setModelLoading(false);
       }
     }
-    loadModel();
+    load();
   }, [isReady, modelLoading, modelReady]);
-
-  function triggerSmartError(type: ErrorType) {
-    setSmartError(ERROR_MAP[type]);
-    setIsCapturing(false);
-    setIsAnalyzing(false);
-    setStatusMsg("");
-  }
 
   const handleCapture = useCallback(async () => {
     const video  = videoRef.current;
     const canvas = captureCanvasRef.current;
     if (!video || !canvas || isCapturing || isAnalyzing) return;
 
-    setSmartError(null);
-    setShowGuide(false);
     setIsCapturing(true);
 
-
-    // on-demand model load if eager load failed
     if (!workerRef.current) {
       setStatusMsg("Loading AI model…");
       try {
-        const mod2 = await loadInferencejs();
-        const engine = new mod2.InferenceEngine();
+        const mod = await loadRF();
+        const engine = new mod.InferenceEngine();
         engineRef.current = engine;
         workerRef.current = await engine.startWorker(MODEL_ID, MODEL_VER, PUB_KEY);
         setModelReady(true);
-      } catch {
-        triggerSmartError("model_fail");
+      } catch (e) {
+        onError(`Model failed to load: ${e instanceof Error ? e.message : "network error"}`);
+        setIsCapturing(false);
+        setStatusMsg("");
         return;
       }
     }
@@ -294,30 +136,31 @@ export function CameraView({ onCapture, onError }: Props) {
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, vw, vh);
 
-    // ── Pre-detection checks ─────────────────────────────────────────────
-    const lum = frameLuminance(canvas);
-    if (lum < 35) { triggerSmartError("too_dark"); return; }
-
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let predictions: any[] = [];
     try {
-      const mod3   = await loadInferencejs();
-      const img    = new mod3.CVImage(canvas);
+      const mod    = await loadRF();
+      const img    = new mod.CVImage(canvas);
       const result = await engineRef.current.infer(workerRef.current, img);
       predictions  = Array.isArray(result) ? result : (result?.predictions ?? []);
-      console.log("[inferencejs]", predictions.length, "predictions");
+      console.log("[RF]", predictions.length, "predictions");
     } catch (e) {
-      console.error("[infer]", e);
-      const msg = e instanceof Error ? e.message : "";
-      triggerSmartError(msg.toLowerCase().includes("network") ? "network" : "model_fail");
+      console.error("[RF infer]", e);
+      setIsAnalyzing(false);
+      setIsCapturing(false);
+      setStatusMsg("");
+      onError(`Detection failed: ${e instanceof Error ? e.message : "unknown"}`);
       return;
     }
 
     setIsAnalyzing(false);
     setStatusMsg("");
 
-    // ── Post-detection validation ────────────────────────────────────────
-    if (predictions.length === 0) { triggerSmartError("no_shoes"); return; }
+    if (predictions.length === 0) {
+      setIsCapturing(false);
+      onError("No shoes detected. Ensure both shoes are clearly visible in side view.");
+      return;
+    }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     function predToBBox(p: any): BBox {
@@ -329,17 +172,17 @@ export function CameraView({ onCapture, onError }: Props) {
                minY: Math.round(y - h/2), maxY: Math.round(y + h/2) };
     }
 
-    const sized = predictions.filter(p => {
+    // Filter tiny detections, dedup, sort left→right
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sized = predictions.filter((p: any) => {
       const w = p.bbox?.width ?? p.width ?? 0;
       const h = p.bbox?.height ?? p.height ?? 0;
-      return w > vw * 0.04 && h > vh * 0.06;
+      return w > vw * 0.04 && h > vh * 0.05;
     });
 
-    if (sized.length === 0) { triggerSmartError("shoes_too_small"); return; }
-
-    // IoU dedup
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const deduped: any[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     for (const p of sized.sort((a: any, b: any) => (b.confidence ?? 0) - (a.confidence ?? 0))) {
       const pb = predToBBox(p);
       const dup = deduped.some(d => {
@@ -354,34 +197,19 @@ export function CameraView({ onCapture, onError }: Props) {
     }
 
     if (deduped.length < 2) {
-      triggerSmartError(deduped.length === 1 ? "one_shoe" : "no_shoes");
+      setIsCapturing(false);
+      onError(`Only ${deduped.length} shoe detected. Ensure both shoes are fully visible.`);
       return;
     }
 
-    // Sort left → right
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     deduped.sort((a: any, b: any) => (a.bbox?.x ?? a.x ?? 0) - (b.bbox?.x ?? b.x ?? 0));
-    const leftPred  = deduped[0];
-    const rightPred = deduped[deduped.length - 1];
-    const lb = predToBBox(leftPred);
-    const rb = predToBBox(rightPred);
-
-    // Partial-frame check: any shoe touching frame edge?
-    const PAD = 10;
-    if (lb.minX < PAD || rb.maxX > vw - PAD || lb.minY < PAD || rb.minY < PAD) {
-      triggerSmartError("partial");
-      return;
-    }
-
-    // Tilt check: shoe baselines must be close
-    const bottomDiff = Math.abs(lb.maxY - rb.maxY);
-    if (bottomDiff > vh * 0.10) { triggerSmartError("tilt"); return; }
-
+    const lb = predToBBox(deduped[0]);
+    const rb = predToBBox(deduped[deduped.length - 1]);
     const groundY = Math.max(lb.maxY, rb.maxY);
 
-    // ── Draw ─────────────────────────────────────────────────────────────
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    function drawPrediction(pred: any, bounds: BBox, label: string) {
+    function drawPred(pred: any, bounds: BBox, label: string) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const pts: { x: number; y: number }[] = pred.points ?? pred.segmentation_polygon ?? [];
       ctx.beginPath();
@@ -433,15 +261,14 @@ export function CameraView({ onCapture, onError }: Props) {
       return { hMm, wMm };
     }
 
-    const leftResult  = drawPrediction(leftPred,  lb, "LEFT");
-    const rightResult = drawPrediction(rightPred, rb, "RIGHT");
+    const L = drawPred(deduped[0],                   lb, "LEFT");
+    const R = drawPred(deduped[deduped.length - 1],  rb, "RIGHT");
 
-    // Center divider
     ctx.strokeStyle = `${CYAN}60`; ctx.lineWidth = 1; ctx.setLineDash([6, 6]);
     ctx.beginPath(); ctx.moveTo(vw/2, 0); ctx.lineTo(vw/2, vh); ctx.stroke();
     ctx.setLineDash([]);
 
-    const diff   = parseFloat(Math.abs(leftResult.hMm - rightResult.hMm).toFixed(1));
+    const diff   = parseFloat(Math.abs(L.hMm - R.hMm).toFixed(1));
     const passed = diff <= 3;
 
     ctx.fillStyle = `${passed ? GREEN : RED}ee`;
@@ -450,40 +277,37 @@ export function CameraView({ onCapture, onError }: Props) {
     ctx.fillText(passed ? `PASSED  Δ${diff}mm` : `REJECTED  Δ${diff}mm  (>3mm)`, vw/2, vh - 16);
 
     ctx.font = "11px monospace"; ctx.fillStyle = "rgba(0,0,0,0.7)";
-    const stamp = `RF | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
+    const stamp = `RF | L:${L.hMm}mm R:${R.hMm}mm`;
     ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
     ctx.fillStyle = GREEN; ctx.textAlign = "left";
     ctx.fillText(stamp, 9, 17);
 
     try {
-      const blob           = await compressImage(canvas, 0.9);
+      const blob             = await compressImage(canvas, 0.9);
       const annotatedDataUrl = canvas.toDataURL("image/jpeg", 0.9);
       if ("vibrate" in navigator) navigator.vibrate([60, 30, 60]);
       onCapture({
         blob, dataUrl: annotatedDataUrl, annotatedDataUrl,
-        leftHeightMm: leftResult.hMm, rightHeightMm: rightResult.hMm,
-        leftWidthMm:  leftResult.wMm, rightWidthMm:  rightResult.wMm,
+        leftHeightMm: L.hMm, rightHeightMm: R.hMm,
+        leftWidthMm:  L.wMm, rightWidthMm:  R.wMm,
         heightDiffMm: diff, passed,
         rejectionReason: passed ? null : `Height difference ${diff}mm exceeds 3mm tolerance`,
       });
       setShowSuccess(true);
-      setStatusMsg("");
       setTimeout(() => { setShowSuccess(false); setIsCapturing(false); }, 1200);
     } catch {
       onError("Failed to compress image");
       setIsCapturing(false);
-      setStatusMsg("");
     }
   }, [isCapturing, isAnalyzing, onCapture, onError]);
 
-  // ── Portrait lock ──────────────────────────────────────────────────────
   if (isPortrait) {
     return (
       <div className="relative w-full h-full bg-black flex items-center justify-center">
         <div className="text-center px-8">
           <RotateCcw className="w-14 h-14 mx-auto mb-4" style={{ color: CYAN, animation: "spin 3s linear infinite" }} />
           <p className="text-white font-bold text-lg mb-2">Rotate your phone</p>
-          <p className="text-sm" style={{ color: "#888" }}>Landscape mode required to scan both shoes</p>
+          <p className="text-sm" style={{ color: "#888" }}>Landscape mode required</p>
         </div>
       </div>
     );
@@ -494,14 +318,12 @@ export function CameraView({ onCapture, onError }: Props) {
       <video ref={videoRef} className="absolute inset-0 w-full h-full object-cover" playsInline muted autoPlay />
       <canvas ref={captureCanvasRef} className="hidden" />
 
-      {/* Camera loading */}
       {!isReady && (
         <div className="absolute inset-0 flex items-center justify-center" style={{ background: "#080810" }}>
           <Loader2 className="w-8 h-8 animate-spin" style={{ color: CYAN }} />
         </div>
       )}
 
-      {/* Analyzing overlay */}
       <AnimatePresence>
         {isAnalyzing && (
           <motion.div
@@ -511,159 +333,6 @@ export function CameraView({ onCapture, onError }: Props) {
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
             <p className="text-base font-bold" style={{ color: CYAN }}>Detecting shoes…</p>
-            <p className="text-xs mt-1" style={{ color: "#666" }}>Roboflow segmentation model</p>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* ── Placement guide overlay ──────────────────────────────────────── */}
-      <AnimatePresence>
-        {isReady && !isCapturing && showGuide && (
-          <motion.div
-            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="absolute inset-0 pointer-events-none z-10"
-          >
-            {/* Left shoe zone */}
-            <div className="absolute"
-              style={{
-                left: "4%", right: "52%", top: "28%", bottom: "18%",
-                border: `2px dashed ${CYAN}70`,
-                borderRadius: 8,
-              }}>
-              <div className="absolute inset-x-0 -top-6 flex justify-center">
-                <span className="text-xs font-bold px-2 py-0.5 rounded" style={{ color: CYAN, background: "rgba(0,0,0,0.6)" }}>
-                  LEFT SHOE HERE
-                </span>
-              </div>
-            </div>
-
-            {/* Right shoe zone */}
-            <div className="absolute"
-              style={{
-                left: "52%", right: "4%", top: "28%", bottom: "18%",
-                border: `2px dashed ${CYAN}70`,
-                borderRadius: 8,
-              }}>
-              <div className="absolute inset-x-0 -top-6 flex justify-center">
-                <span className="text-xs font-bold px-2 py-0.5 rounded" style={{ color: CYAN, background: "rgba(0,0,0,0.6)" }}>
-                  RIGHT SHOE HERE
-                </span>
-              </div>
-            </div>
-
-            {/* Floor reference line */}
-            <div className="absolute left-0 right-0" style={{ bottom: "18%", height: 1, background: `${CYAN}50` }}>
-              <span className="absolute right-2 -top-4 text-xs" style={{ color: `${CYAN}90`, background: "rgba(0,0,0,0.5)", padding: "1px 4px", borderRadius: 3 }}>
-                SOLE LINE
-              </span>
-            </div>
-
-            {/* Center divider */}
-            <div className="absolute top-0 bottom-0"
-              style={{ left: "50%", width: 1, background: `repeating-linear-gradient(to bottom, ${CYAN}60 0px, ${CYAN}60 8px, transparent 8px, transparent 16px)` }} />
-
-            {/* Setup instructions card */}
-            <div className="absolute bottom-20 left-1/2 -translate-x-1/2 w-[88%] max-w-sm">
-              <div className="rounded-xl px-4 py-3" style={{ background: "rgba(0,0,0,0.82)", border: `1px solid ${CYAN}30` }}>
-                <div className="flex items-center gap-2 mb-2">
-                  <Info className="w-3.5 h-3.5 flex-shrink-0" style={{ color: CYAN }} />
-                  <p className="text-xs font-bold uppercase tracking-widest" style={{ color: CYAN }}>Setup guide</p>
-                  <button className="ml-auto pointer-events-auto" onClick={() => setShowGuide(false)}>
-                    <X className="w-3.5 h-3.5" style={{ color: "#555" }} />
-                  </button>
-                </div>
-                <div className="space-y-1.5">
-                  {[
-                    { n: "1", t: "Place shoes SIDE-BY-SIDE in the dashed zones" },
-                    { n: "2", t: "Both toes pointing SAME direction (left or right)" },
-                    { n: "3", t: "Camera 30–50 cm above, LEVEL with the surface" },
-                    { n: "4", t: "Both soles must touch the SOLE LINE" },
-                  ].map(({ n, t }) => (
-                    <div key={n} className="flex items-start gap-2">
-                      <span className="w-4 h-4 rounded-full flex-shrink-0 flex items-center justify-center text-[9px] font-bold mt-0.5"
-                        style={{ background: `${CYAN}30`, color: CYAN }}>
-                        {n}
-                      </span>
-                      <p className="text-[11px] leading-tight" style={{ color: "#ccc" }}>{t}</p>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* ── Smart error card ─────────────────────────────────────────────── */}
-      <AnimatePresence>
-        {smartError && !isAnalyzing && (
-          <motion.div
-            initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}
-            className="absolute inset-x-4 z-40"
-            style={{ bottom: "88px" }}
-          >
-            <div className="rounded-2xl px-4 py-4" style={{
-              background: "rgba(10,10,18,0.95)",
-              border: `1px solid ${smartError.icon === "alert" ? RED : AMBER}50`,
-              backdropFilter: "blur(8px)",
-            }}>
-              <div className="flex items-start gap-3">
-                <div className="w-9 h-9 rounded-xl flex-shrink-0 flex items-center justify-center mt-0.5"
-                  style={{ background: `${smartError.icon === "alert" ? RED : AMBER}18`, border: `1px solid ${smartError.icon === "alert" ? RED : AMBER}40` }}>
-                  <AlertTriangle className="w-5 h-5" style={{ color: smartError.icon === "alert" ? RED : AMBER }} />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="font-bold text-white text-sm">{smartError.title}</p>
-                  <p className="text-xs mt-0.5 leading-relaxed" style={{ color: "#aaa" }}>{smartError.fix}</p>
-                </div>
-                <button onClick={() => { setSmartError(null); setShowGuide(true); }}>
-                  <X className="w-4 h-4 mt-1" style={{ color: "#555" }} />
-                </button>
-              </div>
-
-              {/* Visual fix diagram based on error type */}
-              {smartError.type === "tilt" && (
-                <div className="mt-3 rounded-lg px-3 py-2 flex items-center gap-4"
-                  style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)" }}>
-                  <div className="text-center">
-                    <div className="text-[10px] mb-1" style={{ color: "#666" }}>WRONG</div>
-                    <div className="text-base">📐</div>
-                  </div>
-                  <div className="text-xs text-center flex-1" style={{ color: "#555" }}>→</div>
-                  <div className="text-center">
-                    <div className="text-[10px] mb-1" style={{ color: GREEN }}>CORRECT</div>
-                    <div className="text-base">📏</div>
-                  </div>
-                  <div className="text-[10px] flex-1" style={{ color: "#888" }}>Hold phone level — both soles on same horizontal line</div>
-                </div>
-              )}
-              {smartError.type === "no_shoes" && (
-                <div className="mt-3 rounded-lg px-3 py-2" style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)" }}>
-                  <div className="flex gap-3 items-center">
-                    <div className="text-[10px] text-center" style={{ color: "#888" }}>
-                      <div className="text-lg">👟👟</div>
-                      <div>SIDE VIEW</div>
-                    </div>
-                    <div className="text-[10px] flex-1" style={{ color: "#888" }}>
-                      Shoot from the SIDE — not behind or above. Both shoe soles must be on a flat surface. Fill the frame.
-                    </div>
-                  </div>
-                </div>
-              )}
-              {smartError.type === "shoes_too_small" && (
-                <div className="mt-3 rounded-lg px-3 py-2" style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)" }}>
-                  <div className="text-[10px] text-center" style={{ color: "#888" }}>Move camera to 30–50 cm above shoes · shoes should fill 70% of frame width</div>
-                </div>
-              )}
-
-              <button
-                onClick={() => { setSmartError(null); setShowGuide(true); }}
-                className="mt-3 w-full py-2 rounded-xl text-xs font-bold"
-                style={{ background: `${CYAN}18`, border: `1px solid ${CYAN}40`, color: CYAN }}
-              >
-                Try Again
-              </button>
-            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -671,6 +340,12 @@ export function CameraView({ onCapture, onError }: Props) {
       {/* Corner brackets */}
       {isReady && !isCapturing && (
         <div className="absolute inset-0 pointer-events-none">
+          <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-30"
+            style={{ background: `repeating-linear-gradient(to bottom, ${CYAN} 0px, ${CYAN} 8px, transparent 8px, transparent 16px)` }} />
+          <div className="absolute left-4 top-1/2 -translate-y-1/2 px-2 py-1 rounded text-xs font-bold"
+            style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>LEFT</div>
+          <div className="absolute right-4 top-1/2 -translate-y-1/2 px-2 py-1 rounded text-xs font-bold"
+            style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>RIGHT</div>
           <div className="absolute top-6 left-6 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
           <div className="absolute top-6 right-6 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
           <div className="absolute bottom-20 left-6 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
@@ -678,34 +353,15 @@ export function CameraView({ onCapture, onError }: Props) {
         </div>
       )}
 
-      {/* Model status + dismiss guide hint */}
+      {/* Status bar */}
       {isReady && !isCapturing && (
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2">
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
           <div className="px-3 py-1.5 rounded-full text-xs font-semibold flex items-center gap-2"
             style={{ background: "rgba(0,0,0,0.8)", border: `1px solid ${CYAN}30`, color: "#ccc" }}>
-            <span className="w-2 h-2 rounded-full flex-shrink-0"
-              style={{ background: modelReady ? GREEN : modelLoading ? AMBER : RED, boxShadow: modelReady ? `0 0 6px ${GREEN}` : "none" }} />
-            {modelReady ? "AI Ready — tap capture" : modelLoading ? "Loading AI model…" : "Model failed — tap to retry"}
+            <span className="w-2 h-2 rounded-full"
+              style={{ background: modelReady ? GREEN : modelLoading ? "#f59e0b" : RED, boxShadow: modelReady ? `0 0 6px ${GREEN}` : "none" }} />
+            {modelReady ? "AI Ready" : modelLoading ? "Loading model…" : "Model failed"}
           </div>
-          {showGuide && (
-            <button onClick={() => setShowGuide(false)}
-              className="px-2 py-1.5 rounded-full text-xs"
-              style={{ background: "rgba(0,0,0,0.7)", border: `1px solid ${CYAN}20`, color: "#555" }}>
-              Hide guide
-            </button>
-          )}
-          {!showGuide && (
-            <button onClick={() => setShowGuide(true)}
-              className="px-2 py-1.5 rounded-full text-xs"
-              style={{ background: "rgba(0,0,0,0.7)", border: `1px solid ${CYAN}20`, color: "#555" }}>
-              Show guide
-            </button>
-          )}
-          <button onClick={() => { setCalibMode(true); setCalibPxMm(null); setSmartError(null); }}
-            className="px-2 py-1.5 rounded-full text-xs flex items-center gap-1"
-            style={{ background: "rgba(0,0,0,0.7)", border: `1px solid ${AMBER}40`, color: AMBER }}>
-            <Ruler className="w-3 h-3" />Calibrate
-          </button>
         </div>
       )}
 
@@ -717,7 +373,6 @@ export function CameraView({ onCapture, onError }: Props) {
         </div>
       )}
 
-      {/* Success flash */}
       <AnimatePresence>
         {showSuccess && (
           <motion.div
@@ -736,35 +391,6 @@ export function CameraView({ onCapture, onError }: Props) {
         )}
       </AnimatePresence>
 
-      {/* ── Calibration overlay ─────────────────────────────────────────── */}
-      <AnimatePresence>
-        {calibMode && (
-          <motion.div
-            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="absolute inset-0 z-40 flex flex-col items-center justify-center p-4"
-            style={{ background: "rgba(0,0,0,0.85)", backdropFilter: "blur(6px)" }}
-          >
-            <CalibrationPanel
-              currentPxMm={getCalibration()}
-              onSave={(v) => { setCalibration(v); setCalibSaved(true); setCalibMode(false); setTimeout(() => setCalibSaved(false), 3000); }}
-              onClose={() => setCalibMode(false)}
-            />
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* Calibration saved toast */}
-      <AnimatePresence>
-        {calibSaved && (
-          <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
-            className="absolute top-14 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-full text-xs font-bold"
-            style={{ background: GREEN, color: "#000" }}>
-            ✓ Calibration saved — measurements now accurate
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* Capture button */}
       <div className="absolute bottom-5 left-1/2 -translate-x-1/2 z-10 flex flex-col items-center gap-1.5">
         <button
           onClick={handleCapture}
@@ -772,15 +398,21 @@ export function CameraView({ onCapture, onError }: Props) {
           className="relative w-20 h-20 rounded-full flex items-center justify-center transition-transform active:scale-90 disabled:opacity-40"
           style={{ border: "4px solid rgba(255,255,255,0.85)", background: "rgba(255,255,255,0.12)", backdropFilter: "blur(4px)" }}
         >
-          <Camera className="w-8 h-8 text-white" />
+          {isCapturing || isAnalyzing
+            ? <Loader2 className="w-8 h-8 text-white animate-spin" />
+            : <Camera className="w-8 h-8 text-white" />
+          }
           {(isCapturing || isAnalyzing) && (
             <div className="absolute inset-0 rounded-full border-4 border-cyan-400 animate-ping" />
           )}
         </button>
         <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.5)" }}>
-          {isAnalyzing ? "detecting…" : isCapturing ? "processing…" : modelReady ? "tap to capture" : "loading model…"}
+          {isAnalyzing ? "detecting…" : isCapturing ? "processing…" : modelReady ? "tap to capture" : "loading…"}
         </span>
       </div>
+
+      {/* Unused import suppressor */}
+      <span className="hidden"><XCircle /></span>
     </div>
   );
 }

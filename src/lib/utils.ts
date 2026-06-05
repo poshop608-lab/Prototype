@@ -61,25 +61,8 @@ export function generateScanId(): string {
   return `SCAN-${Date.now()}-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
 }
 
-const CALIB_KEY = "sv_px_per_mm";
-// Default 3.5 px/mm ≈ phone camera at ~40cm, 1080p (adjust via calibration)
-const DEFAULT_PX_PER_MM = 3.5;
-
-export function getCalibration(): number {
-  if (typeof window === "undefined") return DEFAULT_PX_PER_MM;
-  const stored = localStorage.getItem(CALIB_KEY);
-  const v = stored ? parseFloat(stored) : NaN;
-  return isNaN(v) || v <= 0 ? DEFAULT_PX_PER_MM : v;
-}
-
-export function setCalibration(pxPerMm: number): void {
-  if (typeof window === "undefined") return;
-  localStorage.setItem(CALIB_KEY, pxPerMm.toFixed(4));
-}
+export const PX_PER_MM = 3.5;
 
 export function pxToMm(px: number): number {
-  return parseFloat((px / getCalibration()).toFixed(1));
+  return parseFloat((px / PX_PER_MM).toFixed(1));
 }
-
-// Credit card = 85.6 mm wide (ISO/IEC 7810 ID-1)
-export const CALIBRATION_CARD_MM = 85.6;

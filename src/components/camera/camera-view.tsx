@@ -171,57 +171,66 @@ export function CameraView({ onCapture, onError }: Props) {
 
     const groundY = Math.max(lb.maxY, rb.maxY);
 
+    // Scale font relative to frame width so labels never crowd on any resolution
+    const fs = Math.max(18, Math.round(vw * 0.018)); // ~18px at 1000w, 34px at 1920w
+
+    function pill(text: string, cx: number, cy: number, bg: string, fg: string) {
+      ctx.font = `bold ${fs}px -apple-system,sans-serif`;
+      const tw2 = ctx.measureText(text).width;
+      const ph = fs + 10, pw = tw2 + 20, r = ph / 2;
+      const px = cx - pw / 2, py = cy - ph / 2;
+      ctx.beginPath();
+      ctx.moveTo(px + r, py);
+      ctx.arcTo(px + pw, py, px + pw, py + ph, r);
+      ctx.arcTo(px + pw, py + ph, px, py + ph, r);
+      ctx.arcTo(px, py + ph, px, py, r);
+      ctx.arcTo(px, py, px + pw, py, r);
+      ctx.closePath();
+      ctx.fillStyle = bg; ctx.fill();
+      ctx.fillStyle = fg; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(text, cx, cy);
+      ctx.textBaseline = "alphabetic";
+    }
+
     function drawBox(bounds: BBox, label: string) {
+      // Box fill + stroke
       ctx.beginPath();
       ctx.rect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
-      ctx.fillStyle = `${GREEN}22`;
-      ctx.fill();
-      ctx.strokeStyle = GREEN;
-      ctx.lineWidth = 3;
-      ctx.shadowColor = GREEN;
-      ctx.shadowBlur = 14;
-      ctx.stroke();
+      ctx.fillStyle = `${GREEN}1a`; ctx.fill();
+      ctx.strokeStyle = GREEN; ctx.lineWidth = Math.max(2, vw * 0.002);
+      ctx.shadowColor = GREEN; ctx.shadowBlur = 12; ctx.stroke(); ctx.shadowBlur = 0;
+
+      // Corner ticks
+      const tk = Math.round(vw * 0.025);
+      const { minX, minY, maxX } = bounds;
+      const bY = groundY;
+      ctx.strokeStyle = GREEN; ctx.lineWidth = Math.max(3, vw * 0.003);
+      ctx.shadowColor = GREEN; ctx.shadowBlur = 8;
+      [[minX, minY, 1, 1],[maxX, minY,-1, 1],[minX, bY, 1,-1],[maxX, bY,-1,-1]].forEach(([cx,cy,dx,dy]) => {
+        ctx.beginPath(); ctx.moveTo(cx as number,(cy as number)+(dy as number)*tk);
+        ctx.lineTo(cx as number,cy as number); ctx.lineTo((cx as number)+(dx as number)*tk,cy as number); ctx.stroke();
+      });
       ctx.shadowBlur = 0;
 
-      const heightPx = groundY - bounds.minY;
-      const widthPx = bounds.maxX - bounds.minX;
-      const hMm = pxToMm(heightPx);
-      const wMm = pxToMm(widthPx);
+      const hMm = pxToMm(groundY - bounds.minY);
+      const wMm = pxToMm(bounds.maxX - bounds.minX);
       const midX = (bounds.minX + bounds.maxX) / 2;
       const midY = (bounds.minY + groundY) / 2;
-      const rX = Math.min(bounds.maxX + 8, vw - 90);
 
-      ctx.font = "bold 16px monospace";
-      const hl = `${hMm}mm`;
-      ctx.fillStyle = "rgba(0,0,0,0.85)";
-      ctx.fillRect(rX - 2, midY - 12, ctx.measureText(hl).width + 10, 20);
-      ctx.fillStyle = GREEN;
-      ctx.textAlign = "left";
-      ctx.fillText(hl, rX + 2, midY + 4);
+      // Height pill — vertically centred on box right edge
+      const hx = Math.min(bounds.maxX + fs * 1.8, vw - fs * 2);
+      pill(`H ${hMm}mm`, hx, midY, "rgba(0,0,0,0.82)", GREEN);
 
-      const wl = `${wMm}mm`;
-      ctx.fillStyle = "rgba(0,0,0,0.85)";
-      ctx.fillRect(midX - ctx.measureText(wl).width / 2 - 4, Math.max(bounds.minY - 26, 0), ctx.measureText(wl).width + 8, 18);
-      ctx.fillStyle = GREEN;
-      ctx.textAlign = "center";
-      ctx.fillText(wl, midX, Math.max(bounds.minY - 10, 14));
+      // Width pill — above box top, safely inside frame
+      pill(`W ${wMm}mm`, midX, Math.max(bounds.minY - fs * 0.9, fs * 1.1), "rgba(0,0,0,0.82)", GREEN);
 
-      ctx.font = "bold 13px monospace";
-      const bw = ctx.measureText(label).width + 14;
-      ctx.fillStyle = `${GREEN}cc`;
-      ctx.fillRect(midX - bw / 2, Math.min(groundY + 6, vh - 22), bw, 18);
-      ctx.fillStyle = "#000";
-      ctx.textAlign = "center";
-      ctx.fillText(label, midX, Math.min(groundY + 19, vh - 8));
-
-      ctx.strokeStyle = `${GREEN}80`;
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      ctx.moveTo(bounds.minX, groundY);
-      ctx.lineTo(bounds.maxX, groundY);
-      ctx.stroke();
+      // Baseline dashes
+      ctx.strokeStyle = `${GREEN}60`; ctx.lineWidth = 1; ctx.setLineDash([6, 5]);
+      ctx.beginPath(); ctx.moveTo(bounds.minX, groundY); ctx.lineTo(bounds.maxX, groundY); ctx.stroke();
       ctx.setLineDash([]);
+
+      // Label chip below baseline
+      pill(label, midX, Math.min(groundY + fs * 1.1, vh - fs * 0.8), `${GREEN}dd`, "#000");
 
       return { hMm, wMm };
     }
@@ -243,14 +252,17 @@ export function CameraView({ onCapture, onError }: Props) {
     const passed = diff <= 3;
 
     ctx.fillStyle = `${passed ? GREEN : RED}ee`;
-    ctx.fillRect(0, vh - 48, vw, 48);
-    ctx.font = "bold 20px monospace";
+    const bh = Math.round(vh * 0.07);
+    ctx.fillRect(0, vh - bh, vw, bh);
+    ctx.font = `bold ${Math.round(vw * 0.022)}px -apple-system,sans-serif`;
     ctx.fillStyle = "#fff";
     ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
     ctx.fillText(
-      passed ? `PASSED  Δ${diff}mm` : `REJECTED  Δ${diff}mm  (>3mm)`,
-      vw / 2, vh - 16
+      passed ? `✓  PASSED   Δ${diff} mm` : `✗  REJECTED   Δ${diff} mm  (limit 3mm)`,
+      vw / 2, vh - bh / 2
     );
+    ctx.textBaseline = "alphabetic";
 
     ctx.font = "11px monospace";
     ctx.fillStyle = "rgba(0,0,0,0.7)";

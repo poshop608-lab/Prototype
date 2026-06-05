@@ -73,7 +73,6 @@ function detectShoes(
     }
 
     if (!found || maxX - minX < tw * 0.03 || maxY - minY < th * 0.03) {
-      // Fallback: use central 80% of the half
       const pad = Math.round((toX - fromX) * 0.10);
       const vpad = Math.round(th * 0.10);
       return {
@@ -83,6 +82,24 @@ function detectShoes(
         maxY: Math.round((th - vpad) / SCALE),
       };
     }
+
+    // Refine minY: scan UP from maxY row-by-row within detected x-range.
+    // Wall above shoe = sparse rows → stop at 4 consecutive sparse rows.
+    // Prevents wall marks pulling the top edge into the background.
+    let refinedMinY = maxY;
+    let emptyStreak = 0;
+    for (let y = maxY - 1; y >= minY; y--) {
+      let rowFg = 0;
+      for (let x = minX; x <= maxX; x++) {
+        const ri = (y * tw + x) * 4;
+        const rl = 0.299 * data[ri] + 0.587 * data[ri + 1] + 0.114 * data[ri + 2];
+        if (Math.abs(rl - bgLum) > THRESH) rowFg++;
+      }
+      const rowDensity = rowFg / (maxX - minX + 1);
+      if (rowDensity > 0.15) { refinedMinY = y; emptyStreak = 0; }
+      else if (++emptyStreak >= 4) break;
+    }
+    minY = refinedMinY;
 
     const PAD = 4;
     return {

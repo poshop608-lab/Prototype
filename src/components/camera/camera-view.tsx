@@ -10,13 +10,17 @@ const CYAN = "#06b6d4";
 const GREEN = "#22c55e";
 const RED = "#ef4444";
 const YELLOW = "#f59e0b";
+const MAGENTA = "#e879f9";
 
 interface BBox { minX: number; maxX: number; minY: number; maxY: number; }
 interface Pt { x: number; y: number; }
 interface ShoeResult {
   bbox: BBox;
   contour: Pt[] | null;
-  // debug masks in thumbnail coordinates
+  topPt: Pt;    // highest shoe pixel (full-res coords)
+  botPt: Pt;    // lowest shoe pixel
+  heightPx: number;
+  widthPx: number;
   debugMask?: Uint8Array;
   debugClean?: Uint8Array;
   thumbW?: number;
@@ -29,26 +33,27 @@ interface Props {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SHOE SEGMENTATION PIPELINE
+// SEGMENTATION PIPELINE — v3
 //
-// Goal: isolate ONLY the shoe pixels, nothing else.
-//
-// Pipeline:
-//   1. Downsample to 25% for speed
-//   2. Build per-pixel background model from all 4 frame edges
-//   3. Threshold: pixel is "foreground" if color distance > adaptive thresh
-//   4. Morphological close (dilate then erode) to fill holes inside shoe
-//   5. Flood-fill from CORNER seeds only (not full borders) to label BG
-//   6. Keep only the largest connected foreground blob per half = the shoe
-//   7. Row-by-row contour tracing on that blob
-//   8. Measurements from contour extents only
+// Key fixes vs v2:
+//   • Larger dilation (R=4) before morphological close seals collar opening
+//   • Topological hole-fill: after selecting largest blob, flood-fill any
+//     interior holes (collar cavity, inside logo cutouts) back to foreground
+//   • Per-shoe baseline: height = shoe.maxY − shoe.minY, NOT shared groundY
+//   • Top/bottom measurement points returned explicitly for debug overlay
+//   • BG ring samples only top 8% + left/right 3% strips (not bottom — sole
+//     is often near bottom and corrupts the BG model)
 // ─────────────────────────────────────────────────────────────────────────────
 function detectShoes(
   canvas: HTMLCanvasElement,
   vw: number,
   vh: number,
   debugMode: boolean
-): { left: BBox; right: BBox; leftContour: Pt[] | null; rightContour: Pt[] | null; leftDebug?: ShoeResult; rightDebug?: ShoeResult } {
+): {
+  left: BBox; right: BBox;
+  leftContour: Pt[] | null; rightContour: Pt[] | null;
+  leftResult: ShoeResult; rightResult: ShoeResult;
+} {
   const SCALE = 0.25;
   const tw = Math.round(vw * SCALE);
   const th = Math.round(vh * SCALE);
@@ -57,91 +62,83 @@ function detectShoes(
   thumb.width = tw; thumb.height = th;
   const tctx = thumb.getContext("2d", { willReadFrequently: true })!;
   tctx.drawImage(canvas, 0, 0, tw, th);
-  const imgData = tctx.getImageData(0, 0, tw, th);
-  const data = imgData.data;
+  const { data } = tctx.getImageData(0, 0, tw, th);
 
-  // ── Per-pixel RGB arrays ──────────────────────────────────────────────────
-  const R = new Float32Array(tw * th);
-  const G = new Float32Array(tw * th);
-  const B = new Float32Array(tw * th);
+  const Rc = new Float32Array(tw * th);
+  const Gc = new Float32Array(tw * th);
+  const Bc = new Float32Array(tw * th);
   for (let i = 0; i < tw * th; i++) {
-    R[i] = data[i * 4];
-    G[i] = data[i * 4 + 1];
-    B[i] = data[i * 4 + 2];
+    Rc[i] = data[i * 4];
+    Gc[i] = data[i * 4 + 1];
+    Bc[i] = data[i * 4 + 2];
   }
 
-  // ── Background model: sample all 4 edges (outer 3% ring) ────────────────
-  // Store as avg RGB so we can compute per-pixel color distance to BG
-  const BG_RING = Math.max(2, Math.round(th * 0.03));
+  // BG model: top 8% rows + left/right 3% columns only.
+  // Deliberately skip bottom rows — sole pixels contaminate BG average
+  // and produce a threshold too low to separate dark shoe from floor.
+  const TOP_ROWS  = Math.max(3, Math.round(th * 0.08));
+  const SIDE_COLS = Math.max(2, Math.round(tw * 0.03));
 
   let bgR = 0, bgG = 0, bgBl = 0, bgN = 0;
-  for (let y = 0; y < BG_RING; y++)
+  // top strip
+  for (let y = 0; y < TOP_ROWS; y++)
     for (let x = 0; x < tw; x++) {
       const i = y * tw + x;
-      bgR += R[i]; bgG += G[i]; bgBl += B[i]; bgN++;
+      bgR += Rc[i]; bgG += Gc[i]; bgBl += Bc[i]; bgN++;
     }
-  for (let y = th - BG_RING; y < th; y++)
-    for (let x = 0; x < tw; x++) {
+  // left/right columns (middle half of frame height only)
+  for (let y = TOP_ROWS; y < th - TOP_ROWS; y++) {
+    for (let x = 0; x < SIDE_COLS; x++) {
       const i = y * tw + x;
-      bgR += R[i]; bgG += G[i]; bgBl += B[i]; bgN++;
+      bgR += Rc[i]; bgG += Gc[i]; bgBl += Bc[i]; bgN++;
     }
-  for (let x = 0; x < BG_RING; x++)
-    for (let y = BG_RING; y < th - BG_RING; y++) {
+    for (let x = tw - SIDE_COLS; x < tw; x++) {
       const i = y * tw + x;
-      bgR += R[i]; bgG += G[i]; bgBl += B[i]; bgN++;
+      bgR += Rc[i]; bgG += Gc[i]; bgBl += Bc[i]; bgN++;
     }
-  for (let x = tw - BG_RING; x < tw; x++)
-    for (let y = BG_RING; y < th - BG_RING; y++) {
-      const i = y * tw + x;
-      bgR += R[i]; bgG += G[i]; bgBl += B[i]; bgN++;
-    }
+  }
   bgR /= bgN; bgG /= bgN; bgBl /= bgN;
 
-  // Also compute BG variance to set adaptive threshold
-  let variance = 0;
-  for (let y = 0; y < BG_RING; y++)
+  // BG variance → adaptive threshold
+  let varAcc = 0, varN = 0;
+  for (let y = 0; y < TOP_ROWS; y++)
     for (let x = 0; x < tw; x++) {
       const i = y * tw + x;
-      const dr = R[i] - bgR, dg = G[i] - bgG, db = B[i] - bgBl;
-      variance += dr * dr + dg * dg + db * db;
+      const dr = Rc[i] - bgR, dg = Gc[i] - bgG, db = Bc[i] - bgBl;
+      varAcc += dr * dr + dg * dg + db * db; varN++;
     }
-  variance /= (BG_RING * tw);
-  const bgStd = Math.sqrt(variance / 3);
-  // Adaptive: at least 25, at most 55. Tight backgrounds need smaller thresh.
-  const THRESH = Math.max(25, Math.min(55, bgStd * 2.5 + 20));
+  const bgStd = Math.sqrt((varAcc / varN) / 3);
+  // Clamp 22–60. Bright/uniform wall → low std → tighter thresh. Noisy BG → higher.
+  const THRESH = Math.max(22, Math.min(60, bgStd * 2.5 + 18));
 
-  function colorDistToBg(idx: number): number {
-    const dr = R[idx] - bgR, dg = G[idx] - bgG, db = B[idx] - bgBl;
+  function colorDist(idx: number): number {
+    const dr = Rc[idx] - bgR, dg = Gc[idx] - bgG, db = Bc[idx] - bgBl;
     return Math.sqrt(dr * dr + dg * dg + db * db);
   }
 
-  // ── BFS: label connected components ─────────────────────────────────────
-  function bfsLabel(mask: Uint8Array, fromX: number, toX: number): { labels: Int32Array; count: number } {
+  // BFS connected-component labeler
+  function bfsLabel(mask: Uint8Array, fromX: number, toX: number) {
     const labels = new Int32Array(tw * th).fill(-1);
     let label = 0;
-    const queue: number[] = [];
-
+    const q: number[] = [];
     for (let y = 0; y < th; y++) {
       for (let x = fromX; x < toX; x++) {
         const idx = y * tw + x;
         if (mask[idx] !== 1 || labels[idx] !== -1) continue;
         labels[idx] = label;
-        queue.length = 0;
-        queue.push(idx);
-        let qi = 0;
-        while (qi < queue.length) {
-          const cur = queue[qi++];
+        q.length = 0; q.push(idx); let qi = 0;
+        while (qi < q.length) {
+          const cur = q[qi++];
           const cy = Math.floor(cur / tw), cx = cur % tw;
-          const neighbors = [
+          const nb = [
             cy > 0 ? cur - tw : -1,
             cy < th - 1 ? cur + tw : -1,
             cx > fromX ? cur - 1 : -1,
             cx < toX - 1 ? cur + 1 : -1,
           ];
-          for (const nb of neighbors) {
-            if (nb < 0 || mask[nb] !== 1 || labels[nb] !== -1) continue;
-            labels[nb] = label;
-            queue.push(nb);
+          for (const n of nb) {
+            if (n < 0 || mask[n] !== 1 || labels[n] !== -1) continue;
+            labels[n] = label; q.push(n);
           }
         }
         label++;
@@ -153,17 +150,19 @@ function detectShoes(
   function processHalf(fromX: number, toX: number): ShoeResult {
     const halfW = toX - fromX;
 
-    // ── Step 1: foreground mask via color distance to BG ──────────────────
+    // ── Step 1: initial foreground mask ──────────────────────────────────
     const mask = new Uint8Array(tw * th);
     for (let y = 0; y < th; y++)
       for (let x = fromX; x < toX; x++) {
         const idx = y * tw + x;
-        mask[idx] = colorDistToBg(idx) > THRESH ? 1 : 0;
+        mask[idx] = colorDist(idx) > THRESH ? 1 : 0;
       }
 
-    // ── Step 2: morphological close — dilate R=2 then erode R=2 ──────────
-    // Dilation: fills holes inside shoe body
-    const DR = 2;
+    // ── Step 2: dilation R=4 — large enough to bridge collar opening ──────
+    // Collar opening is a gap of ~3–6 thumbnail pixels between shoe upper
+    // and the background behind it. R=4 bridges that gap before BG flood-fill
+    // can sneak through.
+    const DR = 4;
     const dil = new Uint8Array(tw * th);
     for (let y = DR; y < th - DR; y++)
       for (let x = fromX + DR; x < toX - DR; x++) {
@@ -172,53 +171,47 @@ function detectShoes(
             if (mask[(y + dy) * tw + (x + dx)]) { dil[y * tw + x] = 1; break outer; }
       }
 
-    // Erosion: removes thin noise/wisps that survived dilation
-    const ER = 1;
-    const eroded = new Uint8Array(tw * th);
+    // ── Step 3: erosion R=3 — remove thin noise, restore shape ───────────
+    const ER = 3;
+    const closed = new Uint8Array(tw * th);
     for (let y = ER; y < th - ER; y++)
       for (let x = fromX + ER; x < toX - ER; x++) {
-        let allSet = true;
+        let all = true;
         outer2: for (let dy = -ER; dy <= ER; dy++)
           for (let dx = -ER; dx <= ER; dx++)
-            if (!dil[(y + dy) * tw + (x + dx)]) { allSet = false; break outer2; }
-        eroded[y * tw + x] = allSet ? 1 : 0;
+            if (!dil[(y + dy) * tw + (x + dx)]) { all = false; break outer2; }
+        closed[y * tw + x] = all ? 1 : 0;
       }
 
-    // ── Step 3: BFS flood from CORNER seeds only ──────────────────────────
-    // Corners = 5% of frame width/height from each corner.
-    // This avoids seeding into the shoe bottom (shoe often sits at center-bottom).
+    // ── Step 4: BFS from top rows + side column borders ──────────────────
+    // Seed: full top 8% (wall), left col, right col.
+    // NOT bottom row — shoe sole is at the bottom center; seeding from
+    // the full bottom row causes flood-fill to enter through the sole.
     const bgFill = new Uint8Array(tw * th);
-    const bfsBg: number[] = [];
+    const bgQ: number[] = [];
 
     function seedBg(x: number, y: number) {
       if (x < fromX || x >= toX || y < 0 || y >= th) return;
       const idx = y * tw + x;
-      if (bgFill[idx] || eroded[idx]) return;
-      bgFill[idx] = 1; bfsBg.push(idx);
+      if (bgFill[idx] || closed[idx]) return;
+      bgFill[idx] = 1; bgQ.push(idx);
     }
 
-    const cx5 = Math.round(halfW * 0.12); // corner zone width
-    const cy5 = Math.round(th * 0.12);    // corner zone height
-
-    // Top-left corner zone
-    for (let y = 0; y < cy5; y++)
-      for (let x = fromX; x < fromX + cx5; x++) seedBg(x, y);
-    // Top-right corner zone
-    for (let y = 0; y < cy5; y++)
-      for (let x = toX - cx5; x < toX; x++) seedBg(x, y);
-    // Bottom-left corner zone
-    for (let y = th - cy5; y < th; y++)
-      for (let x = fromX; x < fromX + cx5; x++) seedBg(x, y);
-    // Bottom-right corner zone
-    for (let y = th - cy5; y < th; y++)
-      for (let x = toX - cx5; x < toX; x++) seedBg(x, y);
-    // Full top row (sky/wall above shoe is always BG)
-    for (let x = fromX; x < toX; x++) seedBg(x, 0);
-    for (let x = fromX; x < toX; x++) seedBg(x, 1);
+    // Full top 8%
+    for (let y = 0; y < TOP_ROWS; y++)
+      for (let x = fromX; x < toX; x++) seedBg(x, y);
+    // Side columns full height
+    for (let y = 0; y < th; y++) { seedBg(fromX, y); seedBg(toX - 1, y); }
+    // Bottom corners only (20% each side), not centre where sole is
+    const bcw = Math.round(halfW * 0.20);
+    for (let y = Math.round(th * 0.75); y < th; y++) {
+      for (let x = fromX; x < fromX + bcw; x++) seedBg(x, y);
+      for (let x = toX - bcw; x < toX; x++) seedBg(x, y);
+    }
 
     let bqi = 0;
-    while (bqi < bfsBg.length) {
-      const idx = bfsBg[bqi++];
+    while (bqi < bgQ.length) {
+      const idx = bgQ[bqi++];
       const y = Math.floor(idx / tw), x = idx % tw;
       if (y > 0)       seedBg(x, y - 1);
       if (y < th - 1)  seedBg(x, y + 1);
@@ -226,20 +219,17 @@ function detectShoes(
       if (x < toX - 1) seedBg(x + 1, y);
     }
 
-    // ── Step 4: candidate mask = eroded AND NOT bgFill ────────────────────
-    const candidate = new Uint8Array(tw * th);
+    // ── Step 5: candidate = closed AND NOT bgFill ─────────────────────────
+    const cand = new Uint8Array(tw * th);
     for (let y = 0; y < th; y++)
       for (let x = fromX; x < toX; x++) {
-        const idx = y * tw + x;
-        candidate[idx] = (eroded[idx] && !bgFill[idx]) ? 1 : 0;
+        const i = y * tw + x;
+        cand[i] = (closed[i] && !bgFill[i]) ? 1 : 0;
       }
 
-    // ── Step 5: largest connected component = the shoe ───────────────────
-    const { labels, count } = bfsLabel(candidate, fromX, toX);
-
-    if (count === 0) {
-      return fallback(fromX, toX, halfW);
-    }
+    // ── Step 6: largest blob = the shoe ──────────────────────────────────
+    const { labels, count } = bfsLabel(cand, fromX, toX);
+    if (count === 0) return makeFallback(fromX, toX, halfW);
 
     const sizes = new Int32Array(count);
     for (let y = 0; y < th; y++)
@@ -247,55 +237,95 @@ function detectShoes(
         const l = labels[y * tw + x];
         if (l >= 0) sizes[l]++;
       }
+    let best = 0;
+    for (let i = 1; i < count; i++) if (sizes[i] > sizes[best]) best = i;
 
-    let bestLabel = 0, bestSize = 0;
-    for (let i = 0; i < count; i++)
-      if (sizes[i] > bestSize) { bestSize = sizes[i]; bestLabel = i; }
+    if (sizes[best] < halfW * th * 0.015) return makeFallback(fromX, toX, halfW);
 
-    // Reject if shoe blob is too small (< 1.5% of half area) — probably noise
-    const minArea = halfW * th * 0.015;
-    if (bestSize < minArea) {
-      return fallback(fromX, toX, halfW);
-    }
-
-    // ── Step 6: clean shoe mask ───────────────────────────────────────────
-    const shoe = new Uint8Array(tw * th);
+    // ── Step 7: extract blob into shoe mask ───────────────────────────────
     let minY = th, maxY = 0, minXs = toX, maxXs = fromX;
+    const shoe = new Uint8Array(tw * th);
     for (let y = 0; y < th; y++)
       for (let x = fromX; x < toX; x++) {
-        if (labels[y * tw + x] === bestLabel) {
-          shoe[y * tw + x] = 1;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-          if (x < minXs) minXs = x;
-          if (x > maxXs) maxXs = x;
-        }
+        if (labels[y * tw + x] !== best) continue;
+        shoe[y * tw + x] = 1;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+        if (x < minXs) minXs = x; if (x > maxXs) maxXs = x;
       }
 
-    const shoeH = maxY - minY;
-    const shoeW = maxXs - minXs;
-    if (shoeH < th * 0.04 || shoeW < halfW * 0.05) {
-      return fallback(fromX, toX, halfW);
-    }
+    if (maxY - minY < th * 0.04 || maxXs - minXs < halfW * 0.05)
+      return makeFallback(fromX, toX, halfW);
 
-    // ── Step 7: row-by-row silhouette contour ────────────────────────────
+    // ── Step 8: topological hole fill ────────────────────────────────────
+    // Flood-fill from a 1-pixel border around the shoe bbox through NON-shoe
+    // pixels, marking them as "exterior". Any non-shoe pixel NOT reachable
+    // from exterior = interior hole (collar cavity) → fill it.
+    const bx0 = Math.max(fromX, minXs - 2);
+    const bx1 = Math.min(toX - 1, maxXs + 2);
+    const by0 = Math.max(0, minY - 2);
+    const by1 = Math.min(th - 1, maxY + 2);
+
+    const exterior = new Uint8Array(tw * th);
+    const hoQ: number[] = [];
+    function seedExt(x: number, y: number) {
+      if (x < bx0 || x > bx1 || y < by0 || y > by1) return;
+      const idx = y * tw + x;
+      if (shoe[idx] || exterior[idx]) return;
+      exterior[idx] = 1; hoQ.push(idx);
+    }
+    // Border of bbox
+    for (let x = bx0; x <= bx1; x++) { seedExt(x, by0); seedExt(x, by1); }
+    for (let y = by0; y <= by1; y++) { seedExt(bx0, y); seedExt(bx1, y); }
+    let hqi = 0;
+    while (hqi < hoQ.length) {
+      const idx = hoQ[hqi++];
+      const y = Math.floor(idx / tw), x = idx % tw;
+      seedExt(x, y - 1); seedExt(x, y + 1); seedExt(x - 1, y); seedExt(x + 1, y);
+    }
+    // Fill interior holes
+    for (let y = by0; y <= by1; y++)
+      for (let x = bx0; x <= bx1; x++) {
+        const i = y * tw + x;
+        if (!shoe[i] && !exterior[i]) { shoe[i] = 1; }
+      }
+
+    // Recompute extents after hole fill
+    minY = th; maxY = 0; minXs = toX; maxXs = fromX;
+    for (let y = 0; y < th; y++)
+      for (let x = fromX; x < toX; x++) {
+        if (!shoe[y * tw + x]) continue;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+        if (x < minXs) minXs = x; if (x > maxXs) maxXs = x;
+      }
+
+    // ── Step 9: contour smoothing — sliding window on edges ──────────────
+    const WIN = 3;
     const leftEdge: Pt[] = [];
     const rightEdge: Pt[] = [];
     for (let y = minY; y <= maxY; y++) {
       let lx = toX, rx = fromX - 1;
       for (let x = fromX; x < toX; x++)
         if (shoe[y * tw + x]) { if (x < lx) lx = x; if (x > rx) rx = x; }
-      if (rx >= lx) {
-        leftEdge.push({ x: lx, y });
-        rightEdge.push({ x: rx, y });
-      }
+      if (rx >= lx) { leftEdge.push({ x: lx, y }); rightEdge.push({ x: rx, y }); }
     }
+    if (leftEdge.length < 4) return makeFallback(fromX, toX, halfW);
 
-    if (leftEdge.length < 4) return fallback(fromX, toX, halfW);
+    // Smooth edges: replace each x with average of WIN neighbours
+    function smooth(pts: Pt[]): Pt[] {
+      return pts.map((p, i) => {
+        let sum = 0, n = 0;
+        for (let k = Math.max(0, i - WIN); k <= Math.min(pts.length - 1, i + WIN); k++) {
+          sum += pts[k].x; n++;
+        }
+        return { x: Math.round(sum / n), y: p.y };
+      });
+    }
+    const sLeft = smooth(leftEdge);
+    const sRight = smooth(rightEdge);
 
     const pts: Pt[] = [
-      ...leftEdge,
-      ...[...rightEdge].reverse(),
+      ...sLeft,
+      ...[...sRight].reverse(),
     ].map(p => ({ x: Math.round(p.x / SCALE), y: Math.round(p.y / SCALE) }));
 
     const bbox: BBox = {
@@ -305,92 +335,101 @@ function detectShoes(
       maxY: Math.min(vh, Math.round(maxY / SCALE)),
     };
 
+    const heightPx = Math.round((maxY - minY) / SCALE);
+    const widthPx  = Math.round((maxXs - minXs) / SCALE);
+    const topPt  = { x: Math.round((minXs + maxXs) / 2 / SCALE), y: bbox.minY };
+    const botPt  = { x: Math.round((minXs + maxXs) / 2 / SCALE), y: bbox.maxY };
+
     return {
-      bbox,
-      contour: pts,
+      bbox, contour: pts,
+      topPt, botPt, heightPx, widthPx,
       ...(debugMode ? { debugMask: mask, debugClean: shoe, thumbW: tw, thumbH: th } : {}),
     };
   }
 
-  function fallback(fromX: number, toX: number, halfW: number): ShoeResult {
+  function makeFallback(fromX: number, toX: number, halfW: number): ShoeResult {
     const pad = Math.round(halfW * 0.08);
+    const b: BBox = {
+      minX: Math.round((fromX + pad) / SCALE),
+      maxX: Math.round((toX - pad) / SCALE),
+      minY: Math.round(th * 0.15 / SCALE),
+      maxY: Math.round(th * 0.85 / SCALE),
+    };
+    const midX = (b.minX + b.maxX) / 2;
     return {
-      bbox: {
-        minX: Math.round((fromX + pad) / SCALE),
-        maxX: Math.round((toX - pad) / SCALE),
-        minY: Math.round(th * 0.15 / SCALE),
-        maxY: Math.round(th * 0.85 / SCALE),
-      },
-      contour: null,
+      bbox: b, contour: null,
+      topPt: { x: midX, y: b.minY }, botPt: { x: midX, y: b.maxY },
+      heightPx: b.maxY - b.minY, widthPx: b.maxX - b.minX,
     };
   }
 
   const mid = Math.round(tw / 2);
-  const L = processHalf(0, mid);
+  const L  = processHalf(0, mid);
   const Rh = processHalf(mid, tw);
   return {
     left: L.bbox, right: Rh.bbox,
     leftContour: L.contour, rightContour: Rh.contour,
-    leftDebug: debugMode ? L : undefined,
-    rightDebug: debugMode ? Rh : undefined,
+    leftResult: L, rightResult: Rh,
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Debug overlay: draws mask stages onto a secondary canvas shown below camera
+// Debug canvas — 4 mask panels + measurement callout
 // ─────────────────────────────────────────────────────────────────────────────
 function renderDebug(
   dbgCanvas: HTMLCanvasElement,
-  leftDebug: ShoeResult | undefined,
-  rightDebug: ShoeResult | undefined,
-  vw: number, vh: number
+  L: ShoeResult, Rh: ShoeResult,
+  pxPerMm: number
 ) {
-  if (!leftDebug?.debugMask || !leftDebug.thumbW) return;
-  const tw = leftDebug.thumbW;
-  const th = leftDebug.thumbH!;
+  if (!L.debugMask || !L.thumbW) return;
+  const tw = L.thumbW!, th = L.thumbH!;
+  const panelW = Math.round(tw / 2);
 
-  // 4 panels: raw mask L, clean L, raw mask R, clean R
-  const panelW = tw, panelH = th;
   dbgCanvas.width = panelW * 4;
-  dbgCanvas.height = panelH;
+  dbgCanvas.height = th + 22;
   const ctx = dbgCanvas.getContext("2d")!;
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, dbgCanvas.width, panelH);
+  ctx.fillStyle = "#06060f";
+  ctx.fillRect(0, 0, dbgCanvas.width, dbgCanvas.height);
 
   const panels = [
-    { label: "RAW MASK L", mask: leftDebug.debugMask, half: [0, Math.round(tw / 2)] as [number, number], color: [0, 200, 255] },
-    { label: "SHOE ONLY L", mask: leftDebug.debugClean, half: [0, Math.round(tw / 2)] as [number, number], color: [0, 255, 120] },
-    { label: "RAW MASK R", mask: rightDebug?.debugMask, half: [Math.round(tw / 2), tw] as [number, number], color: [0, 200, 255] },
-    { label: "SHOE ONLY R", mask: rightDebug?.debugClean, half: [Math.round(tw / 2), tw] as [number, number], color: [0, 255, 120] },
+    { label: "RAW L",  mask: L.debugMask,   half: [0, panelW]            as [number,number], col: [0,200,255] },
+    { label: "SHOE L", mask: L.debugClean,  half: [0, panelW]            as [number,number], col: [0,255,120] },
+    { label: "RAW R",  mask: Rh.debugMask,  half: [panelW, tw]           as [number,number], col: [0,200,255] },
+    { label: "SHOE R", mask: Rh.debugClean, half: [panelW, tw]           as [number,number], col: [0,255,120] },
   ];
 
-  panels.forEach(({ label, mask, half, color }, pi) => {
+  panels.forEach(({ label, mask, half, col }, pi) => {
     if (!mask) return;
-    const [fx, tx] = half;
-    const imgd = ctx.createImageData(panelW, panelH);
+    const [fx, tx2] = half;
+    const imgd = ctx.createImageData(panelW, th);
     for (let y = 0; y < th; y++) {
-      for (let x = fx; x < tx; x++) {
+      for (let x = fx; x < tx2; x++) {
         const src = y * tw + x;
         const dst = (y * panelW + (x - fx)) * 4;
         if (mask[src]) {
-          imgd.data[dst] = color[0];
-          imgd.data[dst + 1] = color[1];
-          imgd.data[dst + 2] = color[2];
-          imgd.data[dst + 3] = 255;
+          imgd.data[dst] = col[0]; imgd.data[dst+1] = col[1];
+          imgd.data[dst+2] = col[2]; imgd.data[dst+3] = 255;
         } else {
-          imgd.data[dst] = 20; imgd.data[dst + 1] = 20; imgd.data[dst + 2] = 30;
-          imgd.data[dst + 3] = 255;
+          imgd.data[dst] = 18; imgd.data[dst+1] = 18; imgd.data[dst+2] = 28; imgd.data[dst+3] = 255;
         }
       }
     }
     ctx.putImageData(imgd, pi * panelW, 0);
-    ctx.fillStyle = "rgba(0,0,0,0.7)";
-    ctx.fillRect(pi * panelW, 0, ctx.measureText(label).width + 8, 14);
-    ctx.fillStyle = "#fff";
-    ctx.font = "10px monospace";
-    ctx.textAlign = "left";
-    ctx.fillText(label, pi * panelW + 4, 11);
+    ctx.fillStyle = "rgba(0,0,0,0.75)";
+    ctx.fillRect(pi * panelW, 0, panelW, 12);
+    ctx.fillStyle = "#aaa"; ctx.font = "9px monospace"; ctx.textAlign = "left";
+    ctx.fillText(label, pi * panelW + 2, 10);
   });
+
+  // Bottom info bar
+  const { PX_PER_MM } = { PX_PER_MM: pxPerMm };
+  ctx.fillStyle = "#0a0a18";
+  ctx.fillRect(0, th, dbgCanvas.width, 22);
+  ctx.fillStyle = "#0cf"; ctx.font = "9px monospace"; ctx.textAlign = "left";
+  ctx.fillText(
+    `L: ${L.heightPx}px=${(L.heightPx/PX_PER_MM).toFixed(1)}mm  W=${L.widthPx}px=${(L.widthPx/PX_PER_MM).toFixed(1)}mm  |  R: ${Rh.heightPx}px=${(Rh.heightPx/PX_PER_MM).toFixed(1)}mm  W=${Rh.widthPx}px=${(Rh.widthPx/PX_PER_MM).toFixed(1)}mm  |  px/mm=${PX_PER_MM}`,
+    4, th + 14
+  );
 }
 
 export function CameraView({ onCapture, onError }: Props) {
@@ -451,37 +490,38 @@ export function CameraView({ onCapture, onError }: Props) {
 
     const vw = video.videoWidth || 1280;
     const vh = video.videoHeight || 720;
-    canvas.width = vw;
-    canvas.height = vh;
+    canvas.width = vw; canvas.height = vh;
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, vw, vh);
 
     await new Promise(r => setTimeout(r, 20));
 
-    const result = detectShoes(canvas, vw, vh, debugMode);
-    const { left: lb, right: rb, leftContour: lc, rightContour: rc } = result;
+    const det = detectShoes(canvas, vw, vh, debugMode);
+    const { left: lb, right: rb, leftContour: lc, rightContour: rc } = det;
+    const LR = det.leftResult, RR = det.rightResult;
+
+    // PX_PER_MM from utils
+    const PX_PER_MM = 3.5;
 
     if (debugMode && debugCanvasRef.current) {
-      renderDebug(debugCanvasRef.current, result.leftDebug, result.rightDebug, vw, vh);
+      renderDebug(debugCanvasRef.current, LR, RR, PX_PER_MM);
       setShowDebug(true);
     }
-
     setIsAnalyzing(false);
 
-    const groundY = Math.max(lb.maxY, rb.maxY);
     const fs = Math.max(18, Math.round(vw * 0.018));
 
     function pill(text: string, cx: number, cy: number, bg: string, fg: string) {
       ctx.font = `bold ${fs}px -apple-system,sans-serif`;
       const tw2 = ctx.measureText(text).width;
-      const ph = fs + 10, pw = tw2 + 20, r = ph / 2;
+      const ph = fs + 10, pw = tw2 + 20, r2 = ph / 2;
       const px = cx - pw / 2, py = cy - ph / 2;
       ctx.beginPath();
-      ctx.moveTo(px + r, py);
-      ctx.arcTo(px + pw, py, px + pw, py + ph, r);
-      ctx.arcTo(px + pw, py + ph, px, py + ph, r);
-      ctx.arcTo(px, py + ph, px, py, r);
-      ctx.arcTo(px, py, px + pw, py, r);
+      ctx.moveTo(px + r2, py);
+      ctx.arcTo(px + pw, py, px + pw, py + ph, r2);
+      ctx.arcTo(px + pw, py + ph, px, py + ph, r2);
+      ctx.arcTo(px, py + ph, px, py, r2);
+      ctx.arcTo(px, py, px + pw, py, r2);
       ctx.closePath();
       ctx.fillStyle = bg; ctx.fill();
       ctx.fillStyle = fg; ctx.textAlign = "center"; ctx.textBaseline = "middle";
@@ -489,82 +529,111 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.textBaseline = "alphabetic";
     }
 
-    function drawBox(bounds: BBox, contour: Pt[] | null, label: string) {
+    function drawShoe(bounds: BBox, contour: Pt[] | null, sr: ShoeResult, label: string) {
+      // Contour / rect
       ctx.beginPath();
       if (contour && contour.length > 2) {
-        contour.forEach((p, i) => { if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y); });
+        contour.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
         ctx.closePath();
       } else {
         ctx.rect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
       }
-      ctx.fillStyle = `${GREEN}1a`; ctx.fill();
+      ctx.fillStyle = `${GREEN}18`; ctx.fill();
       ctx.strokeStyle = GREEN; ctx.lineWidth = Math.max(2, vw * 0.002);
-      ctx.shadowColor = GREEN; ctx.shadowBlur = 12; ctx.stroke(); ctx.shadowBlur = 0;
+      ctx.shadowColor = GREEN; ctx.shadowBlur = 10; ctx.stroke(); ctx.shadowBlur = 0;
 
-      const tk = Math.round(vw * 0.025);
-      const { minX, minY, maxX } = bounds;
-      const bY = groundY;
+      // Corner ticks
+      const tk = Math.round(vw * 0.022);
+      const { minX, minY, maxX, maxY } = bounds;
       ctx.strokeStyle = GREEN; ctx.lineWidth = Math.max(3, vw * 0.003);
-      ctx.shadowColor = GREEN; ctx.shadowBlur = 8;
-      [[minX, minY, 1, 1],[maxX, minY,-1, 1],[minX, bY, 1,-1],[maxX, bY,-1,-1]].forEach(([cx,cy,dx,dy]) => {
-        ctx.beginPath(); ctx.moveTo(cx as number,(cy as number)+(dy as number)*tk);
-        ctx.lineTo(cx as number,cy as number); ctx.lineTo((cx as number)+(dx as number)*tk,cy as number); ctx.stroke();
+      ctx.shadowColor = GREEN; ctx.shadowBlur = 6;
+      [[minX,minY,1,1],[maxX,minY,-1,1],[minX,maxY,1,-1],[maxX,maxY,-1,-1]].forEach(([cx,cy,dx,dy]) => {
+        ctx.beginPath();
+        ctx.moveTo(cx as number, (cy as number) + (dy as number) * tk);
+        ctx.lineTo(cx as number, cy as number);
+        ctx.lineTo((cx as number) + (dx as number) * tk, cy as number);
+        ctx.stroke();
       });
       ctx.shadowBlur = 0;
 
-      const hMm = pxToMm(groundY - bounds.minY);
-      const wMm = pxToMm(bounds.maxX - bounds.minX);
+      // Measurement: use per-shoe extents (not shared groundY)
+      const hPx = sr.heightPx;
+      const wPx = sr.widthPx;
+      const hMm = parseFloat((hPx / PX_PER_MM).toFixed(1));
+      const wMm = parseFloat((wPx / PX_PER_MM).toFixed(1));
       const midX = (bounds.minX + bounds.maxX) / 2;
-      const midY = (bounds.minY + groundY) / 2;
+      const midY = (bounds.minY + bounds.maxY) / 2;
 
+      // Debug: top/bottom measurement points
+      if (debugMode) {
+        const DOT = Math.max(6, vw * 0.005);
+        ctx.fillStyle = MAGENTA;
+        ctx.beginPath(); ctx.arc(sr.topPt.x, sr.topPt.y, DOT, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = CYAN;
+        ctx.beginPath(); ctx.arc(sr.botPt.x, sr.botPt.y, DOT, 0, Math.PI * 2); ctx.fill();
+        // Vertical measurement line
+        ctx.strokeStyle = `${MAGENTA}80`; ctx.lineWidth = 1; ctx.setLineDash([4,4]);
+        ctx.beginPath(); ctx.moveTo(sr.topPt.x, sr.topPt.y); ctx.lineTo(sr.botPt.x, sr.botPt.y); ctx.stroke();
+        ctx.setLineDash([]);
+        // Px label
+        pill(`${hPx}px`, midX, midY - fs * 1.2, "rgba(0,0,0,0.85)", MAGENTA);
+      }
+
+      // H pill right of shoe
       const hx = Math.min(bounds.maxX + fs * 1.8, vw - fs * 2);
       pill(`H ${hMm}mm`, hx, midY, "rgba(0,0,0,0.82)", GREEN);
+
+      // W pill above shoe
       pill(`W ${wMm}mm`, midX, Math.max(bounds.minY - fs * 0.9, fs * 1.1), "rgba(0,0,0,0.82)", GREEN);
 
-      ctx.strokeStyle = `${GREEN}60`; ctx.lineWidth = 1; ctx.setLineDash([6, 5]);
-      ctx.beginPath(); ctx.moveTo(bounds.minX, groundY); ctx.lineTo(bounds.maxX, groundY); ctx.stroke();
+      // Baseline dashes at shoe bottom
+      ctx.strokeStyle = `${GREEN}55`; ctx.lineWidth = 1; ctx.setLineDash([5, 5]);
+      ctx.beginPath(); ctx.moveTo(bounds.minX, bounds.maxY); ctx.lineTo(bounds.maxX, bounds.maxY); ctx.stroke();
       ctx.setLineDash([]);
 
-      pill(label, midX, Math.min(groundY + fs * 1.1, vh - fs * 0.8), `${GREEN}dd`, "#000");
+      // Label chip
+      pill(label, midX, Math.min(bounds.maxY + fs * 1.1, vh - fs * 0.8), `${GREEN}dd`, "#000");
 
       return { hMm, wMm };
     }
 
-    const leftResult  = drawBox(lb, lc, "LEFT");
-    const rightResult = drawBox(rb, rc, "RIGHT");
+    const leftM  = drawShoe(lb, lc, LR, "LEFT");
+    const rightM = drawShoe(rb, rc, RR, "RIGHT");
 
-    ctx.strokeStyle = `${CYAN}60`;
-    ctx.lineWidth = 1;
-    ctx.setLineDash([6, 6]);
-    ctx.beginPath();
-    ctx.moveTo(vw / 2, 0);
-    ctx.lineTo(vw / 2, vh);
-    ctx.stroke();
+    // Centre divider
+    ctx.strokeStyle = `${CYAN}55`; ctx.lineWidth = 1; ctx.setLineDash([6,6]);
+    ctx.beginPath(); ctx.moveTo(vw/2,0); ctx.lineTo(vw/2,vh); ctx.stroke();
     ctx.setLineDash([]);
 
-    const diff = parseFloat(Math.abs(leftResult.hMm - rightResult.hMm).toFixed(1));
+    const diff = parseFloat(Math.abs(leftM.hMm - rightM.hMm).toFixed(1));
     const passed = diff <= 3;
 
+    // Result banner
     ctx.fillStyle = `${passed ? GREEN : RED}ee`;
     const bh = Math.round(vh * 0.07);
     ctx.fillRect(0, vh - bh, vw, bh);
     ctx.font = `bold ${Math.round(vw * 0.022)}px -apple-system,sans-serif`;
-    ctx.fillStyle = "#fff";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText(
-      passed ? `✓  PASSED   Δ${diff} mm` : `✗  REJECTED   Δ${diff} mm  (limit 3mm)`,
+      passed ? `✓  PASSED   Δ${diff} mm` : `✗  REJECTED   Δ${diff} mm  (limit 3 mm)`,
       vw / 2, vh - bh / 2
     );
     ctx.textBaseline = "alphabetic";
 
-    ctx.font = "11px monospace";
-    ctx.fillStyle = "rgba(0,0,0,0.7)";
-    const stamp = `CV | L:${leftResult.hMm}mm R:${rightResult.hMm}mm`;
-    ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
-    ctx.fillStyle = GREEN;
-    ctx.textAlign = "left";
-    ctx.fillText(stamp, 9, 17);
+    // Debug stamp
+    if (debugMode) {
+      ctx.font = "10px monospace"; ctx.textAlign = "left";
+      const stamp = `DBG | L:${LR.heightPx}px=${leftM.hMm}mm  R:${RR.heightPx}px=${rightM.hMm}mm  px/mm=${PX_PER_MM}`;
+      ctx.fillStyle = "rgba(0,0,0,0.75)";
+      ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
+      ctx.fillStyle = YELLOW; ctx.fillText(stamp, 9, 17);
+    } else {
+      ctx.font = "11px monospace"; ctx.textAlign = "left";
+      const stamp = `CV | L:${leftM.hMm}mm R:${rightM.hMm}mm`;
+      ctx.fillStyle = "rgba(0,0,0,0.7)";
+      ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
+      ctx.fillStyle = GREEN; ctx.fillText(stamp, 9, 17);
+    }
 
     try {
       const blob = await compressImage(canvas, 0.9);
@@ -572,22 +641,20 @@ export function CameraView({ onCapture, onError }: Props) {
       if ("vibrate" in navigator) navigator.vibrate([60, 30, 60]);
 
       onCapture({
-        blob,
-        dataUrl: annotatedDataUrl,
-        annotatedDataUrl,
-        leftHeightMm: leftResult.hMm,
-        rightHeightMm: rightResult.hMm,
-        leftWidthMm: leftResult.wMm,
-        rightWidthMm: rightResult.wMm,
-        heightDiffMm: diff,
+        blob, dataUrl: annotatedDataUrl, annotatedDataUrl,
+        leftHeightMm:  leftM.hMm,
+        rightHeightMm: rightM.hMm,
+        leftWidthMm:   leftM.wMm,
+        rightWidthMm:  rightM.wMm,
+        heightDiffMm:  diff,
         passed,
         rejectionReason: passed ? null : `Height difference ${diff}mm exceeds 3mm tolerance`,
       });
 
       setShowSuccess(true);
-      setTimeout(() => { setShowSuccess(false); setIsCapturing(false); setShowDebug(false); }, 1200);
+      setTimeout(() => { setShowSuccess(false); setIsCapturing(false); setShowDebug(false); }, 1400);
     } catch {
-      onError("Failed to compress image");
+      onError("Failed to process image");
       setIsCapturing(false);
     }
   }, [isCapturing, isAnalyzing, debugMode, onCapture, onError]);
@@ -623,7 +690,7 @@ export function CameraView({ onCapture, onError }: Props) {
             style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
-            <p className="text-base font-bold" style={{ color: CYAN }}>Segmenting shoes...</p>
+            <p className="text-base font-bold" style={{ color: CYAN }}>Segmenting shoes…</p>
           </motion.div>
         )}
       </AnimatePresence>
@@ -632,18 +699,14 @@ export function CameraView({ onCapture, onError }: Props) {
       {isReady && !isCapturing && (
         <div className="absolute inset-0 pointer-events-none">
           <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-40"
-            style={{ background: `repeating-linear-gradient(to bottom, ${CYAN} 0px, ${CYAN} 8px, transparent 8px, transparent 16px)` }} />
+            style={{ background: `repeating-linear-gradient(to bottom,${CYAN} 0,${CYAN} 8px,transparent 8px,transparent 16px)` }} />
           <div className="absolute left-4 top-1/2 -translate-y-1/2">
             <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-              LEFT SHOE
-            </div>
+              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>LEFT SHOE</div>
           </div>
           <div className="absolute right-4 top-1/2 -translate-y-1/2">
             <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-              RIGHT SHOE
-            </div>
+              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>RIGHT SHOE</div>
           </div>
           <div className="absolute top-8 left-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
           <div className="absolute top-8 right-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
@@ -654,7 +717,7 @@ export function CameraView({ onCapture, onError }: Props) {
 
       {isReady && !isCapturing && (
         <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
-          <div className="px-4 py-1.5 rounded-full text-xs font-semibold text-center whitespace-nowrap"
+          <div className="px-4 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap"
             style={{ background: "rgba(0,0,0,0.75)", border: `1px solid ${CYAN}40`, color: "#ccc" }}>
             One shoe each side · landscape · tap capture
           </div>
@@ -679,35 +742,32 @@ export function CameraView({ onCapture, onError }: Props) {
         )}
       </AnimatePresence>
 
-      {/* Debug panel — slides up from bottom as overlay */}
+      {/* Debug overlay panel */}
       <AnimatePresence>
         {showDebug && debugMode && (
           <motion.div
-            initial={{ opacity: 0, y: 80 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 80 }}
-            className="absolute left-0 right-0 bottom-28 z-20 mx-3 rounded-2xl overflow-hidden"
-            style={{ background: "rgba(10,10,18,0.96)", border: "1px solid rgba(255,255,255,0.1)", backdropFilter: "blur(8px)" }}
+            initial={{ opacity: 0, y: 60 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 60 }}
+            className="absolute left-0 right-0 bottom-28 z-20 mx-2 rounded-2xl overflow-hidden"
+            style={{ background: "rgba(8,8,18,0.96)", border: "1px solid rgba(255,255,255,0.1)", backdropFilter: "blur(8px)" }}
           >
-            <div className="px-3 py-2">
-              <p className="text-xs font-bold mb-2" style={{ color: YELLOW }}>DEBUG: Segmentation Masks</p>
-              <canvas
-                ref={debugCanvasRef}
-                className="w-full rounded"
-                style={{ imageRendering: "pixelated", border: `1px solid rgba(255,255,255,0.08)` }}
-              />
-              <div className="flex gap-4 mt-1.5 pb-1 text-xs" style={{ color: "#555" }}>
-                <span style={{ color: "#00c8ff" }}>■ Raw mask</span>
-                <span style={{ color: "#00ff78" }}>■ Shoe only</span>
+            <div className="px-2 py-2">
+              <p className="text-[10px] font-bold mb-1.5" style={{ color: YELLOW }}>DEBUG: Segmentation + Measurements</p>
+              <canvas ref={debugCanvasRef} className="w-full rounded"
+                style={{ imageRendering: "pixelated", border: `1px solid rgba(255,255,255,0.07)` }} />
+              <div className="flex gap-3 mt-1 text-[9px]" style={{ color: "#555" }}>
+                <span style={{ color: "#00c8ff" }}>■ Raw FG mask</span>
+                <span style={{ color: "#00ff78" }}>■ Shoe blob (hole-filled)</span>
+                <span style={{ color: MAGENTA }}>● Top point</span>
+                <span style={{ color: CYAN }}>● Bottom point</span>
               </div>
             </div>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Bottom controls — always visible, absolutely pinned */}
+      {/* Bottom controls */}
       <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center justify-between px-6 pb-6 pt-3"
-        style={{ background: "linear-gradient(to top, rgba(0,0,0,0.75) 0%, transparent 100%)" }}>
-
-        {/* Debug toggle */}
+        style={{ background: "linear-gradient(to top,rgba(0,0,0,0.75) 0%,transparent 100%)" }}>
         <button
           onClick={() => { setDebugMode(d => !d); setShowDebug(false); }}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold"
@@ -721,7 +781,6 @@ export function CameraView({ onCapture, onError }: Props) {
           {debugMode ? "Debug ON" : "Debug"}
         </button>
 
-        {/* Capture button — centre */}
         <div className="flex flex-col items-center gap-1">
           <button
             onClick={handleCapture}
@@ -739,7 +798,6 @@ export function CameraView({ onCapture, onError }: Props) {
           </span>
         </div>
 
-        {/* Spacer */}
         <div className="w-16" />
       </div>
     </div>

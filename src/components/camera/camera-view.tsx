@@ -2,7 +2,7 @@
 
 import { useRef, useEffect, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckCircle2, Loader2, RotateCcw, Camera, XCircle } from "lucide-react";
+import { CheckCircle2, Loader2, RotateCcw, Camera } from "lucide-react";
 import { pxToMm, compressImage } from "@/lib/utils";
 import type { CaptureResult } from "@/store/scan";
 
@@ -10,9 +10,12 @@ const CYAN  = "#06b6d4";
 const GREEN = "#22c55e";
 const RED   = "#ef4444";
 
-const PUB_KEY   = "rf_AvYiDjJLIMb0l0OPIgfb5ghmbyE3";
-const MODEL_ID  = "shoe-segmentation-0kxvd";
-const MODEL_VER = 1;
+interface RoboflowPoint { x: number; y: number; }
+interface RoboflowPrediction {
+  x: number; y: number; width: number; height: number;
+  confidence: number; class: string;
+  points?: RoboflowPoint[];
+}
 
 interface BBox { minX: number; maxX: number; minY: number; maxY: number; }
 interface Props {
@@ -20,30 +23,17 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let _mod: any = null;
-async function loadRF() {
-  if (_mod) return _mod;
-  _mod = await import("inferencejs");
-  return _mod;
-}
-
 export function CameraView({ onCapture, onError }: Props) {
   const videoRef         = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef        = useRef<MediaStream | null>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const engineRef        = useRef<any>(null);
-  const workerRef        = useRef<string | null>(null);
 
-  const [isReady,      setIsReady]      = useState(false);
-  const [isCapturing,  setIsCapturing]  = useState(false);
-  const [isAnalyzing,  setIsAnalyzing]  = useState(false);
-  const [modelLoading, setModelLoading] = useState(false);
-  const [modelReady,   setModelReady]   = useState(false);
-  const [showSuccess,  setShowSuccess]  = useState(false);
-  const [isPortrait,   setIsPortrait]   = useState(false);
-  const [statusMsg,    setStatusMsg]    = useState("");
+  const [isReady,     setIsReady]     = useState(false);
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [showSuccess, setShowSuccess] = useState(false);
+  const [isPortrait,  setIsPortrait]  = useState(false);
+  const [statusMsg,   setStatusMsg]   = useState("");
 
   useEffect(() => {
     function check() { setIsPortrait(window.innerHeight > window.innerWidth); }
@@ -79,54 +69,14 @@ export function CameraView({ onCapture, onError }: Props) {
     return () => { streamRef.current?.getTracks().forEach((t) => t.stop()); };
   }, [onError]);
 
-  // Eager model load
-  useEffect(() => {
-    if (!isReady || modelLoading || modelReady) return;
-    async function load() {
-      setModelLoading(true);
-      setStatusMsg("Loading AI model…");
-      try {
-        const mod = await loadRF();
-        const engine = new mod.InferenceEngine();
-        engineRef.current = engine;
-        workerRef.current = await engine.startWorker(MODEL_ID, MODEL_VER, PUB_KEY);
-        setModelReady(true);
-        setStatusMsg("");
-      } catch (e) {
-        console.error("[RF load]", e);
-        setStatusMsg("Model failed — tap capture to retry");
-      } finally {
-        setModelLoading(false);
-      }
-    }
-    load();
-  }, [isReady, modelLoading, modelReady]);
-
   const handleCapture = useCallback(async () => {
     const video  = videoRef.current;
     const canvas = captureCanvasRef.current;
     if (!video || !canvas || isCapturing || isAnalyzing) return;
 
     setIsCapturing(true);
-
-    if (!workerRef.current) {
-      setStatusMsg("Loading AI model…");
-      try {
-        const mod = await loadRF();
-        const engine = new mod.InferenceEngine();
-        engineRef.current = engine;
-        workerRef.current = await engine.startWorker(MODEL_ID, MODEL_VER, PUB_KEY);
-        setModelReady(true);
-      } catch (e) {
-        onError(`Model failed to load: ${e instanceof Error ? e.message : "network error"}`);
-        setIsCapturing(false);
-        setStatusMsg("");
-        return;
-      }
-    }
-
     setIsAnalyzing(true);
-    setStatusMsg("Detecting shoes…");
+    setStatusMsg("Analyzing with AI…");
 
     const vw = video.videoWidth  || 1280;
     const vh = video.videoHeight || 720;
@@ -135,97 +85,113 @@ export function CameraView({ onCapture, onError }: Props) {
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, vw, vh);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let predictions: any[] = [];
+    // Encode full frame
+    const encCanvas = document.createElement("canvas");
+    encCanvas.width  = 1280;
+    encCanvas.height = Math.round(vh * (1280 / vw));
+    encCanvas.getContext("2d")!.drawImage(canvas, 0, 0, encCanvas.width, encCanvas.height);
+    const b64 = encCanvas.toDataURL("image/jpeg", 0.9).split(",")[1];
+
+    function remap(preds: RoboflowPrediction[], scaleX: number, scaleY: number, offX = 0, offY = 0): RoboflowPrediction[] {
+      return preds.map(p => ({
+        ...p,
+        x: offX + p.x * scaleX, y: offY + p.y * scaleY,
+        width: p.width * scaleX, height: p.height * scaleY,
+        points: p.points?.map(pt => ({ x: offX + pt.x * scaleX, y: offY + pt.y * scaleY })),
+      }));
+    }
+
+    async function callAPI(b64img: string): Promise<RoboflowPrediction[]> {
+      const res = await fetch("/api/roboflow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: b64img }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(`RF ${res.status}: ${JSON.stringify(data)}`);
+      return data.predictions ?? [];
+    }
+
+    let predictions: RoboflowPrediction[] = [];
     try {
-      const mod    = await loadRF();
-      const img    = new mod.CVImage(canvas);
-      const result = await engineRef.current.infer(workerRef.current, img);
-      predictions  = Array.isArray(result) ? result : (result?.predictions ?? []);
-      console.log("[RF]", predictions.length, "predictions");
+      const sx = vw / encCanvas.width, sy = vh / encCanvas.height;
+      let preds = remap(await callAPI(b64), sx, sy);
+
+      // If <2 detected, try split halves
+      if (preds.length < 2) {
+        const hw = Math.floor(vw / 2);
+        const lc = document.createElement("canvas"); lc.width = 640; lc.height = Math.round(vh * 640 / hw);
+        lc.getContext("2d")!.drawImage(canvas, 0, 0, hw, vh, 0, 0, lc.width, lc.height);
+        const rc = document.createElement("canvas"); rc.width = 640; rc.height = Math.round(vh * 640 / hw);
+        rc.getContext("2d")!.drawImage(canvas, hw, 0, hw, vh, 0, 0, rc.width, rc.height);
+        const lsx = hw / lc.width, lsy = vh / lc.height;
+        const [lp, rp] = await Promise.all([
+          callAPI(lc.toDataURL("image/jpeg", 0.9).split(",")[1]).then(p => remap(p, lsx, lsy, 0, 0)),
+          callAPI(rc.toDataURL("image/jpeg", 0.9).split(",")[1]).then(p => remap(p, lsx, lsy, hw, 0)),
+        ]);
+        const best = (arr: RoboflowPrediction[]) => arr.sort((a, b) => b.confidence - a.confidence)[0];
+        preds = [...(lp.length ? [best(lp)] : []), ...(rp.length ? [best(rp)] : [])];
+      }
+      predictions = preds;
     } catch (e) {
-      console.error("[RF infer]", e);
-      setIsAnalyzing(false);
-      setIsCapturing(false);
-      setStatusMsg("");
-      onError(`Detection failed: ${e instanceof Error ? e.message : "unknown"}`);
+      setIsAnalyzing(false); setIsCapturing(false); setStatusMsg("");
+      onError(`AI failed: ${e instanceof Error ? e.message : "network error"}`);
       return;
     }
 
-    setIsAnalyzing(false);
-    setStatusMsg("");
+    setIsAnalyzing(false); setStatusMsg("");
 
     if (predictions.length === 0) {
       setIsCapturing(false);
-      onError("No shoes detected. Ensure both shoes are clearly visible in side view.");
+      onError("No shoes detected. Ensure both shoes are clearly visible and try again.");
       return;
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    function predToBBox(p: any): BBox {
-      const x = p.bbox?.x ?? p.x ?? 0;
-      const y = p.bbox?.y ?? p.y ?? 0;
-      const w = p.bbox?.width  ?? p.width  ?? 0;
-      const h = p.bbox?.height ?? p.height ?? 0;
-      return { minX: Math.round(x - w/2), maxX: Math.round(x + w/2),
-               minY: Math.round(y - h/2), maxY: Math.round(y + h/2) };
+    // Filter small, dedup, sort left→right
+    const pool = predictions.filter(p => p.width > vw * 0.05 && p.height > vh * 0.08);
+    const src  = pool.length ? pool : predictions;
+
+    function iou(a: RoboflowPrediction, b: RoboflowPrediction) {
+      const ax1 = a.x - a.width/2, ax2 = a.x + a.width/2, ay1 = a.y - a.height/2, ay2 = a.y + a.height/2;
+      const bx1 = b.x - b.width/2, bx2 = b.x + b.width/2, by1 = b.y - b.height/2, by2 = b.y + b.height/2;
+      const ix = Math.max(0, Math.min(ax2,bx2) - Math.max(ax1,bx1));
+      const iy = Math.max(0, Math.min(ay2,by2) - Math.max(ay1,by1));
+      const inter = ix * iy;
+      const union = a.width*a.height + b.width*b.height - inter;
+      return union > 0 ? inter/union : 0;
     }
 
-    // Filter tiny detections, dedup, sort left→right
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const sized = predictions.filter((p: any) => {
-      const w = p.bbox?.width ?? p.width ?? 0;
-      const h = p.bbox?.height ?? p.height ?? 0;
-      return w > vw * 0.04 && h > vh * 0.05;
-    });
+    const deduped: RoboflowPrediction[] = [];
+    for (const p of src.sort((a,b) => b.confidence - a.confidence)) {
+      if (!deduped.some(d => iou(d,p) > 0.5)) deduped.push(p);
+    }
+    deduped.sort((a,b) => a.x - b.x);
+    const leftPred  = deduped[0];
+    const rightPred = deduped.length >= 2 ? deduped[deduped.length - 1] : deduped[0];
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const deduped: any[] = [];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    for (const p of sized.sort((a: any, b: any) => (b.confidence ?? 0) - (a.confidence ?? 0))) {
-      const pb = predToBBox(p);
-      const dup = deduped.some(d => {
-        const db = predToBBox(d);
-        const ix = Math.max(0, Math.min(pb.maxX, db.maxX) - Math.max(pb.minX, db.minX));
-        const iy = Math.max(0, Math.min(pb.maxY, db.maxY) - Math.max(pb.minY, db.minY));
-        const inter = ix * iy;
-        const union = (pb.maxX-pb.minX)*(pb.maxY-pb.minY) + (db.maxX-db.minX)*(db.maxY-db.minY) - inter;
-        return union > 0 && inter/union > 0.4;
-      });
-      if (!dup) deduped.push(p);
+    function getBounds(p: RoboflowPrediction): BBox {
+      const xs = p.points?.length ? p.points.map(pt => pt.x) : [p.x - p.width/2, p.x + p.width/2];
+      const ys = p.points?.length ? p.points.map(pt => pt.y) : [p.y - p.height/2, p.y + p.height/2];
+      return { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) };
     }
 
-    if (deduped.length < 2) {
-      setIsCapturing(false);
-      onError(`Only ${deduped.length} shoe detected. Ensure both shoes are fully visible.`);
-      return;
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    deduped.sort((a: any, b: any) => (a.bbox?.x ?? a.x ?? 0) - (b.bbox?.x ?? b.x ?? 0));
-    const lb = predToBBox(deduped[0]);
-    const rb = predToBBox(deduped[deduped.length - 1]);
+    const lb = getBounds(leftPred);
+    const rb = getBounds(rightPred);
     const groundY = Math.max(lb.maxY, rb.maxY);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    function drawPred(pred: any, bounds: BBox, label: string) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const pts: { x: number; y: number }[] = pred.points ?? pred.segmentation_polygon ?? [];
-      ctx.beginPath();
-      if (pts.length >= 3) {
-        pts.forEach((pt, i) => { if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y); });
+    function drawPred(pred: RoboflowPrediction, bounds: BBox, label: string) {
+      if (pred.points && pred.points.length >= 3) {
+        ctx.beginPath();
+        pred.points.forEach((pt, i) => { if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y); });
         ctx.closePath();
       } else {
+        ctx.beginPath();
         ctx.rect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
       }
-      ctx.fillStyle   = `${GREEN}22`;
-      ctx.fill();
-      ctx.strokeStyle = GREEN;
-      ctx.lineWidth   = 3;
-      ctx.shadowColor = GREEN;
-      ctx.shadowBlur  = 14;
-      ctx.stroke();
-      ctx.shadowBlur  = 0;
+      ctx.fillStyle   = `${GREEN}20`; ctx.fill();
+      ctx.strokeStyle = GREEN; ctx.lineWidth = 3;
+      ctx.shadowColor = GREEN; ctx.shadowBlur = 12; ctx.stroke(); ctx.shadowBlur = 0;
 
       const hMm  = pxToMm(groundY - bounds.minY);
       const wMm  = pxToMm(bounds.maxX - bounds.minX);
@@ -237,14 +203,12 @@ export function CameraView({ onCapture, onError }: Props) {
       const hl = `${hMm}mm`;
       ctx.fillStyle = "rgba(0,0,0,0.85)";
       ctx.fillRect(rX - 2, midY - 12, ctx.measureText(hl).width + 10, 20);
-      ctx.fillStyle = GREEN; ctx.textAlign = "left";
-      ctx.fillText(hl, rX + 2, midY + 4);
+      ctx.fillStyle = GREEN; ctx.textAlign = "left"; ctx.fillText(hl, rX + 2, midY + 4);
 
       const wl = `${wMm}mm`;
       ctx.fillStyle = "rgba(0,0,0,0.85)";
       ctx.fillRect(midX - ctx.measureText(wl).width/2 - 4, Math.max(bounds.minY - 26, 0), ctx.measureText(wl).width + 8, 18);
-      ctx.fillStyle = GREEN; ctx.textAlign = "center";
-      ctx.fillText(wl, midX, Math.max(bounds.minY - 10, 14));
+      ctx.fillStyle = GREEN; ctx.textAlign = "center"; ctx.fillText(wl, midX, Math.max(bounds.minY - 10, 14));
 
       ctx.font = "bold 13px monospace";
       const bw = ctx.measureText(label).width + 14;
@@ -253,17 +217,17 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.fillStyle = "#000"; ctx.textAlign = "center";
       ctx.fillText(label, midX, Math.min(groundY + 19, vh - 8));
 
-      ctx.strokeStyle = `${GREEN}80`; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = `${GREEN}80`; ctx.lineWidth = 1; ctx.setLineDash([4,4]);
       ctx.beginPath(); ctx.moveTo(bounds.minX, groundY); ctx.lineTo(bounds.maxX, groundY); ctx.stroke();
       ctx.setLineDash([]);
 
       return { hMm, wMm };
     }
 
-    const L = drawPred(deduped[0],                   lb, "LEFT");
-    const R = drawPred(deduped[deduped.length - 1],  rb, "RIGHT");
+    const L = drawPred(leftPred,  lb, "LEFT");
+    const R = deduped.length >= 2 ? drawPred(rightPred, rb, "RIGHT") : L;
 
-    ctx.strokeStyle = `${CYAN}60`; ctx.lineWidth = 1; ctx.setLineDash([6, 6]);
+    ctx.strokeStyle = `${CYAN}60`; ctx.lineWidth = 1; ctx.setLineDash([6,6]);
     ctx.beginPath(); ctx.moveTo(vw/2, 0); ctx.lineTo(vw/2, vh); ctx.stroke();
     ctx.setLineDash([]);
 
@@ -276,10 +240,9 @@ export function CameraView({ onCapture, onError }: Props) {
     ctx.fillText(passed ? `PASSED  Δ${diff}mm` : `REJECTED  Δ${diff}mm  (>3mm)`, vw/2, vh - 16);
 
     ctx.font = "11px monospace"; ctx.fillStyle = "rgba(0,0,0,0.7)";
-    const stamp = `RF | L:${L.hMm}mm R:${R.hMm}mm`;
+    const stamp = `RF | L:${L.hMm}mm R:${R.hMm}mm | conf ${(leftPred.confidence*100).toFixed(0)}%`;
     ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
-    ctx.fillStyle = GREEN; ctx.textAlign = "left";
-    ctx.fillText(stamp, 9, 17);
+    ctx.fillStyle = GREEN; ctx.textAlign = "left"; ctx.fillText(stamp, 9, 17);
 
     try {
       const blob             = await compressImage(canvas, 0.9);
@@ -288,7 +251,7 @@ export function CameraView({ onCapture, onError }: Props) {
       onCapture({
         blob, dataUrl: annotatedDataUrl, annotatedDataUrl,
         leftHeightMm: L.hMm, rightHeightMm: R.hMm,
-        leftWidthMm:  L.wMm, rightWidthMm:  R.wMm,
+        leftWidthMm: L.wMm, rightWidthMm: R.wMm,
         heightDiffMm: diff, passed,
         rejectionReason: passed ? null : `Height difference ${diff}mm exceeds 3mm tolerance`,
       });
@@ -297,6 +260,7 @@ export function CameraView({ onCapture, onError }: Props) {
     } catch {
       onError("Failed to compress image");
       setIsCapturing(false);
+      setStatusMsg("");
     }
   }, [isCapturing, isAnalyzing, onCapture, onError]);
 
@@ -331,12 +295,11 @@ export function CameraView({ onCapture, onError }: Props) {
             style={{ background: "rgba(0,0,0,0.65)", backdropFilter: "blur(4px)" }}
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
-            <p className="text-base font-bold" style={{ color: CYAN }}>Detecting shoes…</p>
+            <p className="text-base font-bold" style={{ color: CYAN }}>Analyzing with Roboflow…</p>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Corner brackets */}
       {isReady && !isCapturing && (
         <div className="absolute inset-0 pointer-events-none">
           <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-30"
@@ -352,14 +315,11 @@ export function CameraView({ onCapture, onError }: Props) {
         </div>
       )}
 
-      {/* Status bar */}
       {isReady && !isCapturing && (
         <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
-          <div className="px-3 py-1.5 rounded-full text-xs font-semibold flex items-center gap-2"
+          <div className="px-3 py-1.5 rounded-full text-xs font-semibold"
             style={{ background: "rgba(0,0,0,0.8)", border: `1px solid ${CYAN}30`, color: "#ccc" }}>
-            <span className="w-2 h-2 rounded-full"
-              style={{ background: modelReady ? GREEN : modelLoading ? "#f59e0b" : RED, boxShadow: modelReady ? `0 0 6px ${GREEN}` : "none" }} />
-            {modelReady ? "AI Ready" : modelLoading ? "Loading model…" : "Model failed"}
+            Place both shoes side-by-side · tap capture
           </div>
         </div>
       )}
@@ -406,12 +366,9 @@ export function CameraView({ onCapture, onError }: Props) {
           )}
         </button>
         <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.5)" }}>
-          {isAnalyzing ? "detecting…" : isCapturing ? "processing…" : modelReady ? "tap to capture" : "loading…"}
+          {isAnalyzing ? "analyzing…" : isCapturing ? "processing…" : "tap to capture"}
         </span>
       </div>
-
-      {/* Unused import suppressor */}
-      <span className="hidden"><XCircle /></span>
     </div>
   );
 }

@@ -605,143 +605,142 @@ export function CameraView({ onCapture, onError }: Props) {
   }
 
   return (
-    <div className="relative w-full bg-black overflow-hidden flex flex-col">
-      {/* Camera viewport */}
-      <div className="relative w-full" style={{ aspectRatio: "16/9" }}>
-        <video ref={videoRef} className="absolute inset-0 w-full h-full object-cover" playsInline muted autoPlay />
-        <canvas ref={captureCanvasRef} className="hidden" />
+    <div className="relative w-full h-full bg-black overflow-hidden">
+      <video ref={videoRef} className="absolute inset-0 w-full h-full object-cover" playsInline muted autoPlay />
+      <canvas ref={captureCanvasRef} className="hidden" />
 
-        {!isReady && (
-          <div className="absolute inset-0 flex items-center justify-center" style={{ background: "#080810" }}>
-            <Loader2 className="w-8 h-8 animate-spin" style={{ color: CYAN }} />
-          </div>
+      {!isReady && (
+        <div className="absolute inset-0 flex items-center justify-center" style={{ background: "#080810" }}>
+          <Loader2 className="w-8 h-8 animate-spin" style={{ color: CYAN }} />
+        </div>
+      )}
+
+      <AnimatePresence>
+        {isAnalyzing && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="absolute inset-0 flex flex-col items-center justify-center z-30"
+            style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
+          >
+            <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
+            <p className="text-base font-bold" style={{ color: CYAN }}>Segmenting shoes...</p>
+          </motion.div>
         )}
+      </AnimatePresence>
 
-        <AnimatePresence>
-          {isAnalyzing && (
+      {/* Guide overlay */}
+      {isReady && !isCapturing && (
+        <div className="absolute inset-0 pointer-events-none">
+          <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-40"
+            style={{ background: `repeating-linear-gradient(to bottom, ${CYAN} 0px, ${CYAN} 8px, transparent 8px, transparent 16px)` }} />
+          <div className="absolute left-4 top-1/2 -translate-y-1/2">
+            <div className="px-3 py-1 rounded-full text-xs font-bold"
+              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
+              LEFT SHOE
+            </div>
+          </div>
+          <div className="absolute right-4 top-1/2 -translate-y-1/2">
+            <div className="px-3 py-1 rounded-full text-xs font-bold"
+              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
+              RIGHT SHOE
+            </div>
+          </div>
+          <div className="absolute top-8 left-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
+          <div className="absolute top-8 right-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
+          <div className="absolute bottom-24 left-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
+          <div className="absolute bottom-24 right-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
+        </div>
+      )}
+
+      {isReady && !isCapturing && (
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
+          <div className="px-4 py-1.5 rounded-full text-xs font-semibold text-center whitespace-nowrap"
+            style={{ background: "rgba(0,0,0,0.75)", border: `1px solid ${CYAN}40`, color: "#ccc" }}>
+            One shoe each side · landscape · tap capture
+          </div>
+        </div>
+      )}
+
+      <AnimatePresence>
+        {showSuccess && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="absolute inset-0 flex items-center justify-center z-20"
+            style={{ background: "rgba(0,0,0,0.4)", backdropFilter: "blur(2px)" }}
+          >
             <motion.div
-              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-              className="absolute inset-0 flex flex-col items-center justify-center z-30"
-              style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" }}
+              initial={{ scale: 0.5, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 1.2, opacity: 0 }}
+              className="w-20 h-20 rounded-full flex items-center justify-center"
+              style={{ background: "rgba(34,197,94,0.2)", border: `2px solid ${GREEN}`, boxShadow: `0 0 32px ${GREEN}80` }}
             >
-              <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
-              <p className="text-base font-bold" style={{ color: CYAN }}>Segmenting shoes...</p>
+              <CheckCircle2 className="w-10 h-10" style={{ color: GREEN }} />
             </motion.div>
-          )}
-        </AnimatePresence>
-
-        {isReady && !isCapturing && (
-          <div className="absolute inset-0 pointer-events-none">
-            <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-40"
-              style={{ background: `repeating-linear-gradient(to bottom, ${CYAN} 0px, ${CYAN} 8px, transparent 8px, transparent 16px)` }} />
-            <div className="absolute left-4 top-1/2 -translate-y-1/2">
-              <div className="px-3 py-1 rounded-full text-xs font-bold"
-                style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-                LEFT SHOE
-              </div>
-            </div>
-            <div className="absolute right-4 top-1/2 -translate-y-1/2">
-              <div className="px-3 py-1 rounded-full text-xs font-bold"
-                style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>
-                RIGHT SHOE
-              </div>
-            </div>
-            <div className="absolute top-8 left-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
-            <div className="absolute top-8 right-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
-            <div className="absolute bottom-8 left-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
-            <div className="absolute bottom-8 right-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
-          </div>
+          </motion.div>
         )}
+      </AnimatePresence>
 
-        {isReady && !isCapturing && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10">
-            <div className="px-4 py-1.5 rounded-full text-xs font-semibold text-center whitespace-nowrap"
-              style={{ background: "rgba(0,0,0,0.75)", border: `1px solid ${CYAN}40`, color: "#ccc" }}>
-              One shoe each side · landscape · tap capture
-            </div>
-          </div>
-        )}
-
-        <AnimatePresence>
-          {showSuccess && (
-            <motion.div
-              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-              className="absolute inset-0 flex items-center justify-center z-20"
-              style={{ background: "rgba(0,0,0,0.4)", backdropFilter: "blur(2px)" }}
-            >
-              <motion.div
-                initial={{ scale: 0.5, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 1.2, opacity: 0 }}
-                className="w-20 h-20 rounded-full flex items-center justify-center"
-                style={{ background: "rgba(34,197,94,0.2)", border: `2px solid ${GREEN}`, boxShadow: `0 0 32px ${GREEN}80` }}
-              >
-                <CheckCircle2 className="w-10 h-10" style={{ color: GREEN }} />
-              </motion.div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
-
-      {/* Debug panel — shown when debugMode ON and capture taken */}
+      {/* Debug panel — slides up from bottom as overlay */}
       <AnimatePresence>
         {showDebug && debugMode && (
           <motion.div
-            initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}
-            className="overflow-hidden"
-            style={{ background: "#0a0a12", borderTop: "1px solid rgba(255,255,255,0.08)" }}
+            initial={{ opacity: 0, y: 80 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 80 }}
+            className="absolute left-0 right-0 bottom-28 z-20 mx-3 rounded-2xl overflow-hidden"
+            style={{ background: "rgba(10,10,18,0.96)", border: "1px solid rgba(255,255,255,0.1)", backdropFilter: "blur(8px)" }}
           >
             <div className="px-3 py-2">
               <p className="text-xs font-bold mb-2" style={{ color: YELLOW }}>DEBUG: Segmentation Masks</p>
               <canvas
                 ref={debugCanvasRef}
                 className="w-full rounded"
-                style={{ imageRendering: "pixelated", border: `1px solid rgba(255,255,255,0.1)` }}
+                style={{ imageRendering: "pixelated", border: `1px solid rgba(255,255,255,0.08)` }}
               />
-              <div className="flex gap-4 mt-1.5 text-xs" style={{ color: "#555" }}>
-                <span style={{ color: "#00c8ff" }}>■ Raw foreground mask</span>
-                <span style={{ color: "#00ff78" }}>■ Shoe-only (largest blob)</span>
+              <div className="flex gap-4 mt-1.5 pb-1 text-xs" style={{ color: "#555" }}>
+                <span style={{ color: "#00c8ff" }}>■ Raw mask</span>
+                <span style={{ color: "#00ff78" }}>■ Shoe only</span>
               </div>
             </div>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Controls */}
-      <div className="flex items-center justify-between px-6 py-4" style={{ background: "#080810" }}>
+      {/* Bottom controls — always visible, absolutely pinned */}
+      <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center justify-between px-6 pb-6 pt-3"
+        style={{ background: "linear-gradient(to top, rgba(0,0,0,0.75) 0%, transparent 100%)" }}>
+
         {/* Debug toggle */}
         <button
           onClick={() => { setDebugMode(d => !d); setShowDebug(false); }}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold transition-colors"
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold"
           style={{
-            background: debugMode ? `${YELLOW}22` : "rgba(255,255,255,0.04)",
-            border: `1px solid ${debugMode ? YELLOW : "rgba(255,255,255,0.1)"}`,
-            color: debugMode ? YELLOW : "#555",
+            background: debugMode ? `${YELLOW}30` : "rgba(0,0,0,0.5)",
+            border: `1px solid ${debugMode ? YELLOW : "rgba(255,255,255,0.15)"}`,
+            color: debugMode ? YELLOW : "rgba(255,255,255,0.4)",
           }}
         >
           <Bug className="w-3.5 h-3.5" />
           {debugMode ? "Debug ON" : "Debug"}
         </button>
 
-        {/* Capture button */}
-        <button
-          onClick={handleCapture}
-          disabled={!isReady || isCapturing || isAnalyzing}
-          className="relative w-20 h-20 rounded-full flex items-center justify-center transition-transform active:scale-90 disabled:opacity-40"
-          style={{ border: "4px solid rgba(255,255,255,0.85)", background: "rgba(255,255,255,0.12)", backdropFilter: "blur(4px)" }}
-        >
-          <Camera className="w-8 h-8 text-white" />
-          {(isCapturing || isAnalyzing) && (
-            <div className="absolute inset-0 rounded-full border-4 border-cyan-400 animate-ping" />
-          )}
-        </button>
+        {/* Capture button — centre */}
+        <div className="flex flex-col items-center gap-1">
+          <button
+            onClick={handleCapture}
+            disabled={!isReady || isCapturing || isAnalyzing}
+            className="relative w-20 h-20 rounded-full flex items-center justify-center transition-transform active:scale-90 disabled:opacity-40"
+            style={{ border: "4px solid rgba(255,255,255,0.85)", background: "rgba(255,255,255,0.15)", backdropFilter: "blur(4px)" }}
+          >
+            <Camera className="w-8 h-8 text-white" />
+            {(isCapturing || isAnalyzing) && (
+              <div className="absolute inset-0 rounded-full border-4 border-cyan-400 animate-ping" />
+            )}
+          </button>
+          <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.45)" }}>
+            {isAnalyzing ? "segmenting…" : isCapturing ? "processing…" : "tap to capture"}
+          </span>
+        </div>
 
-        {/* Spacer to balance layout */}
+        {/* Spacer */}
         <div className="w-16" />
-      </div>
-
-      <div className="text-center pb-3">
-        <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.3)" }}>
-          {isAnalyzing ? "segmenting..." : isCapturing ? "processing..." : "tap to capture"}
-        </span>
       </div>
     </div>
   );

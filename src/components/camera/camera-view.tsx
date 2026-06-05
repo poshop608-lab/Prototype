@@ -48,34 +48,16 @@ const ERROR_MAP: Record<ErrorType, SmartError> = {
   network:        { type: "network",       title: "Network error",                 fix: "Check internet connection and try again",                  icon: "alert" },
 };
 
-declare global {
-  interface Window {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    InferenceEngine: any;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    CVImage: any;
-    _rfEngineReady: boolean;
-  }
-}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _inferenceModule: any = null;
 
-function loadInferencejs(): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (window._rfEngineReady) { resolve(); return; }
-    const existing = document.getElementById("inferencejs-cdn");
-    if (existing) {
-      const onLoad = () => resolve();
-      const onErr  = () => reject(new Error("CDN load failed"));
-      existing.addEventListener("load", onLoad, { once: true });
-      existing.addEventListener("error", onErr, { once: true });
-      return;
-    }
-    const s = document.createElement("script");
-    s.id = "inferencejs-cdn";
-    s.src = "https://cdn.jsdelivr.net/npm/inferencejs@1.2.3/dist/inference.js";
-    s.onload  = () => { window._rfEngineReady = true; resolve(); };
-    s.onerror = () => reject(new Error("CDN load failed"));
-    document.head.appendChild(s);
-  });
+async function loadInferencejs() {
+  if (_inferenceModule) return _inferenceModule;
+  // Dynamic ESM import from CDN — works in all modern browsers
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mod = await (Function('return import("https://cdn.jsdelivr.net/npm/inferencejs@1.2.3/dist/inference.es.js")')() as Promise<any>);
+  _inferenceModule = mod;
+  return mod;
 }
 
 // Measure average luminance of frame — detect too-dark images
@@ -252,8 +234,8 @@ export function CameraView({ onCapture, onError }: Props) {
       setModelLoading(true);
       setStatusMsg("Loading AI model (~6MB)…");
       try {
-        await loadInferencejs();
-        const engine = new window.InferenceEngine();
+        const mod = await loadInferencejs();
+        const engine = new mod.InferenceEngine();
         engineRef.current = engine;
         const workerId = await engine.startWorker(MODEL_ID, MODEL_VER, PUB_KEY);
         workerRef.current = workerId;
@@ -291,8 +273,8 @@ export function CameraView({ onCapture, onError }: Props) {
     if (!workerRef.current) {
       setStatusMsg("Loading AI model…");
       try {
-        await loadInferencejs();
-        const engine = new window.InferenceEngine();
+        const mod2 = await loadInferencejs();
+        const engine = new mod2.InferenceEngine();
         engineRef.current = engine;
         workerRef.current = await engine.startWorker(MODEL_ID, MODEL_VER, PUB_KEY);
         setModelReady(true);
@@ -319,7 +301,8 @@ export function CameraView({ onCapture, onError }: Props) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let predictions: any[] = [];
     try {
-      const img    = new window.CVImage(canvas);
+      const mod3   = await loadInferencejs();
+      const img    = new mod3.CVImage(canvas);
       const result = await engineRef.current.infer(workerRef.current, img);
       predictions  = Array.isArray(result) ? result : (result?.predictions ?? []);
       console.log("[inferencejs]", predictions.length, "predictions");

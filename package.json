@@ -31,6 +31,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "framer-motion": "^12.38.0",
+    "inferencejs": "^1.2.3",
     "lucide-react": "^1.14.0",
     "next": "16.2.6",
     "react": "19.2.4",
@@ -38,6 +39,9 @@
     "tailwind-merge": "^3.6.0",
     "tailwindcss-animate": "^1.0.7",
     "zustand": "^5.0.13"
+  },
+  "overrides": {
+    "@rollup/rollup-linux-arm64-gnu": "npm:@rollup/rollup-linux-x64-gnu@^4.0.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

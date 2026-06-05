@@ -24,8 +24,7 @@ interface Props {
 let _mod: any = null;
 async function loadRF() {
   if (_mod) return _mod;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  _mod = await (Function('return import("https://cdn.jsdelivr.net/npm/inferencejs@1.2.3/dist/inference.es.js")')() as Promise<any>);
+  _mod = await import("inferencejs");
   return _mod;
 }
 

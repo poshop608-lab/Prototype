@@ -2,8 +2,8 @@
 
 import { useRef, useEffect, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckCircle2, Loader2, RotateCcw, Camera, AlertTriangle, Info, X } from "lucide-react";
-import { pxToMm, compressImage } from "@/lib/utils";
+import { CheckCircle2, Loader2, RotateCcw, Camera, AlertTriangle, Info, X, Ruler } from "lucide-react";
+import { pxToMm, compressImage, getCalibration, setCalibration, CALIBRATION_CARD_MM } from "@/lib/utils";
 import type { CaptureResult } from "@/store/scan";
 
 const CYAN   = "#06b6d4";
@@ -110,7 +110,10 @@ export function CameraView({ onCapture, onError }: Props) {
   const [isPortrait,   setIsPortrait]   = useState(false);
   const [statusMsg,    setStatusMsg]    = useState("");
   const [smartError,   setSmartError]   = useState<SmartError | null>(null);
-  const [showGuide,    setShowGuide]    = useState(true); // placement guide overlay
+  const [showGuide,    setShowGuide]    = useState(true);
+  const [calibMode,    setCalibMode]    = useState(false);   // credit card calibration mode
+  const [calibPxMm,    setCalibPxMm]    = useState<number | null>(null); // detected px/mm
+  const [calibSaved,   setCalibSaved]   = useState(false);
 
   // portrait detection
   useEffect(() => {
@@ -188,6 +191,48 @@ export function CameraView({ onCapture, onError }: Props) {
     setSmartError(null);
     setShowGuide(false);
     setIsCapturing(true);
+
+    // ── Calibration mode: detect credit card width ───────────────────────
+    if (calibMode) {
+      const vw2 = videoRef.current!.videoWidth  || 1280;
+      const vh2 = videoRef.current!.videoHeight || 720;
+      captureCanvasRef.current!.width  = vw2;
+      captureCanvasRef.current!.height = vh2;
+      const ctx2 = captureCanvasRef.current!.getContext("2d")!;
+      ctx2.drawImage(videoRef.current!, 0, 0, vw2, vh2);
+
+      // Sample center strip for a bright rectangular object (credit card = white/light)
+      // Look for widest contiguous bright region in center horizontal strip
+      const s2 = 0.25;
+      const tw2 = Math.round(vw2 * s2), th2 = Math.round(vh2 * s2);
+      const cc = document.createElement("canvas"); cc.width = tw2; cc.height = th2;
+      const tc = cc.getContext("2d", { willReadFrequently: true })!;
+      tc.drawImage(captureCanvasRef.current!, 0, 0, tw2, th2);
+      const { data: d2 } = tc.getImageData(0, 0, tw2, th2);
+
+      // Scan center row for brightest object extent
+      const midY = Math.round(th2 * 0.5);
+      let cardL = -1, cardR = -1;
+      // Find leftmost and rightmost bright pixel in center row
+      for (let x = 0; x < tw2; x++) {
+        const i2 = (midY * tw2 + x) * 4;
+        const lum2 = 0.299 * d2[i2] + 0.587 * d2[i2+1] + 0.114 * d2[i2+2];
+        if (lum2 > 160) { // bright = card (white/light-coloured)
+          if (cardL === -1) cardL = x;
+          cardR = x;
+        }
+      }
+
+      if (cardL >= 0 && cardR > cardL && (cardR - cardL) > tw2 * 0.1) {
+        const cardWidthPx = (cardR - cardL) / s2; // back to full res
+        const newPxMm = cardWidthPx / CALIBRATION_CARD_MM;
+        setCalibPxMm(newPxMm);
+      } else {
+        setCalibPxMm(null);
+      }
+      setIsCapturing(false);
+      return;
+    }
 
     // on-demand model load if eager load failed
     if (!workerRef.current) {
@@ -620,6 +665,11 @@ export function CameraView({ onCapture, onError }: Props) {
               Show guide
             </button>
           )}
+          <button onClick={() => { setCalibMode(true); setCalibPxMm(null); setSmartError(null); }}
+            className="px-2 py-1.5 rounded-full text-xs flex items-center gap-1"
+            style={{ background: "rgba(0,0,0,0.7)", border: `1px solid ${AMBER}40`, color: AMBER }}>
+            <Ruler className="w-3 h-3" />Calibrate
+          </button>
         </div>
       )}
 
@@ -646,6 +696,97 @@ export function CameraView({ onCapture, onError }: Props) {
             >
               <CheckCircle2 className="w-10 h-10" style={{ color: GREEN }} />
             </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Calibration overlay ─────────────────────────────────────────── */}
+      <AnimatePresence>
+        {calibMode && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="absolute inset-0 z-40 flex flex-col items-center justify-center"
+            style={{ background: "rgba(0,0,0,0.75)", backdropFilter: "blur(4px)" }}
+          >
+            {calibPxMm === null ? (
+              // Instruction
+              <div className="px-6 py-5 rounded-2xl mx-4 max-w-sm w-full"
+                style={{ background: "rgba(10,10,20,0.95)", border: `1px solid ${CYAN}40` }}>
+                <div className="flex items-center gap-2 mb-3">
+                  <Ruler className="w-5 h-5" style={{ color: CYAN }} />
+                  <p className="font-bold text-white">Camera Calibration</p>
+                  <button className="ml-auto" onClick={() => setCalibMode(false)}>
+                    <X className="w-4 h-4" style={{ color: "#555" }} />
+                  </button>
+                </div>
+                <div className="rounded-xl p-3 mb-4 text-center"
+                  style={{ background: "rgba(6,182,212,0.08)", border: `1px solid ${CYAN}30` }}>
+                  <div className="text-4xl mb-1">💳</div>
+                  <p className="text-xs font-bold" style={{ color: CYAN }}>Credit Card = 85.6mm wide</p>
+                  <p className="text-[11px] mt-1" style={{ color: "#888" }}>Place card flat, landscape, filling the WIDTH of frame</p>
+                </div>
+                <div className="space-y-2 mb-4">
+                  {["Place card on flat surface same as shoes", "Camera same height you use for scanning", "Card should span most of the frame width", "Tap CAPTURE when card is centered"].map((t, i) => (
+                    <div key={i} className="flex items-start gap-2">
+                      <span className="w-4 h-4 rounded-full flex-shrink-0 flex items-center justify-center text-[9px] font-bold mt-0.5"
+                        style={{ background: `${CYAN}25`, color: CYAN }}>{i+1}</span>
+                      <p className="text-[11px]" style={{ color: "#ccc" }}>{t}</p>
+                    </div>
+                  ))}
+                </div>
+                <button onClick={handleCapture}
+                  className="w-full py-2.5 rounded-xl text-sm font-bold"
+                  style={{ background: CYAN, color: "#000" }}>
+                  Capture Card
+                </button>
+              </div>
+            ) : (
+              // Result
+              <div className="px-6 py-5 rounded-2xl mx-4 max-w-sm w-full"
+                style={{ background: "rgba(10,10,20,0.95)", border: `1px solid ${GREEN}40` }}>
+                <div className="flex items-center gap-2 mb-3">
+                  <Ruler className="w-5 h-5" style={{ color: GREEN }} />
+                  <p className="font-bold text-white">Calibration Result</p>
+                </div>
+                <div className="rounded-xl p-3 mb-4 text-center"
+                  style={{ background: "rgba(34,197,94,0.08)", border: `1px solid ${GREEN}30` }}>
+                  <p className="text-2xl font-black" style={{ color: GREEN }}>{calibPxMm.toFixed(2)} px/mm</p>
+                  <p className="text-xs mt-1" style={{ color: "#888" }}>Detected card width → {(CALIBRATION_CARD_MM).toFixed(1)}mm reference</p>
+                  <p className="text-xs mt-0.5" style={{ color: "#666" }}>
+                    Was: {getCalibration().toFixed(2)} px/mm → Now: {calibPxMm.toFixed(2)} px/mm
+                  </p>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => { setCalibPxMm(null); }}
+                    className="flex-1 py-2 rounded-xl text-xs font-semibold"
+                    style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", color: "#888" }}>
+                    Retake
+                  </button>
+                  <button onClick={() => {
+                    setCalibration(calibPxMm);
+                    setCalibSaved(true);
+                    setCalibMode(false);
+                    setCalibPxMm(null);
+                    setTimeout(() => setCalibSaved(false), 3000);
+                  }}
+                    className="flex-[2] py-2 rounded-xl text-xs font-bold"
+                    style={{ background: GREEN, color: "#000" }}>
+                    Save Calibration ✓
+                  </button>
+                </div>
+              </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Calibration saved toast */}
+      <AnimatePresence>
+        {calibSaved && (
+          <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+            className="absolute top-14 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-full text-xs font-bold"
+            style={{ background: GREEN, color: "#000" }}>
+            ✓ Calibration saved — measurements now accurate
           </motion.div>
         )}
       </AnimatePresence>

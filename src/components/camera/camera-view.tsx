@@ -128,26 +128,48 @@ function analyzeShoe(
   const heelOnLeft = leftSole >= rightSole;
   const hzX0 = heelOnLeft ? minX : maxX - heelZoneW;
   const hzX1 = heelOnLeft ? minX + heelZoneW : maxX;
+  const hzMidX = Math.round((hzX0 + hzX1) / 2);
 
-  // Scan heel zone for topmost and bottommost shoe pixels
-  let hMinY = h, hMaxY = 0, heelRowsFilled = 0;
+  // Build per-row pixel count within heel column (used for gap detection)
+  const heelRowCount = new Int32Array(h);
   for (let y = minY; y <= maxY; y++) {
-    let has = false;
+    let cnt = 0;
     for (let x = hzX0; x <= hzX1; x++) {
-      if (mask[y * w + x]) {
-        if (y < hMinY) hMinY = y;
-        if (y > hMaxY) hMaxY = y;
-        has = true;
-      }
+      if (mask[y * w + x]) cnt++;
     }
-    if (has) heelRowsFilled++;
+    heelRowCount[y] = cnt;
   }
 
-  const heelValid = heelRowsFilled > shoeH * 0.40 && (hMaxY - hMinY) > shoeH * 0.30;
-  const hzMidX = Math.round((hzX0 + hzX1) / 2);
+  // hMaxY = outsole bottom: last row (scanning down) with heel pixels
+  let hMaxY = -1;
+  for (let y = maxY; y >= minY; y--) {
+    if (heelRowCount[y] > 0) { hMaxY = y; break; }
+  }
+
+  // Heel collar top (hMinY):
+  // Scan upward from outsole bottom. Find the first row where heel pixel
+  // density drops below 15% of heel zone width → that row is above the
+  // outsole/midsole stack = the heel collar opening top.
+  // Minimum heel height cap: at least 8% of shoe height (avoids noise).
+  const minHeelH = Math.round(shoeH * 0.08);
+  const densityThresh = (hzX1 - hzX0) * 0.15;
+  let hMinY = hMaxY - minHeelH; // fallback: minimum cap
+
+  if (hMaxY > 0) {
+    for (let y = hMaxY - minHeelH; y >= minY; y--) {
+      if (heelRowCount[y] < densityThresh) {
+        hMinY = y + 1; // row just below the gap = collar top
+        break;
+      }
+      hMinY = y;
+    }
+  }
+
+  const heelHeightPx = hMaxY - hMinY;
+  // Valid if outsole found and heel height is reasonable (5%–60% of shoe height)
+  const heelValid = hMaxY > 0 && heelHeightPx > shoeH * 0.05 && heelHeightPx < shoeH * 0.60;
   const heelTopPt: Pt = { x: hzMidX, y: hMinY };
   const heelBotPt: Pt = { x: hzMidX, y: hMaxY };
-  const heelHeightPx = hMaxY - hMinY;
   const heelBBox: BBox = { minX: hzX0, maxX: hzX1, minY: hMinY, maxY: hMaxY };
 
   return {

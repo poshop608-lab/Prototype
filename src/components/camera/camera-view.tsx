@@ -74,7 +74,7 @@ function analyzeShoe(
   // Confidence gate
   if (iouScore > 0 && iouScore < 0.6) return invalid(`Low SAM confidence (${iouScore.toFixed(2)})`);
 
-  // Compute bounding box from mask
+  // ── Step 1: Bounding box from mask pixels only ──────────────────────────
   let minX = toX, maxX = fromX, minY = h, maxY = 0;
   let pixelCount = 0;
   for (let y = 0; y < h; y++) {
@@ -85,19 +85,32 @@ function analyzeShoe(
       if (y < minY) minY = y; if (y > maxY) maxY = y;
     }
   }
-
   if (pixelCount === 0) return invalid("No shoe pixels detected");
 
   const shoeW = maxX - minX, shoeH = maxY - minY;
 
-  // Reject tiny detections
   if (shoeW < (toX - fromX) * 0.1) return invalid("Shoe too narrow — move camera closer");
   if (shoeH < h * 0.05) return invalid("Shoe too short — check alignment");
-
-  // Reject if shoe is partially outside frame
   if (minX <= fromX + 2 || maxX >= toX - 2) return invalid("Shoe partially cropped — move camera back");
 
-  // Contour: row-by-row left/right edges
+  // ── Step 2: Per-column contour profiles ────────────────────────────────
+  // For each X column, find:
+  //   topEdge[x]  = Y of topmost mask pixel  (top silhouette)
+  //   botEdge[x]  = Y of bottommost mask pixel (bottom silhouette)
+  // These are indexed by absolute x (0..w).
+  // Only mask pixels count — background cannot enter these arrays.
+  const topEdge = new Int32Array(w).fill(-1);
+  const botEdge = new Int32Array(w).fill(-1);
+
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = fromX; x < toX; x++) {
+      if (!mask[y * w + x]) continue;
+      if (topEdge[x] < 0 || y < topEdge[x]) topEdge[x] = y;
+      if (botEdge[x] < 0 || y > botEdge[x]) botEdge[x] = y;
+    }
+  }
+
+  // Row-by-row left/right edges for contour drawing
   const leftEdge: Pt[] = [], rightEdge: Pt[] = [];
   for (let y = minY; y <= maxY; y++) {
     let lx = toX, rx = fromX - 1;
@@ -107,21 +120,20 @@ function analyzeShoe(
     if (rx >= lx) { leftEdge.push({ x: lx, y }); rightEdge.push({ x: rx, y }); }
   }
   const contourPts: Pt[] = [...leftEdge, ...[...rightEdge].reverse()];
-
   const bbox: BBox = { minX, maxX, minY, maxY };
 
-  // ── Heel detection ──────────────────────────────────────────────────────
-  // Step 1: Which end is the heel?
-  // Measure shoe mask "fullness" in bottom 25% of shoe height at each end.
-  // The heel end has a more vertical rear wall → denser bottom pixels.
-  const soleYStart = maxY - Math.round(shoeH * 0.25);
+  // ── Step 3: Identify heel end ───────────────────────────────────────────
+  // The heel has a more vertical rear wall than the toe.
+  // Measure how many mask pixels are in the bottom 20% of shoe height
+  // at each end (rear 20% of width). Denser side = heel.
   const heelZoneW = Math.round(shoeW * HEEL_FRAC);
+  const soleCheckTop = maxY - Math.round(shoeH * 0.20);
 
   let leftSole = 0, rightSole = 0;
-  for (let y = soleYStart; y <= maxY; y++) {
+  for (let y = soleCheckTop; y <= maxY; y++) {
     for (let x = minX; x < minX + heelZoneW; x++)
       if (mask[y * w + x]) leftSole++;
-    for (let x = maxX - heelZoneW; x <= maxX; x++)
+    for (let x = maxX - heelZoneW + 1; x <= maxX; x++)
       if (mask[y * w + x]) rightSole++;
   }
 
@@ -130,59 +142,111 @@ function analyzeShoe(
   const hzX1 = heelOnLeft ? minX + heelZoneW : maxX;
   const hzMidX = Math.round((hzX0 + hzX1) / 2);
 
-  // Step 2: hMaxY = sole baseline under heel.
-  // Scan from image bottom up within heel X zone; first row with mask pixels.
-  // We use the OUTER contour edge (left or right edge array) restricted to
-  // the heel zone so background pixels outside the mask cannot contribute.
+  // ── Step 4: hMaxY — outsole contact line ───────────────────────────────
+  // The bottommost mask pixel in the heel X zone, restricted to mask only.
+  // botEdge[] already holds bottommost Y per column from mask pixels.
   let hMaxY = -1;
-  for (let y = maxY; y >= minY; y--) {
-    for (let x = hzX0; x <= hzX1; x++) {
-      if (mask[y * w + x]) { hMaxY = y; break; }
-    }
-    if (hMaxY >= 0) break;
+  for (let x = hzX0; x <= hzX1; x++) {
+    if (botEdge[x] > hMaxY) hMaxY = botEdge[x];
   }
-  if (hMaxY < 0) return invalid("Cannot find sole baseline in heel zone");
+  if (hMaxY < 0) return invalid("Cannot find outsole in heel zone");
 
-  // Step 3: hMinY = heel collar top.
+  // ── Step 5: hMinY — heel block top (welt line / insole junction) ────────
   //
-  // On a side-view shoe image, the top silhouette DIPS downward at the heel
-  // collar (ankle opening). This creates a valley in the per-column top-edge
-  // profile: toe-box and vamp are high (low Y), then the collar dips (high Y).
+  // FUNDAMENTAL INSIGHT: We are NOT measuring the heel collar of the upper.
+  // We are measuring the HEEL BLOCK HEIGHT = the outsole + heel stack thickness.
   //
-  // Algorithm: for each X column in the heel zone, find the topmost mask pixel
-  // (min Y per column = top silhouette). Then take the MAX of these min-Y values
-  // within the heel X zone — that maximum = the deepest dip = collar top.
+  // On a side-view shoe photo the heel block is visible as a rectangular
+  // block at the bottom-rear. Its top edge = where the heel block meets the
+  // shoe upper (welt line). This is NOT at the top of the shoe — it is
+  // roughly 10–20% of shoe height from the bottom.
   //
-  // Only search within the inner portion of the heel zone (avoid outer 10%
-  // which may be the rounded rear wall, not the collar opening).
-  const innerHzX0 = hzX0 + Math.round((hzX1 - hzX0) * 0.10);
-  const innerHzX1 = hzX1 - Math.round((hzX1 - hzX0) * 0.10);
-  let hMinY = minY; // will be overridden
+  // Detection method: use the REAR-FACE contour of the heel zone.
+  // The rear face is the outermost X edge at the heel end:
+  //   heelOnLeft  → the LEFT contour edge (leftEdge array, x ≈ minX)
+  //   heelOnRight → the RIGHT contour edge (rightEdge array, x ≈ maxX)
+  //
+  // Scan this rear-face edge from hMaxY UPWARD. The heel block sidewall
+  // is nearly vertical (constant X). When the edge X position moves inward
+  // by more than INSET_THRESHOLD pixels over a short window, that is the
+  // welt/insole junction — the top of the heel block.
+  //
+  // If the rear edge never inflects (very upright heel), fall back to
+  // botEdge-based approach using the bottom-most N% of the shoe height.
 
-  for (let x = innerHzX0; x <= innerHzX1; x++) {
-    // Find topmost mask pixel in this column
-    for (let y = minY; y <= hMaxY; y++) {
-      if (mask[y * w + x]) {
-        // Track maximum Y across columns (deepest dip in top silhouette)
-        if (y > hMinY) hMinY = y;
-        break;
+  // Build rear-face edge: for each row y in [minY..hMaxY],
+  // the outermost X in the heel zone.
+  const rearEdgeX: Map<number, number> = new Map();
+  for (let y = minY; y <= hMaxY; y++) {
+    if (heelOnLeft) {
+      // Leftmost mask pixel in heel zone = rear face
+      for (let x = hzX0; x <= hzX1; x++) {
+        if (mask[y * w + x]) { rearEdgeX.set(y, x); break; }
+      }
+    } else {
+      // Rightmost mask pixel in heel zone = rear face
+      for (let x = hzX1; x >= hzX0; x--) {
+        if (mask[y * w + x]) { rearEdgeX.set(y, x); break; }
       }
     }
   }
 
-  const heelHeightPx = hMaxY - hMinY;
+  // Scan upward from hMaxY, detect where rear edge inflects inward.
+  // Use a 5-row sliding window to smooth noise.
+  // Inflection = edge moves inward > INSET_THRESHOLD px per WINDOW rows.
+  const INSET_THRESHOLD = Math.round(shoeW * 0.025); // 2.5% of shoe width
+  const WINDOW = 5;
+  let hMinY = -1;
 
-  // Validity: heel height must be 4%–45% of full shoe height.
-  // A formal shoe heel is ~30–80mm; full shoe height ~250–320mm
-  // so heel/shoe ratio is ~10–30%. Cap at 45% to catch gross errors.
-  const heelValid =
-    hMaxY > 0 &&
-    heelHeightPx > shoeH * 0.04 &&
-    heelHeightPx < shoeH * 0.45;
+  // Collect rows that have a rear edge value, sorted bottom-up
+  const rows: number[] = [];
+  for (let y = hMaxY; y >= minY; y--) {
+    if (rearEdgeX.has(y)) rows.push(y);
+  }
+
+  // Smooth: 5-row rolling average of edge X
+  function avgEdgeX(centerY: number): number {
+    let sum = 0, cnt = 0;
+    for (let dy = -Math.floor(WINDOW / 2); dy <= Math.floor(WINDOW / 2); dy++) {
+      const ex = rearEdgeX.get(centerY + dy);
+      if (ex !== undefined) { sum += ex; cnt++; }
+    }
+    return cnt > 0 ? sum / cnt : -1;
+  }
+
+  for (let i = WINDOW; i < rows.length - WINDOW; i++) {
+    const yLow  = rows[i - WINDOW]; // closer to sole
+    const yHigh = rows[i];          // higher up
+    const xLow  = avgEdgeX(yLow);
+    const xHigh = avgEdgeX(yHigh);
+    if (xLow < 0 || xHigh < 0) continue;
+
+    // inward movement: heel-on-left means x increases inward, heel-on-right means x decreases
+    const inwardMove = heelOnLeft ? (xHigh - xLow) : (xLow - xHigh);
+    if (inwardMove > INSET_THRESHOLD) {
+      hMinY = yHigh;
+      break;
+    }
+  }
+
+  // Fallback: if no clear inflection found, use bottom 18% of shoe height
+  // as the heel block (typical for dress shoe: heel ≈ 30mm / shoe ≈ 280mm ≈ 11%)
+  if (hMinY < 0) {
+    hMinY = hMaxY - Math.round(shoeH * 0.18);
+  }
+
+  // Clamp: heel block cannot be taller than 35% of shoe height
+  const maxHeelH = Math.round(shoeH * 0.35);
+  if (hMaxY - hMinY > maxHeelH) hMinY = hMaxY - maxHeelH;
+
+  // ── Step 6: Validate & return ───────────────────────────────────────────
+  const heelHeightPx = hMaxY - hMinY;
+  // Sanity: heel block 3%–35% of full shoe height
+  const heelValid = heelHeightPx > shoeH * 0.03 && heelHeightPx < shoeH * 0.35;
 
   const heelTopPt: Pt = { x: hzMidX, y: hMinY };
   const heelBotPt: Pt = { x: hzMidX, y: hMaxY };
-  const heelBBox: BBox = { minX: hzX0, maxX: hzX1, minY: hMinY, maxY: hMaxY };
+  const heelBBox:  BBox = { minX: hzX0, maxX: hzX1, minY: hMinY, maxY: hMaxY };
 
   return {
     valid: true,
@@ -325,12 +389,21 @@ function drawAnnotations(
     // Debug extras
     if (debugMode) {
       const DOT = Math.max(7, vw * 0.005);
+      // Magenta dot = welt line (hMinY) — heel block top
       ctx.fillStyle = MAGENTA;
       ctx.beginPath(); ctx.arc(heelTopPt.x, topY, DOT, 0, Math.PI * 2); ctx.fill();
+      // Cyan dot = outsole contact (hMaxY)
       ctx.fillStyle = CYAN;
       ctx.beginPath(); ctx.arc(heelBotPt.x, botY, DOT, 0, Math.PI * 2); ctx.fill();
-      pill(`${heelHeightPx}px`, (hz.minX + hz.maxX) / 2, heelMidY, "rgba(0,0,0,0.88)", MAGENTA);
-      pill(`IoU:${sa.iouScore.toFixed(2)}`, midX, (minY + maxY) / 2, "rgba(0,0,0,0.7)", ORANGE);
+      // Pixel count pill
+      pill(`${heelHeightPx}px → ${hMm}mm`, (hz.minX + hz.maxX) / 2, heelMidY, "rgba(0,0,0,0.88)", MAGENTA);
+      // Shoe bbox dimensions
+      pill(`shoeH:${maxY - minY}px`, midX, (minY + maxY) / 2, "rgba(0,0,0,0.7)", ORANGE);
+      pill(`IoU:${sa.iouScore.toFixed(2)}`, midX, minY - fs * 2.2, "rgba(0,0,0,0.7)", ORANGE);
+      // Show heel zone X span
+      ctx.strokeStyle = MAGENTA; ctx.lineWidth = 1; ctx.setLineDash([2, 4]);
+      ctx.strokeRect(hz.minX, minY, hz.maxX - hz.minX, maxY - minY);
+      ctx.setLineDash([]);
     }
 
     return hMm;

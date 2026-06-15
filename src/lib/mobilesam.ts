@@ -4,8 +4,10 @@
 
 import * as ort from "onnxruntime-web";
 
-// Configure WASM paths — onnxruntime-web looks for these in /public
+// WASM files are copied to /public/ by scripts/copy-ort-wasm.mjs at build time.
+// Use single-threaded mode: avoids SharedArrayBuffer requirement (iOS Safari compat).
 ort.env.wasm.wasmPaths = "/";
+ort.env.wasm.numThreads = 1;
 
 export interface SamMask {
   mask: Uint8Array;   // 1 = foreground, 0 = background (same size as input image)
@@ -22,7 +24,6 @@ let loadError: string | null = null;
 export async function loadSAM(): Promise<void> {
   if (encoderSession && decoderSession) return;
   if (loading) {
-    // Wait for existing load
     await new Promise<void>((res, rej) => {
       const t = setInterval(() => {
         if (encoderSession && decoderSession) { clearInterval(t); res(); }
@@ -47,6 +48,10 @@ export async function loadSAM(): Promise<void> {
     throw e;
   }
   loading = false;
+}
+
+export function getSAMLoadError(): string | null {
+  return loadError;
 }
 
 export function isSAMLoaded(): boolean {

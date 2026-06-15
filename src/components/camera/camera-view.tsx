@@ -43,7 +43,7 @@ import { useRef, useEffect, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { CheckCircle2, Loader2, Camera, Bug, AlertTriangle, XCircle } from "lucide-react";
 import { compressImage } from "@/lib/utils";
-import { loadSAM, isSAMLoaded, encodeImage, decodeMask, gridPrompts } from "@/lib/mobilesam";
+import { loadSAM, isSAMLoaded, encodeImage, decodeMask, gridPrompts, getSAMLoadError } from "@/lib/mobilesam";
 import { detectAruco } from "@/lib/aruco";
 import type { CaptureResult } from "@/store/scan";
 
@@ -604,12 +604,18 @@ export function CameraView({ onCapture, onError }: Props) {
   const [isPortrait,  setIsPortrait]  = useState(false);
   const [debugMode,   setDebugMode]   = useState(false);
   const [samStatus,   setSamStatus]   = useState<"idle"|"loading"|"ready"|"error">("idle");
+  const [samErrorMsg, setSamErrorMsg] = useState<string>("");
 
   useEffect(() => {
     setSamStatus("loading");
     loadSAM()
       .then(() => setSamStatus("ready"))
-      .catch((e) => { console.error("SAM load:", e); setSamStatus("error"); });
+      .catch((e) => {
+        const msg = getSAMLoadError() ?? String(e);
+        console.error("SAM load:", msg);
+        setSamErrorMsg(msg);
+        setSamStatus("error");
+      });
   }, []);
 
   useEffect(() => {
@@ -804,10 +810,17 @@ export function CameraView({ onCapture, onError }: Props) {
         </div>
       )}
       {samStatus === "error" && (
-        <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-center gap-2 py-2"
+        <div className="absolute top-0 inset-x-0 z-20 flex flex-col items-center justify-center gap-1 py-2 px-3"
           style={{ background: `${RED}20`, borderBottom: `1px solid ${RED}40` }}>
-          <XCircle className="w-3.5 h-3.5" style={{ color: RED }} />
-          <span className="text-xs font-semibold" style={{ color: RED }}>AI model failed to load — reload page</span>
+          <div className="flex items-center gap-2">
+            <XCircle className="w-3.5 h-3.5 shrink-0" style={{ color: RED }} />
+            <span className="text-xs font-semibold" style={{ color: RED }}>AI model failed to load — reload page</span>
+          </div>
+          {samErrorMsg && (
+            <span className="text-[10px] break-all text-center max-w-full" style={{ color: `${RED}cc` }}>
+              {samErrorMsg.slice(0, 200)}
+            </span>
+          )}
         </div>
       )}
 

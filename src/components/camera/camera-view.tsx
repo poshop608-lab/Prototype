@@ -111,10 +111,10 @@ function analyzeShoe(
   const bbox: BBox = { minX, maxX, minY, maxY };
 
   // ── Heel detection ──────────────────────────────────────────────────────
-  // Determine which end is the heel:
-  // Count sole pixels (bottom 20% of shoe height) on left end vs right end.
-  // Denser side = heel (outsole is thicker at heel).
-  const soleYStart = maxY - Math.round(shoeH * 0.20);
+  // Step 1: Which end is the heel?
+  // Measure shoe mask "fullness" in bottom 25% of shoe height at each end.
+  // The heel end has a more vertical rear wall → denser bottom pixels.
+  const soleYStart = maxY - Math.round(shoeH * 0.25);
   const heelZoneW = Math.round(shoeW * HEEL_FRAC);
 
   let leftSole = 0, rightSole = 0;
@@ -130,44 +130,56 @@ function analyzeShoe(
   const hzX1 = heelOnLeft ? minX + heelZoneW : maxX;
   const hzMidX = Math.round((hzX0 + hzX1) / 2);
 
-  // Build per-row pixel count within heel column (used for gap detection)
-  const heelRowCount = new Int32Array(h);
-  for (let y = minY; y <= maxY; y++) {
-    let cnt = 0;
-    for (let x = hzX0; x <= hzX1; x++) {
-      if (mask[y * w + x]) cnt++;
-    }
-    heelRowCount[y] = cnt;
-  }
-
-  // hMaxY = outsole bottom: last row (scanning down) with heel pixels
+  // Step 2: hMaxY = sole baseline under heel.
+  // Scan from image bottom up within heel X zone; first row with mask pixels.
+  // We use the OUTER contour edge (left or right edge array) restricted to
+  // the heel zone so background pixels outside the mask cannot contribute.
   let hMaxY = -1;
   for (let y = maxY; y >= minY; y--) {
-    if (heelRowCount[y] > 0) { hMaxY = y; break; }
+    for (let x = hzX0; x <= hzX1; x++) {
+      if (mask[y * w + x]) { hMaxY = y; break; }
+    }
+    if (hMaxY >= 0) break;
   }
+  if (hMaxY < 0) return invalid("Cannot find sole baseline in heel zone");
 
-  // Heel collar top (hMinY):
-  // Scan upward from outsole bottom. Find the first row where heel pixel
-  // density drops below 15% of heel zone width → that row is above the
-  // outsole/midsole stack = the heel collar opening top.
-  // Minimum heel height cap: at least 8% of shoe height (avoids noise).
-  const minHeelH = Math.round(shoeH * 0.08);
-  const densityThresh = (hzX1 - hzX0) * 0.15;
-  let hMinY = hMaxY - minHeelH; // fallback: minimum cap
+  // Step 3: hMinY = heel collar top.
+  //
+  // On a side-view shoe image, the top silhouette DIPS downward at the heel
+  // collar (ankle opening). This creates a valley in the per-column top-edge
+  // profile: toe-box and vamp are high (low Y), then the collar dips (high Y).
+  //
+  // Algorithm: for each X column in the heel zone, find the topmost mask pixel
+  // (min Y per column = top silhouette). Then take the MAX of these min-Y values
+  // within the heel X zone — that maximum = the deepest dip = collar top.
+  //
+  // Only search within the inner portion of the heel zone (avoid outer 10%
+  // which may be the rounded rear wall, not the collar opening).
+  const innerHzX0 = hzX0 + Math.round((hzX1 - hzX0) * 0.10);
+  const innerHzX1 = hzX1 - Math.round((hzX1 - hzX0) * 0.10);
+  let hMinY = minY; // will be overridden
 
-  if (hMaxY > 0) {
-    for (let y = hMaxY - minHeelH; y >= minY; y--) {
-      if (heelRowCount[y] < densityThresh) {
-        hMinY = y + 1; // row just below the gap = collar top
+  for (let x = innerHzX0; x <= innerHzX1; x++) {
+    // Find topmost mask pixel in this column
+    for (let y = minY; y <= hMaxY; y++) {
+      if (mask[y * w + x]) {
+        // Track maximum Y across columns (deepest dip in top silhouette)
+        if (y > hMinY) hMinY = y;
         break;
       }
-      hMinY = y;
     }
   }
 
   const heelHeightPx = hMaxY - hMinY;
-  // Valid if outsole found and heel height is reasonable (5%–60% of shoe height)
-  const heelValid = hMaxY > 0 && heelHeightPx > shoeH * 0.05 && heelHeightPx < shoeH * 0.60;
+
+  // Validity: heel height must be 4%–45% of full shoe height.
+  // A formal shoe heel is ~30–80mm; full shoe height ~250–320mm
+  // so heel/shoe ratio is ~10–30%. Cap at 45% to catch gross errors.
+  const heelValid =
+    hMaxY > 0 &&
+    heelHeightPx > shoeH * 0.04 &&
+    heelHeightPx < shoeH * 0.45;
+
   const heelTopPt: Pt = { x: hzMidX, y: hMinY };
   const heelBotPt: Pt = { x: hzMidX, y: hMaxY };
   const heelBBox: BBox = { minX: hzX0, maxX: hzX1, minY: hMinY, maxY: hMaxY };

@@ -169,14 +169,15 @@ export default function CapturePage() {
             >
               <div className="px-4 py-3" style={{ borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
                 <p className="text-xs font-semibold uppercase tracking-widest" style={{ color: "#555" }}>Measurements</p>
+                <p className="text-xs mt-0.5" style={{ color: "#444" }}>Heel profile = full shoe height at heel end (side view). Difference is the QC metric.</p>
               </div>
               <div className="divide-y" style={{ borderColor: "rgba(255,255,255,0.04)" }}>
                 {[
-                  { label: "Left Shoe Height", value: `${captured.leftHeightMm} mm`, accent: false },
-                  { label: "Right Shoe Height", value: `${captured.rightHeightMm} mm`, accent: false },
+                  { label: "Left Heel Profile", value: `${captured.leftHeightMm} mm`, accent: false },
+                  { label: "Right Heel Profile", value: `${captured.rightHeightMm} mm`, accent: false },
                   { label: "Left Shoe Width", value: `${captured.leftWidthMm} mm`, accent: false },
                   { label: "Right Shoe Width", value: `${captured.rightWidthMm} mm`, accent: false },
-                  { label: "Height Difference", value: `${captured.heightDiffMm} mm`, accent: true },
+                  { label: "Profile Difference", value: `${captured.heightDiffMm} mm`, accent: true },
                 ].map(({ label, value, accent }) => (
                   <div key={label} className="flex items-center justify-between px-4 py-3">
                     <span className="text-sm" style={{ color: "#666" }}>{label}</span>

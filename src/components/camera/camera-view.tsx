@@ -57,9 +57,10 @@ const MAX_AREA_FRAC   = 0.65;   // mask must not cover >65% of half-frame
 const BORDER_PAD      = 5;      // px from edge = border touch
 const MIN_SHARPNESS   = 80;     // Laplacian variance threshold
 const MIN_MID_EXPO    = 0.35;   // fraction of pixels in [60,200] range
-// Heel column height valid range in mm (full shoe at heel end, side profile)
-const MIN_HEEL_COL_MM = 80;
-const MAX_HEEL_COL_MM = 250;
+// Heel profile valid range in mm (full shoe height at heel end, side profile)
+// Formal shoe side-profile: 100–230mm is the realistic range.
+const MIN_HEEL_COL_MM = 100;
+const MAX_HEEL_COL_MM = 230;
 
 // ── Colours ───────────────────────────────────────────────────────────────────
 const CYAN    = "#06b6d4";
@@ -491,7 +492,7 @@ function drawAnnotations(
     const pillX = heelOnLeft
       ? Math.max(heelZone.minX - fs * 5, fs * 4)
       : Math.min(heelZone.maxX + fs * 5, vw - fs * 4);
-    pill(`H ${heelColHeightMm}mm`, pillX, heelMidY, "rgba(0,0,0,0.92)", YELLOW);
+    pill(`Profile ${heelColHeightMm}mm`, pillX, heelMidY, "rgba(0,0,0,0.92)", YELLOW);
 
     // ── Width pill (top of shoe bbox) ─────────────────────────────────────────
     const wMm = parseFloat((shoeW / arucoPxPerMm).toFixed(1));
@@ -567,7 +568,7 @@ function drawAnnotations(
   if (scanInvalid) {
     ctx.fillText(`⚠ INVALID — ${invalidReasons[0]}`, vw / 2, vh - bh / 2);
   } else {
-    const diffStr = `Δ${diff}mm (limit ${TOLERANCE_MM}mm)`;
+    const diffStr = `profile diff Δ${diff}mm (limit ${TOLERANCE_MM}mm)`;
     ctx.fillText(
       passed ? `✓ PASSED  ${diffStr}` : `✗ REJECTED  ${diffStr}`,
       vw / 2, vh - bh / 2,

@@ -530,69 +530,90 @@ export function CameraView({ onCapture, onError }: Props) {
     }
 
     function drawShoe(bounds: BBox, contour: Pt[] | null, sr: ShoeResult, label: string) {
-      // Contour / rect
+      const { minX, minY, maxX, maxY } = bounds;
+      const midX = (minX + maxX) / 2;
+      const midY = (minY + maxY) / 2;
+      const lw = Math.max(2, vw * 0.002);
+
+      // ── Shoe silhouette (faint fill + outline) ──────────────────────────
       ctx.beginPath();
       if (contour && contour.length > 2) {
         contour.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
         ctx.closePath();
       } else {
-        ctx.rect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
+        ctx.rect(minX, minY, maxX - minX, maxY - minY);
       }
-      ctx.fillStyle = `${GREEN}18`; ctx.fill();
-      ctx.strokeStyle = GREEN; ctx.lineWidth = Math.max(2, vw * 0.002);
-      ctx.shadowColor = GREEN; ctx.shadowBlur = 10; ctx.stroke(); ctx.shadowBlur = 0;
+      ctx.fillStyle = `${GREEN}12`; ctx.fill();
+      ctx.strokeStyle = `${GREEN}60`; ctx.lineWidth = lw;
+      ctx.shadowColor = GREEN; ctx.shadowBlur = 6; ctx.stroke(); ctx.shadowBlur = 0;
 
-      // Corner ticks
-      const tk = Math.round(vw * 0.022);
-      const { minX, minY, maxX, maxY } = bounds;
-      ctx.strokeStyle = GREEN; ctx.lineWidth = Math.max(3, vw * 0.003);
-      ctx.shadowColor = GREEN; ctx.shadowBlur = 6;
-      [[minX,minY,1,1],[maxX,minY,-1,1],[minX,maxY,1,-1],[maxX,maxY,-1,-1]].forEach(([cx,cy,dx,dy]) => {
-        ctx.beginPath();
-        ctx.moveTo(cx as number, (cy as number) + (dy as number) * tk);
-        ctx.lineTo(cx as number, cy as number);
-        ctx.lineTo((cx as number) + (dx as number) * tk, cy as number);
-        ctx.stroke();
-      });
+      // ── Horizontal reference lines (the core measurement visualization) ──
+      // Top reference line: highest shoe pixel
+      // Bottom reference line: lowest sole pixel
+      // These span the full shoe width with small tick serifs on each end.
+      const lineExt = Math.round(vw * 0.015); // how far line extends beyond shoe edges
+      const tickH   = Math.round(vw * 0.012); // vertical tick height at line ends
+      const refLW   = Math.max(3, vw * 0.003);
+
+      function drawRefLine(y: number, color: string) {
+        const x0 = minX - lineExt;
+        const x1 = maxX + lineExt;
+        ctx.strokeStyle = color; ctx.lineWidth = refLW;
+        ctx.shadowColor = color; ctx.shadowBlur = 8;
+        // Main horizontal span
+        ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+        // Left tick (perpendicular serif)
+        ctx.lineWidth = refLW * 0.7;
+        ctx.beginPath(); ctx.moveTo(x0, y - tickH / 2); ctx.lineTo(x0, y + tickH / 2); ctx.stroke();
+        // Right tick
+        ctx.beginPath(); ctx.moveTo(x1, y - tickH / 2); ctx.lineTo(x1, y + tickH / 2); ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+
+      // Top line — cyan (highest shoe point)
+      drawRefLine(minY, CYAN);
+      // Bottom line — green (lowest sole point)
+      drawRefLine(maxY, GREEN);
+
+      // Vertical arrow connecting them (right side of shoe)
+      const arrowX = maxX + lineExt + Math.round(vw * 0.005);
+      const arrowHeadH = Math.round(vw * 0.008);
+      ctx.strokeStyle = YELLOW; ctx.lineWidth = lw; ctx.shadowColor = YELLOW; ctx.shadowBlur = 6;
+      ctx.beginPath(); ctx.moveTo(arrowX, minY); ctx.lineTo(arrowX, maxY); ctx.stroke();
+      // Arrow head top
+      ctx.beginPath();
+      ctx.moveTo(arrowX - arrowHeadH * 0.6, minY + arrowHeadH);
+      ctx.lineTo(arrowX, minY);
+      ctx.lineTo(arrowX + arrowHeadH * 0.6, minY + arrowHeadH);
+      ctx.stroke();
+      // Arrow head bottom
+      ctx.beginPath();
+      ctx.moveTo(arrowX - arrowHeadH * 0.6, maxY - arrowHeadH);
+      ctx.lineTo(arrowX, maxY);
+      ctx.lineTo(arrowX + arrowHeadH * 0.6, maxY - arrowHeadH);
+      ctx.stroke();
       ctx.shadowBlur = 0;
 
-      // Measurement: use per-shoe extents (not shared groundY)
+      // ── Measurements ─────────────────────────────────────────────────────
       const hPx = sr.heightPx;
       const wPx = sr.widthPx;
       const hMm = parseFloat((hPx / PX_PER_MM).toFixed(1));
       const wMm = parseFloat((wPx / PX_PER_MM).toFixed(1));
-      const midX = (bounds.minX + bounds.maxX) / 2;
-      const midY = (bounds.minY + bounds.maxY) / 2;
 
-      // Debug: top/bottom measurement points
+      // H pill: next to vertical arrow, centred vertically
+      const hpx = Math.min(arrowX + fs * 2.2, vw - fs * 2.5);
+      pill(`H ${hMm}mm`, hpx, midY, "rgba(0,0,0,0.88)", YELLOW);
+
+      // W pill: above top reference line
+      pill(`W ${wMm}mm`, midX, Math.max(minY - fs * 1.1, fs * 1.1), "rgba(0,0,0,0.88)", CYAN);
+
+      // Label chip below bottom line
+      pill(label, midX, Math.min(maxY + fs * 1.2, vh - fs * 0.8), `${GREEN}dd`, "#000");
+
+      // Debug extras
       if (debugMode) {
-        const DOT = Math.max(6, vw * 0.005);
-        ctx.fillStyle = MAGENTA;
-        ctx.beginPath(); ctx.arc(sr.topPt.x, sr.topPt.y, DOT, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = CYAN;
-        ctx.beginPath(); ctx.arc(sr.botPt.x, sr.botPt.y, DOT, 0, Math.PI * 2); ctx.fill();
-        // Vertical measurement line
-        ctx.strokeStyle = `${MAGENTA}80`; ctx.lineWidth = 1; ctx.setLineDash([4,4]);
-        ctx.beginPath(); ctx.moveTo(sr.topPt.x, sr.topPt.y); ctx.lineTo(sr.botPt.x, sr.botPt.y); ctx.stroke();
-        ctx.setLineDash([]);
-        // Px label
-        pill(`${hPx}px`, midX, midY - fs * 1.2, "rgba(0,0,0,0.85)", MAGENTA);
+        pill(`${hPx}px`, midX, midY, "rgba(0,0,0,0.85)", MAGENTA);
       }
-
-      // H pill right of shoe
-      const hx = Math.min(bounds.maxX + fs * 1.8, vw - fs * 2);
-      pill(`H ${hMm}mm`, hx, midY, "rgba(0,0,0,0.82)", GREEN);
-
-      // W pill above shoe
-      pill(`W ${wMm}mm`, midX, Math.max(bounds.minY - fs * 0.9, fs * 1.1), "rgba(0,0,0,0.82)", GREEN);
-
-      // Baseline dashes at shoe bottom
-      ctx.strokeStyle = `${GREEN}55`; ctx.lineWidth = 1; ctx.setLineDash([5, 5]);
-      ctx.beginPath(); ctx.moveTo(bounds.minX, bounds.maxY); ctx.lineTo(bounds.maxX, bounds.maxY); ctx.stroke();
-      ctx.setLineDash([]);
-
-      // Label chip
-      pill(label, midX, Math.min(bounds.maxY + fs * 1.1, vh - fs * 0.8), `${GREEN}dd`, "#000");
 
       return { hMm, wMm };
     }
@@ -606,7 +627,7 @@ export function CameraView({ onCapture, onError }: Props) {
     ctx.setLineDash([]);
 
     const diff = parseFloat(Math.abs(leftM.hMm - rightM.hMm).toFixed(1));
-    const passed = diff <= 3;
+    const passed = diff <= 2;
 
     // Result banner
     ctx.fillStyle = `${passed ? GREEN : RED}ee`;
@@ -615,7 +636,7 @@ export function CameraView({ onCapture, onError }: Props) {
     ctx.font = `bold ${Math.round(vw * 0.022)}px -apple-system,sans-serif`;
     ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText(
-      passed ? `✓  PASSED   Δ${diff} mm` : `✗  REJECTED   Δ${diff} mm  (limit 3 mm)`,
+      passed ? `✓  PASSED   Δ${diff} mm` : `✗  REJECTED   Δ${diff} mm  (limit 2 mm)`,
       vw / 2, vh - bh / 2
     );
     ctx.textBaseline = "alphabetic";
@@ -648,7 +669,7 @@ export function CameraView({ onCapture, onError }: Props) {
         rightWidthMm:  rightM.wMm,
         heightDiffMm:  diff,
         passed,
-        rejectionReason: passed ? null : `Height difference ${diff}mm exceeds 3mm tolerance`,
+        rejectionReason: passed ? null : `Height difference ${diff}mm exceeds 2mm tolerance`,
       });
 
       setShowSuccess(true);

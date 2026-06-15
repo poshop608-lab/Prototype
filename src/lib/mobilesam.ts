@@ -34,9 +34,12 @@ export async function loadSAM(): Promise<void> {
   }
   loading = true;
   try {
+    // graphOptimizationLevel "all" crashes on these Qualcomm-hub models
+    // (ORT transpose_optimization bug). Use "disabled" — model runs correctly
+    // without optimization, just slightly slower.
     const opts: ort.InferenceSession.SessionOptions = {
       executionProviders: ["wasm"],
-      graphOptimizationLevel: "all",
+      graphOptimizationLevel: "disabled",
     };
     [encoderSession, decoderSession] = await Promise.all([
       ort.InferenceSession.create("/models/encoder.onnx", opts),

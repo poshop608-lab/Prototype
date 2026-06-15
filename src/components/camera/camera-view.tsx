@@ -31,20 +31,20 @@ interface Pt { x: number; y: number; }
 interface ShoeAnalysis {
   valid: boolean;
   invalidReason?: string;
-  // Mask
   mask: Uint8Array;
-  // Extents from mask
   bbox: BBox;
   contourPts: Pt[];
   widthPx: number;
-  // Heel measurement
   heelBBox: BBox;
   heelTopPt: Pt;
   heelBotPt: Pt;
   heelHeightPx: number;
   heelValid: boolean;
-  // SAM confidence
   iouScore: number;
+  // Debug: rear-face profile (row Y → outermost X in heel zone)
+  rearFaceProfile: { y: number; x: number }[];
+  // Debug: was inflection found or did we use fallback?
+  inflectionFound: boolean;
 }
 
 interface Props {
@@ -69,6 +69,7 @@ function analyzeShoe(
     widthPx: 0, heelBBox: { minX: 0, maxX: 0, minY: 0, maxY: 0 },
     heelTopPt: { x: 0, y: 0 }, heelBotPt: { x: 0, y: 0 },
     heelHeightPx: 0, heelValid: false, iouScore,
+    rearFaceProfile: [], inflectionFound: false,
   });
 
   // Confidence gate
@@ -191,69 +192,81 @@ function analyzeShoe(
     }
   }
 
-  // Scan upward from hMaxY, detect where rear edge inflects inward.
-  // Use a 5-row sliding window to smooth noise.
-  // Inflection = edge moves inward > INSET_THRESHOLD px per WINDOW rows.
-  const INSET_THRESHOLD = Math.round(shoeW * 0.025); // 2.5% of shoe width
-  const WINDOW = 5;
+  // Scan upward from hMaxY. Use a sliding window to detect inward inflection.
+  // Only search within the bottom 40% of shoe height (heel block can't be
+  // taller than 40% of the full shoe).
+  const INSET_THRESHOLD = Math.round(shoeW * 0.020); // 2% of shoe width
+  const WINDOW = 8;
+  const maxSearchY = hMaxY - Math.round(shoeH * 0.40); // don't go above 40% from bottom
   let hMinY = -1;
+  let inflectionFound = false;
 
-  // Collect rows that have a rear edge value, sorted bottom-up
+  // Collect rows with rear edge, bottom-up, limited to search range
   const rows: number[] = [];
-  for (let y = hMaxY; y >= minY; y--) {
+  for (let y = hMaxY; y >= Math.max(minY, maxSearchY); y--) {
     if (rearEdgeX.has(y)) rows.push(y);
   }
 
-  // Smooth: 5-row rolling average of edge X
-  function avgEdgeX(centerY: number): number {
+  // Smooth: rolling average of edge X over WINDOW rows
+  function avgEdgeX(rowIdx: number): number {
     let sum = 0, cnt = 0;
-    for (let dy = -Math.floor(WINDOW / 2); dy <= Math.floor(WINDOW / 2); dy++) {
-      const ex = rearEdgeX.get(centerY + dy);
-      if (ex !== undefined) { sum += ex; cnt++; }
+    for (let di = -Math.floor(WINDOW / 2); di <= Math.floor(WINDOW / 2); di++) {
+      const ri = rowIdx + di;
+      if (ri < 0 || ri >= rows.length) continue;
+      sum += rearEdgeX.get(rows[ri])!; cnt++;
     }
     return cnt > 0 ? sum / cnt : -1;
   }
 
+  // Scan upward (i increases = moving up from sole)
   for (let i = WINDOW; i < rows.length - WINDOW; i++) {
-    const yLow  = rows[i - WINDOW]; // closer to sole
-    const yHigh = rows[i];          // higher up
-    const xLow  = avgEdgeX(yLow);
-    const xHigh = avgEdgeX(yHigh);
-    if (xLow < 0 || xHigh < 0) continue;
+    const xNear = avgEdgeX(i - WINDOW); // closer to sole (lower)
+    const xFar  = avgEdgeX(i);          // higher up
+    if (xNear < 0 || xFar < 0) continue;
 
-    // inward movement: heel-on-left means x increases inward, heel-on-right means x decreases
-    const inwardMove = heelOnLeft ? (xHigh - xLow) : (xLow - xHigh);
+    // Inward move: heel-on-left → x increases going inward; heel-on-right → x decreases
+    const inwardMove = heelOnLeft ? (xFar - xNear) : (xNear - xFar);
     if (inwardMove > INSET_THRESHOLD) {
-      hMinY = yHigh;
+      hMinY = rows[i];
+      inflectionFound = true;
       break;
     }
   }
 
-  // Fallback: if no clear inflection found, use bottom 18% of shoe height
-  // as the heel block (typical for dress shoe: heel ≈ 30mm / shoe ≈ 280mm ≈ 11%)
+  // Fallback: 18% of shoe height from bottom (≈50px for 280px-tall shoe at this distance)
   if (hMinY < 0) {
     hMinY = hMaxY - Math.round(shoeH * 0.18);
   }
 
-  // Clamp: heel block cannot be taller than 35% of shoe height
-  const maxHeelH = Math.round(shoeH * 0.35);
-  if (hMaxY - hMinY > maxHeelH) hMinY = hMaxY - maxHeelH;
+  // Hard clamp: heel block max 35% of shoe height, min 3%
+  hMinY = Math.max(hMinY, hMaxY - Math.round(shoeH * 0.35));
+  hMinY = Math.min(hMinY, hMaxY - Math.round(shoeH * 0.03));
 
-  // ── Step 6: Validate & return ───────────────────────────────────────────
+  // ── Step 6: Validate ────────────────────────────────────────────────────
   const heelHeightPx = hMaxY - hMinY;
-  // Sanity: heel block 3%–35% of full shoe height
-  const heelValid = heelHeightPx > shoeH * 0.03 && heelHeightPx < shoeH * 0.35;
+
+  // Physical validation: 10mm–80mm for formal shoes
+  // Without ArUco we use px range: at ~3.5px/mm → 35–280px
+  // With ArUco these will be converted to mm and checked later
+  const heelValid = heelHeightPx > 20 && heelHeightPx < 500; // px sanity only here
 
   const heelTopPt: Pt = { x: hzMidX, y: hMinY };
   const heelBotPt: Pt = { x: hzMidX, y: hMaxY };
   const heelBBox:  BBox = { minX: hzX0, maxX: hzX1, minY: hMinY, maxY: hMaxY };
+
+  // Build rear-face profile for debug drawing (every 3rd row to reduce points)
+  const rearFaceProfile: { y: number; x: number }[] = [];
+  for (let y = hMaxY; y >= Math.max(minY, maxSearchY); y -= 3) {
+    const x = rearEdgeX.get(y);
+    if (x !== undefined) rearFaceProfile.push({ y, x });
+  }
 
   return {
     valid: true,
     mask, bbox, contourPts,
     widthPx: shoeW,
     heelBBox, heelTopPt, heelBotPt, heelHeightPx, heelValid,
-    iouScore,
+    iouScore, rearFaceProfile, inflectionFound,
   };
 }
 
@@ -375,38 +388,65 @@ function drawAnnotations(
     const wMm = parseFloat((widthPx / pxPerMm).toFixed(1));
     const heelMidY = (topY + botY) / 2;
 
+    // Physical mm validation (10–80mm for formal shoe heel block)
+    const hMmValid = heelValid && hMm >= 10 && hMm <= 80;
+
     const hPillX = Math.min(arrowX + fs * 2.4, vw - fs * 2.5);
-    if (heelValid) {
+    if (hMmValid) {
       pill(`H ${hMm}mm`, hPillX, heelMidY, "rgba(0,0,0,0.9)", YELLOW);
     } else {
-      pill("HEEL?", hPillX, heelMidY, "rgba(0,0,0,0.9)", RED);
-      invalidReasons.push(`${label}: Heel not detected`);
+      pill(`H ${hMm}mm ✗`, hPillX, heelMidY, "rgba(0,0,0,0.9)", RED);
+      invalidReasons.push(`${label}: Heel ${hMm}mm out of range (10–80mm)`);
     }
 
     pill(`W ${wMm}mm`, midX, Math.max(minY - fs * 1.1, fs * 1.1), "rgba(0,0,0,0.9)", CYAN);
     pill(label, midX, Math.min(maxY + fs * 1.2, vh - fs * 0.9), `${GREEN}dd`, "#000");
 
-    // Debug extras
+    // ── Debug extras ──────────────────────────────────────────────────────
     if (debugMode) {
-      const DOT = Math.max(7, vw * 0.005);
-      // Magenta dot = welt line (hMinY) — heel block top
-      ctx.fillStyle = MAGENTA;
+      const DOT = Math.max(9, vw * 0.007);
+
+      // Draw rear-face profile polyline (orange) — the contour we actually scanned
+      if (sa.rearFaceProfile.length > 1) {
+        ctx.strokeStyle = ORANGE; ctx.lineWidth = 3; ctx.shadowColor = ORANGE; ctx.shadowBlur = 6;
+        ctx.beginPath();
+        sa.rearFaceProfile.forEach((pt, i) => {
+          if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
+        });
+        ctx.stroke(); ctx.shadowBlur = 0;
+      }
+
+      // MAGENTA dot = heel block top (welt line / inflection point)
+      ctx.fillStyle = MAGENTA; ctx.shadowColor = MAGENTA; ctx.shadowBlur = 12;
       ctx.beginPath(); ctx.arc(heelTopPt.x, topY, DOT, 0, Math.PI * 2); ctx.fill();
-      // Cyan dot = outsole contact (hMaxY)
-      ctx.fillStyle = CYAN;
+      ctx.shadowBlur = 0;
+      // Label the magenta dot
+      ctx.font = `bold ${fs * 0.75}px monospace`; ctx.fillStyle = MAGENTA; ctx.textAlign = "left";
+      ctx.fillText(sa.inflectionFound ? "▲ WELT (detected)" : "▲ WELT (fallback)", heelTopPt.x + DOT + 4, topY + 4);
+
+      // CYAN dot = outsole contact (hMaxY) — ground contact point
+      ctx.fillStyle = CYAN; ctx.shadowColor = CYAN; ctx.shadowBlur = 12;
       ctx.beginPath(); ctx.arc(heelBotPt.x, botY, DOT, 0, Math.PI * 2); ctx.fill();
-      // Pixel count pill
-      pill(`${heelHeightPx}px → ${hMm}mm`, (hz.minX + hz.maxX) / 2, heelMidY, "rgba(0,0,0,0.88)", MAGENTA);
-      // Shoe bbox dimensions
-      pill(`shoeH:${maxY - minY}px`, midX, (minY + maxY) / 2, "rgba(0,0,0,0.7)", ORANGE);
-      pill(`IoU:${sa.iouScore.toFixed(2)}`, midX, minY - fs * 2.2, "rgba(0,0,0,0.7)", ORANGE);
-      // Show heel zone X span
-      ctx.strokeStyle = MAGENTA; ctx.lineWidth = 1; ctx.setLineDash([2, 4]);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = CYAN;
+      ctx.fillText("▼ OUTSOLE", heelBotPt.x + DOT + 4, botY + 4);
+
+      // Raw pixel pill
+      pill(`${heelHeightPx}px | ${hMm}mm`, (hz.minX + hz.maxX) / 2, heelMidY, "rgba(0,0,0,0.92)", MAGENTA);
+
+      // Shoe full height for reference
+      pill(`fullH:${maxY - minY}px=${((maxY - minY) / pxPerMm).toFixed(0)}mm`, midX, minY + (maxY - minY) * 0.5, "rgba(0,0,0,0.7)", ORANGE);
+
+      // IoU score
+      pill(`IoU:${sa.iouScore.toFixed(2)}`, midX, minY - fs * 1.5, "rgba(0,0,0,0.7)", ORANGE);
+
+      // Heel zone vertical span (dashed magenta rectangle)
+      ctx.strokeStyle = MAGENTA; ctx.lineWidth = 1.5; ctx.setLineDash([3, 5]);
       ctx.strokeRect(hz.minX, minY, hz.maxX - hz.minX, maxY - minY);
       ctx.setLineDash([]);
     }
 
-    return hMm;
+    return hMmValid ? hMm : 0;
   }
 
   leftHMm  = drawShoe(left, "LEFT");
@@ -423,8 +463,8 @@ function drawAnnotations(
   if (arucoPxPerMm) {
     pill(`ArUco ✓ ${arucoPxPerMm.toFixed(2)}px/mm`, vw - fs * 7, fs * 1.6, "rgba(0,80,0,0.85)", GREEN);
   } else {
-    pill("No ArUco marker!", vw - fs * 7, fs * 1.6, "rgba(100,0,0,0.85)", RED);
-    invalidReasons.push("ArUco marker not detected");
+    // Warning only — allow scan with fallback px/mm so dev can verify heel geometry
+    pill(`px/mm≈3.5 (no ArUco)`, vw - fs * 7, fs * 1.6, "rgba(100,60,0,0.85)", YELLOW);
   }
 
   const scanInvalid = invalidReasons.length > 0;

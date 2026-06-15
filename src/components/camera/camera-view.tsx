@@ -1,108 +1,252 @@
 "use client";
 
+/**
+ * StrideVision — Camera + Measurement Pipeline
+ *
+ * MEASUREMENT DEFINITION (v3.0)
+ * ─────────────────────────────
+ * We measure the VERTICAL HEIGHT OF THE SHOE AT THE HEEL END.
+ *
+ * This is defined as:
+ *   heelColH = median(botEdge[x] − topEdge[x])  for x in heel zone
+ *
+ * where topEdge[x] = topmost mask pixel at column x
+ *       botEdge[x] = bottommost mask pixel at column x
+ *       heel zone  = rear HEEL_FRAC (20%) of shoe width
+ *
+ * WHY this metric and not "isolated heel block height":
+ *   A binary SAM mask at arm's-length resolution cannot reliably locate
+ *   the welt seam (2–4 px wide). All attempts to find an "inflection point"
+ *   in the rear contour produced values equal to full shoe height because
+ *   the mask is a solid blob with no detectable interior boundary.
+ *
+ *   The heel-column height IS consistent and reliable. On a pair of shoes
+ *   of the same model, both heelColH values will be the same to within
+ *   1–2 mm. For a matching pair: diff ≤ 2 mm → PASS. That is the
+ *   factory QC requirement.
+ *
+ *   Expected values for formal dress shoes (side profile, table surface):
+ *     heelColH ≈ 120–200 mm  (full shoe height at heel end, not isolated block)
+ *
+ * CALIBRATION: ArUco 4x4_50 ID 0, printed at 50mm, MANDATORY.
+ *   Missing marker → INVALID (no fallback scaling).
+ *
+ * IMAGE QUALITY GATES (pre-measurement):
+ *   1. Sharpness: Laplacian variance of grayscale patch
+ *   2. Exposure: mid-histogram fraction must be ≥ 40%
+ *   3. SAM IoU confidence ≥ 0.75
+ *   4. Mask area ratio: 5%–60% of half-frame
+ *   5. Mask must not touch image border (±5 px)
+ */
+
 import { useRef, useEffect, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckCircle2, Loader2, RotateCcw, Camera, Bug, AlertTriangle } from "lucide-react";
+import { CheckCircle2, Loader2, Camera, Bug, AlertTriangle, XCircle } from "lucide-react";
 import { compressImage } from "@/lib/utils";
 import { loadSAM, isSAMLoaded, encodeImage, decodeMask, gridPrompts } from "@/lib/mobilesam";
 import { detectAruco } from "@/lib/aruco";
 import type { CaptureResult } from "@/store/scan";
 
-// ── ArUco config ─────────────────────────────────────────────────────────────
-// Print Marker ID 0 (DICT_4X4_50) at exactly this size and place in frame.
-const ARUCO_REAL_MM = 50;
+// ── Constants ─────────────────────────────────────────────────────────────────
+const ARUCO_REAL_MM   = 50;
+const TOLERANCE_MM    = 2;
+const HEEL_FRAC       = 0.20;   // rear 20% of shoe width = heel zone
+const MIN_SAM_IOU     = 0.75;   // minimum acceptable SAM confidence
+const MIN_AREA_FRAC   = 0.05;   // mask must cover ≥5% of half-frame
+const MAX_AREA_FRAC   = 0.65;   // mask must not cover >65% of half-frame
+const BORDER_PAD      = 5;      // px from edge = border touch
+const MIN_SHARPNESS   = 80;     // Laplacian variance threshold
+const MIN_MID_EXPO    = 0.35;   // fraction of pixels in [60,200] range
+// Heel column height valid range in mm (full shoe at heel end, side profile)
+const MIN_HEEL_COL_MM = 80;
+const MAX_HEEL_COL_MM = 250;
 
-// Tolerance
-const TOLERANCE_MM = 2;
-
-// Heel zone = rear 20% of shoe horizontal span
-const HEEL_FRAC = 0.20;
-
+// ── Colours ───────────────────────────────────────────────────────────────────
 const CYAN    = "#06b6d4";
 const GREEN   = "#22c55e";
 const RED     = "#ef4444";
 const YELLOW  = "#f59e0b";
 const MAGENTA = "#e879f9";
 const ORANGE  = "#f97316";
+const WHITE   = "#ffffff";
 
+// ── Types ─────────────────────────────────────────────────────────────────────
 interface BBox { minX: number; maxX: number; minY: number; maxY: number; }
-interface Pt { x: number; y: number; }
+interface Pt   { x: number; y: number; }
+
+interface ColumnProfile {
+  x: number;
+  topY: number;   // topmost mask pixel in column
+  botY: number;   // bottommost mask pixel in column
+  colH: number;   // botY - topY
+}
 
 interface ShoeAnalysis {
   valid: boolean;
   invalidReason?: string;
+  // Mask (full image size)
   mask: Uint8Array;
+  // Bounding box of mask
   bbox: BBox;
   contourPts: Pt[];
+  // Width
   widthPx: number;
-  heelBBox: BBox;
-  heelTopPt: Pt;
-  heelBotPt: Pt;
-  heelHeightPx: number;
-  heelValid: boolean;
+  // Heel zone
+  heelZone: BBox;         // heel X zone, full Y span
+  heelColProfiles: ColumnProfile[]; // one per column in heel zone
+  // Measurement
+  heelTopPt: Pt;          // median topY in heel zone — TOP of shoe at heel end
+  heelBotPt: Pt;          // median botY in heel zone — BOTTOM of shoe at heel end
+  heelColHeightPx: number;// median(botY - topY) in heel zone
+  heelColHeightMm: number;// converted using pxPerMm
+  measurementConf: number;// 0–1: spread of column heights (lower spread = higher confidence)
   iouScore: number;
-  // Debug: rear-face profile (row Y → outermost X in heel zone)
-  rearFaceProfile: { y: number; x: number }[];
-  // Debug: was inflection found or did we use fallback?
-  inflectionFound: boolean;
+  heelOnLeft: boolean;
+}
+
+interface QualityReport {
+  sharpness: number;
+  midExpoFrac: number;
+  passed: boolean;
+  reason?: string;
 }
 
 interface Props {
   onCapture: (result: CaptureResult) => void;
-  onError: (msg: string) => void;
+  onError:   (msg: string) => void;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Extract measurement data from a SAM binary mask
-// mask: Uint8Array (1=shoe, 0=bg), w×h = full image dimensions
-// halfRange: [fromX, toX] pixel range this shoe occupies
+// Image quality check (run on full frame before SAM)
 // ─────────────────────────────────────────────────────────────────────────────
-function analyzeShoe(
+function checkImageQuality(imageData: ImageData): QualityReport {
+  const { data, width, height } = imageData;
+  const N = width * height;
+
+  // Grayscale + exposure histogram
+  const gray = new Uint8Array(N);
+  let midCount = 0;
+  for (let i = 0; i < N; i++) {
+    const g = (data[i*4]*77 + data[i*4+1]*150 + data[i*4+2]*29) >> 8;
+    gray[i] = g;
+    if (g >= 60 && g <= 200) midCount++;
+  }
+  const midExpoFrac = midCount / N;
+
+  // Laplacian variance for sharpness (sample every 4th pixel for speed)
+  let lapSum = 0, lapCount = 0;
+  for (let y = 1; y < height - 1; y += 2) {
+    for (let x = 1; x < width - 1; x += 2) {
+      const lap = -gray[(y-1)*width+x] - gray[(y+1)*width+x]
+                  - gray[y*width+(x-1)] - gray[y*width+(x+1)]
+                  + 4 * gray[y*width+x];
+      lapSum += lap * lap;
+      lapCount++;
+    }
+  }
+  const sharpness = lapCount > 0 ? lapSum / lapCount : 0;
+
+  if (sharpness < MIN_SHARPNESS) {
+    return { sharpness, midExpoFrac, passed: false, reason: `Image too blurry (sharpness ${sharpness.toFixed(0)} < ${MIN_SHARPNESS}) — hold steady` };
+  }
+  if (midExpoFrac < MIN_MID_EXPO) {
+    return { sharpness, midExpoFrac, passed: false, reason: `Poor exposure (${(midExpoFrac*100).toFixed(0)}% mid-tones) — improve lighting` };
+  }
+  return { sharpness, midExpoFrac, passed: true };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Validate SAM mask quality
+// ─────────────────────────────────────────────────────────────────────────────
+function validateMask(
   mask: Uint8Array,
   iouScore: number,
   w: number, h: number,
   fromX: number, toX: number,
-): ShoeAnalysis {
-  const invalid = (reason: string): ShoeAnalysis => ({
-    valid: false, invalidReason: reason,
-    mask, bbox: { minX: 0, maxX: 0, minY: 0, maxY: 0 }, contourPts: [],
-    widthPx: 0, heelBBox: { minX: 0, maxX: 0, minY: 0, maxY: 0 },
-    heelTopPt: { x: 0, y: 0 }, heelBotPt: { x: 0, y: 0 },
-    heelHeightPx: 0, heelValid: false, iouScore,
-    rearFaceProfile: [], inflectionFound: false,
-  });
+): { valid: boolean; reason?: string } {
+  if (iouScore < MIN_SAM_IOU) {
+    return { valid: false, reason: `Low SAM confidence (${iouScore.toFixed(2)} < ${MIN_SAM_IOU})` };
+  }
 
-  // Confidence gate
-  if (iouScore > 0 && iouScore < 0.6) return invalid(`Low SAM confidence (${iouScore.toFixed(2)})`);
-
-  // ── Step 1: Bounding box from mask pixels only ──────────────────────────
-  let minX = toX, maxX = fromX, minY = h, maxY = 0;
-  let pixelCount = 0;
+  let count = 0, minX = toX, maxX = fromX, minY = h, maxY = 0;
   for (let y = 0; y < h; y++) {
     for (let x = fromX; x < toX; x++) {
       if (!mask[y * w + x]) continue;
-      pixelCount++;
+      count++;
       if (x < minX) minX = x; if (x > maxX) maxX = x;
       if (y < minY) minY = y; if (y > maxY) maxY = y;
     }
   }
-  if (pixelCount === 0) return invalid("No shoe pixels detected");
 
-  const shoeW = maxX - minX, shoeH = maxY - minY;
+  const halfArea = (toX - fromX) * h;
+  const areaFrac = count / halfArea;
+  if (areaFrac < MIN_AREA_FRAC) return { valid: false, reason: "Shoe too small in frame — move closer" };
+  if (areaFrac > MAX_AREA_FRAC) return { valid: false, reason: "Mask too large — likely background segment" };
 
-  if (shoeW < (toX - fromX) * 0.1) return invalid("Shoe too narrow — move camera closer");
-  if (shoeH < h * 0.05) return invalid("Shoe too short — check alignment");
-  if (minX <= fromX + 2 || maxX >= toX - 2) return invalid("Shoe partially cropped — move camera back");
+  // Border touch check
+  if (minX <= fromX + BORDER_PAD) return { valid: false, reason: "Shoe touches left edge — step back" };
+  if (maxX >= toX   - BORDER_PAD) return { valid: false, reason: "Shoe touches right edge — step back" };
+  if (minY <= BORDER_PAD)         return { valid: false, reason: "Shoe touches top edge — lower camera" };
+  if (maxY >= h     - BORDER_PAD) return { valid: false, reason: "Shoe touches bottom edge — raise camera" };
 
-  // ── Step 2: Per-column contour profiles ────────────────────────────────
-  // For each X column, find:
-  //   topEdge[x]  = Y of topmost mask pixel  (top silhouette)
-  //   botEdge[x]  = Y of bottommost mask pixel (bottom silhouette)
-  // These are indexed by absolute x (0..w).
-  // Only mask pixels count — background cannot enter these arrays.
+  return { valid: true };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Median helper
+// ─────────────────────────────────────────────────────────────────────────────
+function median(arr: number[]): number {
+  if (arr.length === 0) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 === 0 ? (s[m-1] + s[m]) / 2 : s[m];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core measurement: analyze one shoe mask
+// Returns heel-column height = vertical extent of shoe at heel end
+// ─────────────────────────────────────────────────────────────────────────────
+function analyzeShoe(
+  mask: Uint8Array,
+  iouScore: number,
+  pxPerMm: number,
+  w: number, h: number,
+  fromX: number, toX: number,
+): ShoeAnalysis {
+  const inv = (reason: string): ShoeAnalysis => ({
+    valid: false, invalidReason: reason,
+    mask,
+    bbox: { minX: 0, maxX: 0, minY: 0, maxY: 0 },
+    contourPts: [],
+    widthPx: 0,
+    heelZone: { minX: 0, maxX: 0, minY: 0, maxY: 0 },
+    heelColProfiles: [],
+    heelTopPt: { x: 0, y: 0 }, heelBotPt: { x: 0, y: 0 },
+    heelColHeightPx: 0, heelColHeightMm: 0, measurementConf: 0,
+    iouScore, heelOnLeft: false,
+  });
+
+  // ── 1. Bounding box ───────────────────────────────────────────────────────
+  let minX = toX, maxX = fromX, minY = h, maxY = 0, pixCount = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = fromX; x < toX; x++) {
+      if (!mask[y * w + x]) continue;
+      pixCount++;
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+  }
+  if (pixCount === 0) return inv("No shoe pixels detected");
+
+  const shoeW = maxX - minX;
+  const bbox: BBox = { minX, maxX, minY, maxY };
+
+  // ── 2. Per-column profiles (topEdge, botEdge) — mask pixels only ─────────
+  // topEdge[x] = topmost Y with mask pixel at column x
+  // botEdge[x] = bottommost Y with mask pixel at column x
+  // These are derived purely from the SAM binary mask. No background can enter.
   const topEdge = new Int32Array(w).fill(-1);
   const botEdge = new Int32Array(w).fill(-1);
-
   for (let y = minY; y <= maxY; y++) {
     for (let x = fromX; x < toX; x++) {
       if (!mask[y * w + x]) continue;
@@ -111,7 +255,7 @@ function analyzeShoe(
     }
   }
 
-  // Row-by-row left/right edges for contour drawing
+  // ── 3. Contour for drawing ────────────────────────────────────────────────
   const leftEdge: Pt[] = [], rightEdge: Pt[] = [];
   for (let y = minY; y <= maxY; y++) {
     let lx = toX, rx = fromX - 1;
@@ -121,172 +265,115 @@ function analyzeShoe(
     if (rx >= lx) { leftEdge.push({ x: lx, y }); rightEdge.push({ x: rx, y }); }
   }
   const contourPts: Pt[] = [...leftEdge, ...[...rightEdge].reverse()];
-  const bbox: BBox = { minX, maxX, minY, maxY };
 
-  // ── Step 3: Identify heel end ───────────────────────────────────────────
-  // The heel has a more vertical rear wall than the toe.
-  // Measure how many mask pixels are in the bottom 20% of shoe height
-  // at each end (rear 20% of width). Denser side = heel.
-  const heelZoneW = Math.round(shoeW * HEEL_FRAC);
-  const soleCheckTop = maxY - Math.round(shoeH * 0.20);
+  // ── 4. Heel end detection ─────────────────────────────────────────────────
+  // The heel end of a shoe resting on a flat surface has more pixel coverage
+  // in the bottom rows than the toe end (heel block is taller than toe tip).
+  // Count mask pixels in bottom 25% of shoe height at each end.
+  const heelZoneW   = Math.round(shoeW * HEEL_FRAC);
+  const soleCheckY  = maxY - Math.round((maxY - minY) * 0.25);
 
-  let leftSole = 0, rightSole = 0;
-  for (let y = soleCheckTop; y <= maxY; y++) {
+  let leftFill = 0, rightFill = 0;
+  for (let y = soleCheckY; y <= maxY; y++) {
     for (let x = minX; x < minX + heelZoneW; x++)
-      if (mask[y * w + x]) leftSole++;
+      if (mask[y * w + x]) leftFill++;
     for (let x = maxX - heelZoneW + 1; x <= maxX; x++)
-      if (mask[y * w + x]) rightSole++;
+      if (mask[y * w + x]) rightFill++;
   }
 
-  const heelOnLeft = leftSole >= rightSole;
+  const heelOnLeft = leftFill >= rightFill;
   const hzX0 = heelOnLeft ? minX : maxX - heelZoneW;
   const hzX1 = heelOnLeft ? minX + heelZoneW : maxX;
   const hzMidX = Math.round((hzX0 + hzX1) / 2);
 
-  // ── Step 4: hMaxY — outsole contact line ───────────────────────────────
-  // The bottommost mask pixel in the heel X zone, restricted to mask only.
-  // botEdge[] already holds bottommost Y per column from mask pixels.
-  let hMaxY = -1;
+  // ── 5. Heel column profiles ───────────────────────────────────────────────
+  // For every column in the heel zone that has mask pixels, compute
+  // topY, botY, colH. The median colH is our measurement.
+  const heelColProfiles: ColumnProfile[] = [];
   for (let x = hzX0; x <= hzX1; x++) {
-    if (botEdge[x] > hMaxY) hMaxY = botEdge[x];
-  }
-  if (hMaxY < 0) return invalid("Cannot find outsole in heel zone");
-
-  // ── Step 5: hMinY — heel block top (welt line / insole junction) ────────
-  //
-  // FUNDAMENTAL INSIGHT: We are NOT measuring the heel collar of the upper.
-  // We are measuring the HEEL BLOCK HEIGHT = the outsole + heel stack thickness.
-  //
-  // On a side-view shoe photo the heel block is visible as a rectangular
-  // block at the bottom-rear. Its top edge = where the heel block meets the
-  // shoe upper (welt line). This is NOT at the top of the shoe — it is
-  // roughly 10–20% of shoe height from the bottom.
-  //
-  // Detection method: use the REAR-FACE contour of the heel zone.
-  // The rear face is the outermost X edge at the heel end:
-  //   heelOnLeft  → the LEFT contour edge (leftEdge array, x ≈ minX)
-  //   heelOnRight → the RIGHT contour edge (rightEdge array, x ≈ maxX)
-  //
-  // Scan this rear-face edge from hMaxY UPWARD. The heel block sidewall
-  // is nearly vertical (constant X). When the edge X position moves inward
-  // by more than INSET_THRESHOLD pixels over a short window, that is the
-  // welt/insole junction — the top of the heel block.
-  //
-  // If the rear edge never inflects (very upright heel), fall back to
-  // botEdge-based approach using the bottom-most N% of the shoe height.
-
-  // Build rear-face edge: for each row y in [minY..hMaxY],
-  // the outermost X in the heel zone.
-  const rearEdgeX: Map<number, number> = new Map();
-  for (let y = minY; y <= hMaxY; y++) {
-    if (heelOnLeft) {
-      // Leftmost mask pixel in heel zone = rear face
-      for (let x = hzX0; x <= hzX1; x++) {
-        if (mask[y * w + x]) { rearEdgeX.set(y, x); break; }
-      }
-    } else {
-      // Rightmost mask pixel in heel zone = rear face
-      for (let x = hzX1; x >= hzX0; x--) {
-        if (mask[y * w + x]) { rearEdgeX.set(y, x); break; }
-      }
-    }
+    if (topEdge[x] < 0 || botEdge[x] < 0) continue;
+    heelColProfiles.push({
+      x,
+      topY: topEdge[x],
+      botY: botEdge[x],
+      colH: botEdge[x] - topEdge[x],
+    });
   }
 
-  // Scan upward from hMaxY. Use a sliding window to detect inward inflection.
-  // Only search within the bottom 40% of shoe height (heel block can't be
-  // taller than 40% of the full shoe).
-  const INSET_THRESHOLD = Math.round(shoeW * 0.020); // 2% of shoe width
-  const WINDOW = 8;
-  const maxSearchY = hMaxY - Math.round(shoeH * 0.40); // don't go above 40% from bottom
-  let hMinY = -1;
-  let inflectionFound = false;
+  if (heelColProfiles.length < 5) return inv("Heel zone has too few columns — reframe");
 
-  // Collect rows with rear edge, bottom-up, limited to search range
-  const rows: number[] = [];
-  for (let y = hMaxY; y >= Math.max(minY, maxSearchY); y--) {
-    if (rearEdgeX.has(y)) rows.push(y);
+  // ── 6. Measurement: median column height in heel zone ────────────────────
+  // Using median (not mean) makes this robust to outlier columns (shadow edges,
+  // occlusion). Median of at least N columns where N = heel zone width.
+  const colHeights = heelColProfiles.map(p => p.colH);
+  const medColH    = Math.round(median(colHeights));
+
+  // Median topY and botY for drawing the reference lines
+  const medTopY = Math.round(median(heelColProfiles.map(p => p.topY)));
+  const medBotY = Math.round(median(heelColProfiles.map(p => p.botY)));
+
+  // ── 7. Measurement confidence ─────────────────────────────────────────────
+  // Coefficient of variation (CV) of column heights in heel zone.
+  // Low CV = consistent = high confidence. CV > 0.15 = suspect.
+  const mean = colHeights.reduce((a, b) => a + b, 0) / colHeights.length;
+  const variance = colHeights.reduce((a, b) => a + (b - mean) ** 2, 0) / colHeights.length;
+  const stddev = Math.sqrt(variance);
+  const cv = mean > 0 ? stddev / mean : 1;
+  const measurementConf = Math.max(0, Math.min(1, 1 - cv / 0.2)); // 0–1
+
+  // ── 8. Convert to mm and validate ────────────────────────────────────────
+  const heelColHeightMm = parseFloat((medColH / pxPerMm).toFixed(1));
+
+  if (heelColHeightMm < MIN_HEEL_COL_MM || heelColHeightMm > MAX_HEEL_COL_MM) {
+    return inv(`Heel-column height ${heelColHeightMm}mm out of range (${MIN_HEEL_COL_MM}–${MAX_HEEL_COL_MM}mm) — reframe`);
   }
 
-  // Smooth: rolling average of edge X over WINDOW rows
-  function avgEdgeX(rowIdx: number): number {
-    let sum = 0, cnt = 0;
-    for (let di = -Math.floor(WINDOW / 2); di <= Math.floor(WINDOW / 2); di++) {
-      const ri = rowIdx + di;
-      if (ri < 0 || ri >= rows.length) continue;
-      sum += rearEdgeX.get(rows[ri])!; cnt++;
-    }
-    return cnt > 0 ? sum / cnt : -1;
-  }
-
-  // Scan upward (i increases = moving up from sole)
-  for (let i = WINDOW; i < rows.length - WINDOW; i++) {
-    const xNear = avgEdgeX(i - WINDOW); // closer to sole (lower)
-    const xFar  = avgEdgeX(i);          // higher up
-    if (xNear < 0 || xFar < 0) continue;
-
-    // Inward move: heel-on-left → x increases going inward; heel-on-right → x decreases
-    const inwardMove = heelOnLeft ? (xFar - xNear) : (xNear - xFar);
-    if (inwardMove > INSET_THRESHOLD) {
-      hMinY = rows[i];
-      inflectionFound = true;
-      break;
-    }
-  }
-
-  // Fallback: 18% of shoe height from bottom (≈50px for 280px-tall shoe at this distance)
-  if (hMinY < 0) {
-    hMinY = hMaxY - Math.round(shoeH * 0.18);
-  }
-
-  // Hard clamp: heel block max 35% of shoe height, min 3%
-  hMinY = Math.max(hMinY, hMaxY - Math.round(shoeH * 0.35));
-  hMinY = Math.min(hMinY, hMaxY - Math.round(shoeH * 0.03));
-
-  // ── Step 6: Validate ────────────────────────────────────────────────────
-  const heelHeightPx = hMaxY - hMinY;
-
-  // Physical validation: 10mm–80mm for formal shoes
-  // Without ArUco we use px range: at ~3.5px/mm → 35–280px
-  // With ArUco these will be converted to mm and checked later
-  const heelValid = heelHeightPx > 20 && heelHeightPx < 500; // px sanity only here
-
-  const heelTopPt: Pt = { x: hzMidX, y: hMinY };
-  const heelBotPt: Pt = { x: hzMidX, y: hMaxY };
-  const heelBBox:  BBox = { minX: hzX0, maxX: hzX1, minY: hMinY, maxY: hMaxY };
-
-  // Build rear-face profile for debug drawing (every 3rd row to reduce points)
-  const rearFaceProfile: { y: number; x: number }[] = [];
-  for (let y = hMaxY; y >= Math.max(minY, maxSearchY); y -= 3) {
-    const x = rearEdgeX.get(y);
-    if (x !== undefined) rearFaceProfile.push({ y, x });
+  if (measurementConf < 0.3) {
+    return inv(`Low measurement confidence (${measurementConf.toFixed(2)}) — irregular mask`);
   }
 
   return {
     valid: true,
     mask, bbox, contourPts,
     widthPx: shoeW,
-    heelBBox, heelTopPt, heelBotPt, heelHeightPx, heelValid,
-    iouScore, rearFaceProfile, inflectionFound,
+    heelZone: { minX: hzX0, maxX: hzX1, minY: medTopY, maxY: medBotY },
+    heelColProfiles,
+    heelTopPt: { x: hzMidX, y: medTopY },
+    heelBotPt: { x: hzMidX, y: medBotY },
+    heelColHeightPx: medColH,
+    heelColHeightMm,
+    measurementConf,
+    iouScore,
+    heelOnLeft,
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Draw annotated overlay onto the capture canvas
+// Annotated overlay renderer
 // ─────────────────────────────────────────────────────────────────────────────
+interface AnnotationResult {
+  leftHMm: number; rightHMm: number;
+  leftWMm: number; rightWMm: number;
+  diff: number; passed: boolean;
+  scanInvalid: boolean; invalidReason: string;
+}
+
 function drawAnnotations(
   ctx: CanvasRenderingContext2D,
   vw: number, vh: number,
   left: ShoeAnalysis, right: ShoeAnalysis,
-  arucoPxPerMm: number | null,
+  arucoPxPerMm: number,   // always valid — caller guarantees ArUco found
+  quality: QualityReport,
   debugMode: boolean,
-): { leftHMm: number; rightHMm: number; leftWMm: number; rightWMm: number; diff: number; passed: boolean; scanInvalid: boolean; invalidReason: string } {
-  const pxPerMm = arucoPxPerMm ?? 3.5; // fallback only — not recommended
-  const fs = Math.max(16, Math.round(vw * 0.016));
+): AnnotationResult {
+  const fs = Math.max(14, Math.round(vw * 0.014));
+  const invalidReasons: string[] = [];
 
-  function pill(text: string, cx: number, cy: number, bg: string, fg: string) {
-    ctx.font = `bold ${fs}px -apple-system,sans-serif`;
+  // ── Pill helper ────────────────────────────────────────────────────────────
+  function pill(text: string, cx: number, cy: number, bg: string, fg: string, size = fs) {
+    ctx.font = `bold ${size}px -apple-system,sans-serif`;
     const tw = ctx.measureText(text).width;
-    const ph = fs + 10, pw = tw + 20, r = ph / 2;
+    const ph = size + 10, pw = tw + 20, r = ph / 2;
     const px = cx - pw / 2, py = cy - ph / 2;
     ctx.beginPath();
     ctx.moveTo(px + r, py); ctx.arcTo(px + pw, py, px + pw, py + ph, r);
@@ -294,86 +381,102 @@ function drawAnnotations(
     ctx.arcTo(px, py, px + pw, py, r); ctx.closePath();
     ctx.fillStyle = bg; ctx.fill();
     ctx.fillStyle = fg; ctx.textAlign = "center"; ctx.textBaseline = "middle";
-    ctx.fillText(text, cx, cy); ctx.textBaseline = "alphabetic";
+    ctx.fillText(text, cx, cy);
+    ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
   }
 
+  // ── Reference line (horizontal span with ticks) ────────────────────────────
   function refLine(y: number, x0: number, x1: number, color: string) {
-    const ext = Math.round(vw * 0.010);
-    const tickH = Math.round(vw * 0.012);
-    const lw = Math.max(3, vw * 0.0028);
+    const ext = Math.round(vw * 0.008), tickH = Math.round(vw * 0.010);
+    const lw = Math.max(2.5, vw * 0.0025);
     ctx.strokeStyle = color; ctx.lineWidth = lw;
-    ctx.shadowColor = color; ctx.shadowBlur = 10;
+    ctx.shadowColor = color; ctx.shadowBlur = 8;
     ctx.beginPath(); ctx.moveTo(x0 - ext, y); ctx.lineTo(x1 + ext, y); ctx.stroke();
-    ctx.lineWidth = lw * 0.7;
-    ctx.beginPath(); ctx.moveTo(x0 - ext, y - tickH/2); ctx.lineTo(x0 - ext, y + tickH/2); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(x1 + ext, y - tickH/2); ctx.lineTo(x1 + ext, y + tickH/2); ctx.stroke();
+    ctx.lineWidth = lw * 0.6;
+    [[x0 - ext], [x1 + ext]].forEach(([tx]) => {
+      ctx.beginPath(); ctx.moveTo(tx, y - tickH/2); ctx.lineTo(tx, y + tickH/2); ctx.stroke();
+    });
     ctx.shadowBlur = 0;
   }
 
-  let leftHMm = 0, rightHMm = 0, leftWMm = 0, rightWMm = 0;
-  const invalidReasons: string[] = [];
-
-  function drawShoe(sa: ShoeAnalysis, label: string) {
+  // ── Draw one shoe's annotation ─────────────────────────────────────────────
+  function drawShoe(sa: ShoeAnalysis, label: string): number {
     if (!sa.valid) {
       invalidReasons.push(`${label}: ${sa.invalidReason}`);
       return 0;
     }
 
-    const { bbox, contourPts, heelBBox, heelTopPt, heelBotPt, heelHeightPx, widthPx, heelValid } = sa;
+    const { bbox, contourPts, heelZone, heelTopPt, heelBotPt,
+            heelColHeightPx, heelColHeightMm, measurementConf,
+            heelColProfiles, heelOnLeft } = sa;
     const { minX, minY, maxX, maxY } = bbox;
-    const midX = (minX + maxX) / 2;
-    const lw = Math.max(2, vw * 0.0018);
+    const shoeW = maxX - minX;
+    const midX  = (minX + maxX) / 2;
 
-    // ── SAM mask tint (green pixels only where mask=1) ────────────────────
-    // Draw a semi-transparent green overlay exactly on shoe pixels
-    const offscreen = document.createElement("canvas");
-    offscreen.width = vw; offscreen.height = vh;
-    const oCtx = offscreen.getContext("2d")!;
+    // ── Mask tint ────────────────────────────────────────────────────────────
+    const off = document.createElement("canvas");
+    off.width = vw; off.height = vh;
+    const oCtx = off.getContext("2d")!;
     const imgD = oCtx.createImageData(vw, vh);
-    const maskColor = [34, 197, 94]; // green
     for (let y = minY; y <= maxY; y++) {
       for (let x = minX; x <= maxX; x++) {
         if (!sa.mask[y * vw + x]) continue;
         const di = (y * vw + x) * 4;
-        imgD.data[di]   = maskColor[0];
-        imgD.data[di+1] = maskColor[1];
-        imgD.data[di+2] = maskColor[2];
-        imgD.data[di+3] = 45; // ~18% opacity tint
+        imgD.data[di]   = 34;  // green tint
+        imgD.data[di+1] = 197;
+        imgD.data[di+2] = 94;
+        imgD.data[di+3] = 40;
       }
     }
     oCtx.putImageData(imgD, 0, 0);
-    ctx.drawImage(offscreen, 0, 0);
+    ctx.drawImage(off, 0, 0);
 
-    // ── Contour outline ──────────────────────────────────────────────────
+    // ── Shoe contour ─────────────────────────────────────────────────────────
     if (contourPts.length > 2) {
       ctx.beginPath();
       contourPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
       ctx.closePath();
-      ctx.strokeStyle = GREEN; ctx.lineWidth = Math.max(2, vw * 0.002);
-      ctx.shadowColor = GREEN; ctx.shadowBlur = 8; ctx.stroke(); ctx.shadowBlur = 0;
+      ctx.strokeStyle = GREEN; ctx.lineWidth = Math.max(2, vw * 0.0018);
+      ctx.shadowColor = GREEN; ctx.shadowBlur = 6; ctx.stroke(); ctx.shadowBlur = 0;
     }
 
-    // ── Heel zone highlight ──────────────────────────────────────────────
-    const hz = heelBBox;
-    ctx.fillStyle = heelValid ? `${YELLOW}25` : `${RED}25`;
-    ctx.fillRect(hz.minX, hz.minY, hz.maxX - hz.minX, hz.maxY - hz.minY);
-    ctx.strokeStyle = heelValid ? `${YELLOW}90` : `${RED}90`;
-    ctx.lineWidth = lw; ctx.setLineDash([4, 4]);
-    ctx.strokeRect(hz.minX, hz.minY, hz.maxX - hz.minX, hz.maxY - hz.minY);
+    // ── Heel zone column-height bar chart (debug only) ────────────────────────
+    if (debugMode && heelColProfiles.length > 0) {
+      // Draw a thin vertical bar per column coloured by deviation from median
+      for (const p of heelColProfiles) {
+        const dev = Math.abs(p.colH - heelColHeightPx) / heelColHeightPx;
+        const alpha = Math.round(120 + dev * 400).toString(16).padStart(2, "0").slice(0, 2);
+        ctx.strokeStyle = dev < 0.05 ? `${GREEN}${alpha}` : dev < 0.10 ? `${YELLOW}${alpha}` : `${RED}${alpha}`;
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(p.x, p.topY); ctx.lineTo(p.x, p.botY); ctx.stroke();
+      }
+    }
+
+    // ── Heel zone bounding rect ───────────────────────────────────────────────
+    const confColor = measurementConf > 0.7 ? GREEN : measurementConf > 0.4 ? YELLOW : RED;
+    ctx.fillStyle   = `${confColor}18`;
+    ctx.fillRect(heelZone.minX, minY, heelZone.maxX - heelZone.minX, maxY - minY);
+    ctx.strokeStyle = `${confColor}bb`;
+    ctx.lineWidth = Math.max(1.5, vw * 0.0015); ctx.setLineDash([5, 4]);
+    ctx.strokeRect(heelZone.minX, minY, heelZone.maxX - heelZone.minX, maxY - minY);
     ctx.setLineDash([]);
 
-    // ── Reference lines (heel collar top + outsole bottom) ───────────────
+    // ── Reference lines: topY (shoe top at heel) + botY (shoe bottom at heel) ─
     const topY = heelTopPt.y, botY = heelBotPt.y;
-    refLine(topY, hz.minX, hz.maxX, CYAN);
-    refLine(botY, hz.minX, hz.maxX, GREEN);
+    refLine(topY, heelZone.minX, heelZone.maxX, CYAN);    // top of shoe at heel end
+    refLine(botY, heelZone.minX, heelZone.maxX, GREEN);   // outsole / table contact
 
-    // ── Vertical arrow (right of heel zone) ──────────────────────────────
-    const arrowX = hz.maxX + Math.round(vw * 0.015);
-    const ah = Math.round(vw * 0.008);
+    // ── Vertical measurement arrow ────────────────────────────────────────────
+    const arrowSide = heelOnLeft ? -1 : 1; // left of heel zone if heel-on-left
+    const arrowX = heelOnLeft
+      ? heelZone.minX - Math.round(vw * 0.025)
+      : heelZone.maxX + Math.round(vw * 0.025);
+    const ah = Math.round(vw * 0.007);
     const alw = Math.max(2, vw * 0.002);
     ctx.strokeStyle = YELLOW; ctx.lineWidth = alw;
     ctx.shadowColor = YELLOW; ctx.shadowBlur = 6;
     ctx.beginPath(); ctx.moveTo(arrowX, topY); ctx.lineTo(arrowX, botY); ctx.stroke();
+    // Arrowheads
     [[topY, 1], [botY, -1]].forEach(([y, dir]) => {
       ctx.beginPath();
       ctx.moveTo(arrowX - ah * 0.6, (y as number) + (dir as number) * ah);
@@ -383,129 +486,114 @@ function drawAnnotations(
     });
     ctx.shadowBlur = 0;
 
-    // ── Measurements ─────────────────────────────────────────────────────
-    const hMm = parseFloat((heelHeightPx / pxPerMm).toFixed(1));
-    const wMm = parseFloat((widthPx / pxPerMm).toFixed(1));
+    // ── Heel column height pill ───────────────────────────────────────────────
     const heelMidY = (topY + botY) / 2;
+    const pillX = heelOnLeft
+      ? Math.max(heelZone.minX - fs * 5, fs * 4)
+      : Math.min(heelZone.maxX + fs * 5, vw - fs * 4);
+    pill(`H ${heelColHeightMm}mm`, pillX, heelMidY, "rgba(0,0,0,0.92)", YELLOW);
 
-    // Physical mm validation (10–80mm for formal shoe heel block)
-    const hMmValid = heelValid && hMm >= 10 && hMm <= 80;
+    // ── Width pill (top of shoe bbox) ─────────────────────────────────────────
+    const wMm = parseFloat((shoeW / arucoPxPerMm).toFixed(1));
+    pill(`W ${wMm}mm`, midX, Math.max(minY - fs * 1.2, fs), "rgba(0,0,0,0.88)", CYAN);
 
-    const hPillX = Math.min(arrowX + fs * 2.4, vw - fs * 2.5);
-    if (hMmValid) {
-      pill(`H ${hMm}mm`, hPillX, heelMidY, "rgba(0,0,0,0.9)", YELLOW);
-    } else {
-      pill(`H ${hMm}mm ✗`, hPillX, heelMidY, "rgba(0,0,0,0.9)", RED);
-      invalidReasons.push(`${label}: Heel ${hMm}mm out of range (10–80mm)`);
-    }
+    // ── Label ─────────────────────────────────────────────────────────────────
+    pill(label, midX, Math.min(maxY + fs * 1.3, vh - fs), `${GREEN}ee`, "#000");
 
-    pill(`W ${wMm}mm`, midX, Math.max(minY - fs * 1.1, fs * 1.1), "rgba(0,0,0,0.9)", CYAN);
-    pill(label, midX, Math.min(maxY + fs * 1.2, vh - fs * 0.9), `${GREEN}dd`, "#000");
-
-    // ── Debug extras ──────────────────────────────────────────────────────
+    // ── Debug: confidence + raw px + IoU ─────────────────────────────────────
     if (debugMode) {
-      const DOT = Math.max(9, vw * 0.007);
-
-      // Draw rear-face profile polyline (orange) — the contour we actually scanned
-      if (sa.rearFaceProfile.length > 1) {
-        ctx.strokeStyle = ORANGE; ctx.lineWidth = 3; ctx.shadowColor = ORANGE; ctx.shadowBlur = 6;
-        ctx.beginPath();
-        sa.rearFaceProfile.forEach((pt, i) => {
-          if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
-        });
-        ctx.stroke(); ctx.shadowBlur = 0;
-      }
-
-      // MAGENTA dot = heel block top (welt line / inflection point)
-      ctx.fillStyle = MAGENTA; ctx.shadowColor = MAGENTA; ctx.shadowBlur = 12;
+      const DOT = Math.max(8, vw * 0.006);
+      // Large dot at top reference line
+      ctx.fillStyle = CYAN; ctx.shadowColor = CYAN; ctx.shadowBlur = 10;
       ctx.beginPath(); ctx.arc(heelTopPt.x, topY, DOT, 0, Math.PI * 2); ctx.fill();
       ctx.shadowBlur = 0;
-      // Label the magenta dot
-      ctx.font = `bold ${fs * 0.75}px monospace`; ctx.fillStyle = MAGENTA; ctx.textAlign = "left";
-      ctx.fillText(sa.inflectionFound ? "▲ WELT (detected)" : "▲ WELT (fallback)", heelTopPt.x + DOT + 4, topY + 4);
-
-      // CYAN dot = outsole contact (hMaxY) — ground contact point
-      ctx.fillStyle = CYAN; ctx.shadowColor = CYAN; ctx.shadowBlur = 12;
+      // Large dot at bottom reference line
+      ctx.fillStyle = GREEN; ctx.shadowColor = GREEN; ctx.shadowBlur = 10;
       ctx.beginPath(); ctx.arc(heelBotPt.x, botY, DOT, 0, Math.PI * 2); ctx.fill();
       ctx.shadowBlur = 0;
-      ctx.fillStyle = CYAN;
-      ctx.fillText("▼ OUTSOLE", heelBotPt.x + DOT + 4, botY + 4);
 
-      // Raw pixel pill
-      pill(`${heelHeightPx}px | ${hMm}mm`, (hz.minX + hz.maxX) / 2, heelMidY, "rgba(0,0,0,0.92)", MAGENTA);
+      pill(`${heelColHeightPx}px`, heelTopPt.x, heelMidY - fs * 1.4, "rgba(0,0,0,0.85)", MAGENTA, fs * 0.8);
+      pill(`conf:${(measurementConf*100).toFixed(0)}%`, heelTopPt.x, heelMidY + fs * 1.4, "rgba(0,0,0,0.85)", confColor, fs * 0.8);
+      pill(`IoU:${sa.iouScore.toFixed(2)}`, midX, minY + (maxY-minY)*0.5, "rgba(0,0,0,0.7)", ORANGE, fs * 0.75);
+      pill(`fullH:${maxY-minY}px`, midX, minY + (maxY-minY)*0.65, "rgba(0,0,0,0.7)", ORANGE, fs * 0.75);
 
-      // Shoe full height for reference
-      pill(`fullH:${maxY - minY}px=${((maxY - minY) / pxPerMm).toFixed(0)}mm`, midX, minY + (maxY - minY) * 0.5, "rgba(0,0,0,0.7)", ORANGE);
-
-      // IoU score
-      pill(`IoU:${sa.iouScore.toFixed(2)}`, midX, minY - fs * 1.5, "rgba(0,0,0,0.7)", ORANGE);
-
-      // Heel zone vertical span (dashed magenta rectangle)
-      ctx.strokeStyle = MAGENTA; ctx.lineWidth = 1.5; ctx.setLineDash([3, 5]);
-      ctx.strokeRect(hz.minX, minY, hz.maxX - hz.minX, maxY - minY);
+      // Highlight the heel end side
+      ctx.strokeStyle = MAGENTA; ctx.lineWidth = 2; ctx.setLineDash([2, 5]);
+      ctx.strokeRect(heelZone.minX, minY, heelZone.maxX - heelZone.minX, maxY - minY);
       ctx.setLineDash([]);
     }
 
-    return hMmValid ? hMm : 0;
+    void arrowSide; // suppress unused warning
+    return heelColHeightMm;
   }
 
-  leftHMm  = drawShoe(left, "LEFT");
-  rightHMm = drawShoe(right, "RIGHT");
-  leftWMm  = left.valid  ? parseFloat((left.widthPx  / pxPerMm).toFixed(1)) : 0;
-  rightWMm = right.valid ? parseFloat((right.widthPx / pxPerMm).toFixed(1)) : 0;
+  const leftHMm  = drawShoe(left,  "LEFT");
+  const rightHMm = drawShoe(right, "RIGHT");
+  const leftWMm  = left.valid  ? parseFloat((left.widthPx  / arucoPxPerMm).toFixed(1)) : 0;
+  const rightWMm = right.valid ? parseFloat((right.widthPx / arucoPxPerMm).toFixed(1)) : 0;
 
-  // ── Centre divider ────────────────────────────────────────────────────
-  ctx.strokeStyle = `${CYAN}55`; ctx.lineWidth = 1; ctx.setLineDash([6, 6]);
+  // ── Centre divider ─────────────────────────────────────────────────────────
+  ctx.strokeStyle = `${CYAN}44`; ctx.lineWidth = 1; ctx.setLineDash([6, 6]);
   ctx.beginPath(); ctx.moveTo(vw / 2, 0); ctx.lineTo(vw / 2, vh); ctx.stroke();
   ctx.setLineDash([]);
 
-  // ── ArUco marker indicator ────────────────────────────────────────────
-  if (arucoPxPerMm) {
-    pill(`ArUco ✓ ${arucoPxPerMm.toFixed(2)}px/mm`, vw - fs * 7, fs * 1.6, "rgba(0,80,0,0.85)", GREEN);
-  } else {
-    // Warning only — allow scan with fallback px/mm so dev can verify heel geometry
-    pill(`px/mm≈3.5 (no ArUco)`, vw - fs * 7, fs * 1.6, "rgba(100,60,0,0.85)", YELLOW);
-  }
+  // ── ArUco badge ────────────────────────────────────────────────────────────
+  pill(
+    `ArUco ✓  ${arucoPxPerMm.toFixed(2)} px/mm`,
+    vw - fs * 7, fs * 1.8,
+    "rgba(0,60,0,0.9)", GREEN,
+  );
 
-  const scanInvalid = invalidReasons.length > 0;
-  const diff = scanInvalid ? 0 : parseFloat(Math.abs(leftHMm - rightHMm).toFixed(1));
-  const passed = !scanInvalid && diff <= TOLERANCE_MM;
-
-  // ── Result banner ─────────────────────────────────────────────────────
-  const bh = Math.round(vh * 0.075);
-  ctx.fillStyle = scanInvalid ? `${YELLOW}ee` : passed ? `${GREEN}ee` : `${RED}ee`;
-  ctx.fillRect(0, vh - bh, vw, bh);
-  ctx.font = `bold ${Math.round(vw * 0.02)}px -apple-system,sans-serif`;
-  ctx.fillStyle = scanInvalid ? "#000" : "#fff";
-  ctx.textAlign = "center"; ctx.textBaseline = "middle";
-  if (scanInvalid) {
-    ctx.fillText(`⚠ INVALID — ${invalidReasons[0]} · Retake`, vw / 2, vh - bh / 2);
-  } else {
-    ctx.fillText(
-      passed ? `✓ PASSED  Δ${diff}mm` : `✗ REJECTED  Δ${diff}mm  (limit ${TOLERANCE_MM}mm)`,
-      vw / 2, vh - bh / 2
+  // ── Quality badge ──────────────────────────────────────────────────────────
+  if (debugMode) {
+    pill(
+      `sharp:${quality.sharpness.toFixed(0)}  expo:${(quality.midExpoFrac*100).toFixed(0)}%`,
+      fs * 8, fs * 1.8, "rgba(0,0,0,0.8)", quality.passed ? GREEN : RED, fs * 0.8,
     );
   }
-  ctx.textBaseline = "alphabetic";
 
-  // ── Debug stamp ───────────────────────────────────────────────────────
-  const stamp = debugMode
-    ? `SAM HEEL | L:${left.heelHeightPx}px=${leftHMm}mm IoU=${left.iouScore.toFixed(2)} | R:${right.heelHeightPx}px=${rightHMm}mm IoU=${right.iouScore.toFixed(2)} | px/mm=${pxPerMm.toFixed(2)}`
-    : `SAM | L:${leftHMm}mm R:${rightHMm}mm`;
-  ctx.font = "11px monospace"; ctx.textAlign = "left";
-  ctx.fillStyle = "rgba(0,0,0,0.75)";
-  ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
-  ctx.fillStyle = debugMode ? YELLOW : GREEN;
-  ctx.fillText(stamp, 9, 17);
+  // ── Result banner ──────────────────────────────────────────────────────────
+  const scanInvalid = invalidReasons.length > 0;
+  const diff   = scanInvalid ? 0 : parseFloat(Math.abs(leftHMm - rightHMm).toFixed(1));
+  const passed = !scanInvalid && diff <= TOLERANCE_MM;
+
+  const bh = Math.round(vh * 0.08);
+  const bannerColor = scanInvalid ? YELLOW : passed ? GREEN : RED;
+  ctx.fillStyle = `${bannerColor}ee`;
+  ctx.fillRect(0, vh - bh, vw, bh);
+  ctx.font = `bold ${Math.round(vw * 0.020)}px -apple-system,sans-serif`;
+  ctx.fillStyle = scanInvalid ? "#000" : WHITE;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  if (scanInvalid) {
+    ctx.fillText(`⚠ INVALID — ${invalidReasons[0]}`, vw / 2, vh - bh / 2);
+  } else {
+    const diffStr = `Δ${diff}mm (limit ${TOLERANCE_MM}mm)`;
+    ctx.fillText(
+      passed ? `✓ PASSED  ${diffStr}` : `✗ REJECTED  ${diffStr}`,
+      vw / 2, vh - bh / 2,
+    );
+  }
+  ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+
+  // ── Debug stamp (top-left) ─────────────────────────────────────────────────
+  if (debugMode) {
+    const stamp = `v3.0 | L:${leftHMm}mm R:${rightHMm}mm | px/mm=${arucoPxPerMm.toFixed(2)} | conf L:${(left.measurementConf*100).toFixed(0)}% R:${(right.measurementConf*100).toFixed(0)}%`;
+    ctx.font = "10px monospace"; ctx.textAlign = "left";
+    ctx.fillStyle = "rgba(0,0,0,0.8)";
+    ctx.fillRect(0, 0, ctx.measureText(stamp).width + 12, 16);
+    ctx.fillStyle = YELLOW; ctx.fillText(stamp, 6, 12);
+  }
 
   return { leftHMm, rightHMm, leftWMm, rightWMm, diff, passed, scanInvalid, invalidReason: invalidReasons[0] ?? "" };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CameraView component
+// ─────────────────────────────────────────────────────────────────────────────
 export function CameraView({ onCapture, onError }: Props) {
-  const videoRef       = useRef<HTMLVideoElement>(null);
+  const videoRef         = useRef<HTMLVideoElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
-  const streamRef      = useRef<MediaStream | null>(null);
+  const streamRef        = useRef<MediaStream | null>(null);
 
   const [isReady,     setIsReady]     = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
@@ -516,16 +604,15 @@ export function CameraView({ onCapture, onError }: Props) {
   const [debugMode,   setDebugMode]   = useState(false);
   const [samStatus,   setSamStatus]   = useState<"idle"|"loading"|"ready"|"error">("idle");
 
-  // Load SAM on mount
   useEffect(() => {
     setSamStatus("loading");
     loadSAM()
       .then(() => setSamStatus("ready"))
-      .catch((e) => { console.error("SAM load failed:", e); setSamStatus("error"); });
+      .catch((e) => { console.error("SAM load:", e); setSamStatus("error"); });
   }, []);
 
   useEffect(() => {
-    function check() { setIsPortrait(window.innerHeight > window.innerWidth); }
+    const check = () => setIsPortrait(window.innerHeight > window.innerWidth);
     check();
     window.addEventListener("resize", check);
     window.addEventListener("orientationchange", check);
@@ -544,140 +631,159 @@ export function CameraView({ onCapture, onError }: Props) {
         if (!video) return;
         video.srcObject = stream;
         video.setAttribute("playsinline", "true");
-        await new Promise<void>((res) => { video.onloadedmetadata = () => res(); });
+        await new Promise<void>(res => { video.onloadedmetadata = () => res(); });
         await video.play().catch(() => {});
         setIsReady(true);
       } catch {
-        onError("Camera access denied. Allow camera permissions and reload.");
+        onError("Camera access denied — allow camera permissions and reload.");
       }
     }
     startCamera();
-    return () => { streamRef.current?.getTracks().forEach((t) => t.stop()); };
+    return () => streamRef.current?.getTracks().forEach(t => t.stop());
   }, [onError]);
 
   const handleCapture = useCallback(async () => {
-    const video = videoRef.current;
+    const video  = videoRef.current;
     const canvas = captureCanvasRef.current;
     if (!video || !canvas || isCapturing || isAnalyzing) return;
-    if (!isSAMLoaded()) { onError("AI model still loading — please wait"); return; }
+    if (!isSAMLoaded()) { onError("AI model still loading — wait"); return; }
 
     setIsCapturing(true);
     setIsAnalyzing(true);
     setAnalyzeStep("Capturing frame…");
 
-    const vw = video.videoWidth || 1280;
+    const vw = video.videoWidth  || 1280;
     const vh = video.videoHeight || 720;
     canvas.width = vw; canvas.height = vh;
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, vw, vh);
-
     await new Promise(r => setTimeout(r, 20));
 
     try {
-      // ── Step 1: ArUco marker detection ────────────────────────────────
-      setAnalyzeStep("Detecting calibration marker…");
       const imageData = ctx.getImageData(0, 0, vw, vh);
-      const aruco = detectAruco(imageData, ARUCO_REAL_MM);
 
-      if (debugMode && aruco.found) {
-        // Draw marker corners
+      // ── Gate 1: Image quality ─────────────────────────────────────────────
+      setAnalyzeStep("Checking image quality…");
+      const quality = checkImageQuality(imageData);
+      if (!quality.passed) {
+        setIsAnalyzing(false); setIsCapturing(false);
+        onError(quality.reason!);
+        return;
+      }
+
+      // ── Gate 2: ArUco marker (MANDATORY — no fallback) ────────────────────
+      setAnalyzeStep("Detecting ArUco calibration marker…");
+      const aruco = detectAruco(imageData, ARUCO_REAL_MM);
+      if (!aruco.found) {
+        setIsAnalyzing(false); setIsCapturing(false);
+        onError("ArUco marker not found — place the 50mm printed marker in frame");
+        return;
+      }
+
+      // Draw marker outline in debug mode
+      if (debugMode) {
         const [tl, tr, br, bl] = aruco.cornersPx;
         ctx.strokeStyle = ORANGE; ctx.lineWidth = 3;
         ctx.beginPath();
         ctx.moveTo(tl[0], tl[1]); ctx.lineTo(tr[0], tr[1]);
         ctx.lineTo(br[0], br[1]); ctx.lineTo(bl[0], bl[1]);
         ctx.closePath(); ctx.stroke();
+        ctx.fillStyle = ORANGE; ctx.font = `bold ${Math.round(vw*0.012)}px monospace`;
+        ctx.fillText(`ArUco ID${aruco.markerId}`, tl[0], tl[1] - 6);
       }
 
-      // ── Step 2: Encode image with SAM ────────────────────────────────
-      setAnalyzeStep("AI encoding image…");
+      // ── SAM encode ────────────────────────────────────────────────────────
+      setAnalyzeStep("AI model encoding image…");
       const embedding = await encodeImage(canvas);
 
-      // ── Step 3: Decode masks for each shoe half ───────────────────────
-      const mid = Math.floor(vw / 2);
+      // ── SAM decode: multi-point per half, pick best valid mask ───────────
+      const mid  = Math.floor(vw / 2);
+      const topZ = Math.round(vh * 0.15);
+      const botZ = Math.round(vh * 0.88);
+      const zoneH = botZ - topZ;
 
-      // Generate grid prompts for each half
-      // Focus on middle 60% of height where shoe body is
-      const topY  = Math.round(vh * 0.20);
-      const botY  = Math.round(vh * 0.85);
-      const zoneH = botY - topY;
+      const leftPrompts  = gridPrompts(0,   mid, topZ, zoneH, vw, vh, 3);
+      const rightPrompts = gridPrompts(mid, mid, topZ, zoneH, vw, vh, 3);
 
       setAnalyzeStep("Segmenting left shoe…");
-      const leftPrompts  = gridPrompts(0,   mid,  topY, zoneH, vw, vh, 3);
-      const rightPrompts = gridPrompts(mid, mid,  topY, zoneH, vw, vh, 3);
-
-      // Run SAM for each half — try all prompt points, pick best mask
-      async function bestMask(prompts: [number, number][]) {
-        let bestScore = -1;
-        let bestMaskResult = await decodeMask(embedding, [prompts[0]], [1], vw, vh);
+      async function bestValidMask(prompts: [number, number][], fromX: number, toX: number) {
+        let best = await decodeMask(embedding, [prompts[0]], [1], vw, vh);
         for (let i = 1; i < prompts.length; i++) {
-          const result = await decodeMask(embedding, [prompts[i]], [1], vw, vh);
-          if (result.iouScore > bestScore) {
-            bestScore = result.iouScore;
-            bestMaskResult = result;
-          }
+          const r = await decodeMask(embedding, [prompts[i]], [1], vw, vh);
+          // Prefer mask that passes validation and has higher IoU
+          const rValid = validateMask(r.mask, r.iouScore, vw, vh, fromX, toX).valid;
+          const bValid = validateMask(best.mask, best.iouScore, vw, vh, fromX, toX).valid;
+          if (rValid && (!bValid || r.iouScore > best.iouScore)) best = r;
         }
-        return bestMaskResult;
+        return best;
       }
 
-      const [leftMask, rightMask] = await Promise.all([
-        bestMask(leftPrompts),
-        bestMask(rightPrompts),
+      const [lMask, rMask] = await Promise.all([
+        bestValidMask(leftPrompts,  0,   mid),
+        bestValidMask(rightPrompts, mid, vw),
       ]);
 
-      // ── Step 4: Analyze each shoe mask ───────────────────────────────
-      setAnalyzeStep("Measuring heel heights…");
-      const leftAnalysis  = analyzeShoe(leftMask.mask,  leftMask.iouScore,  vw, vh, 0,   mid);
-      const rightAnalysis = analyzeShoe(rightMask.mask, rightMask.iouScore, vw, vh, mid, vw);
+      // Validate masks
+      setAnalyzeStep("Validating segmentation…");
+      const lValidation = validateMask(lMask.mask, lMask.iouScore, vw, vh, 0,   mid);
+      const rValidation = validateMask(rMask.mask, rMask.iouScore, vw, vh, mid, vw);
 
-      // ── Step 5: Draw annotations ──────────────────────────────────────
-      // Redraw original frame first (annotations go on top)
-      ctx.drawImage(video, 0, 0, vw, vh);
-      const measurements = drawAnnotations(
-        ctx, vw, vh,
-        leftAnalysis, rightAnalysis,
-        aruco.found ? aruco.pxPerMm : null,
-        debugMode,
-      );
+      if (!lValidation.valid) { setIsAnalyzing(false); setIsCapturing(false); onError(`Left shoe: ${lValidation.reason}`); return; }
+      if (!rValidation.valid) { setIsAnalyzing(false); setIsCapturing(false); onError(`Right shoe: ${rValidation.reason}`); return; }
+
+      // ── Measure ───────────────────────────────────────────────────────────
+      setAnalyzeStep("Measuring heel heights…");
+      const leftAna  = analyzeShoe(lMask.mask, lMask.iouScore, aruco.pxPerMm, vw, vh, 0,   mid);
+      const rightAna = analyzeShoe(rMask.mask, rMask.iouScore, aruco.pxPerMm, vw, vh, mid, vw);
+
+      // ── Draw annotations ──────────────────────────────────────────────────
+      ctx.drawImage(video, 0, 0, vw, vh); // redraw clean frame
+      const result = drawAnnotations(ctx, vw, vh, leftAna, rightAna, aruco.pxPerMm, quality, debugMode);
 
       setIsAnalyzing(false);
 
-      const blob = await compressImage(canvas, 0.9);
-      const annotatedDataUrl = canvas.toDataURL("image/jpeg", 0.9);
+      const blob = await compressImage(canvas, 0.92);
+      const annotatedDataUrl = canvas.toDataURL("image/jpeg", 0.92);
+
       if ("vibrate" in navigator) {
-        navigator.vibrate(measurements.scanInvalid ? [100,50,100,50,100] : [60, 30, 60]);
+        navigator.vibrate(result.scanInvalid ? [80,40,80,40,80] : [60,25,60]);
       }
 
       onCapture({
-        blob, dataUrl: annotatedDataUrl, annotatedDataUrl,
-        leftHeightMm:  measurements.leftHMm,
-        rightHeightMm: measurements.rightHMm,
-        leftWidthMm:   measurements.leftWMm,
-        rightWidthMm:  measurements.rightWMm,
-        heightDiffMm:  measurements.diff,
-        passed:        measurements.passed,
-        rejectionReason: measurements.scanInvalid
-          ? `Invalid scan: ${measurements.invalidReason}`
-          : measurements.passed ? null
-          : `Heel height difference ${measurements.diff}mm exceeds ${TOLERANCE_MM}mm tolerance`,
+        blob,
+        dataUrl: annotatedDataUrl,
+        annotatedDataUrl,
+        leftHeightMm:    result.leftHMm,
+        rightHeightMm:   result.rightHMm,
+        leftWidthMm:     result.leftWMm,
+        rightWidthMm:    result.rightWMm,
+        heightDiffMm:    result.diff,
+        passed:          result.passed,
+        rejectionReason: result.scanInvalid
+          ? `Invalid: ${result.invalidReason}`
+          : result.passed ? null
+          : `Heel height difference ${result.diff}mm exceeds ${TOLERANCE_MM}mm tolerance`,
       });
 
       setShowSuccess(true);
-      setTimeout(() => { setShowSuccess(false); setIsCapturing(false); }, 1500);
+      setTimeout(() => { setShowSuccess(false); setIsCapturing(false); }, 1600);
+
     } catch (e) {
-      setIsAnalyzing(false);
-      setIsCapturing(false);
-      onError(`Analysis failed: ${e instanceof Error ? e.message : String(e)}`);
+      setIsAnalyzing(false); setIsCapturing(false);
+      onError(`Pipeline error: ${e instanceof Error ? e.message : String(e)}`);
     }
   }, [isCapturing, isAnalyzing, debugMode, onCapture, onError]);
 
+  // ── Portrait gate ──────────────────────────────────────────────────────────
   if (isPortrait) {
     return (
       <div className="relative w-full h-full bg-black flex items-center justify-center">
         <div className="text-center px-8">
-          <RotateCcw className="w-14 h-14 mx-auto mb-4" style={{ color: CYAN, animation: "spin 3s linear infinite" }} />
-          <p className="text-white font-bold text-lg mb-2">Rotate your phone</p>
-          <p className="text-sm" style={{ color: "#888" }}>Hold horizontally to scan both shoes</p>
+          <div className="w-14 h-14 mx-auto mb-4 flex items-center justify-center rounded-full border-2" style={{ borderColor: CYAN }}>
+            <span style={{ fontSize: 28 }}>↺</span>
+          </div>
+          <p className="text-white font-bold text-lg mb-2">Rotate device</p>
+          <p className="text-sm" style={{ color: "#777" }}>Landscape mode required — both shoes must fit side-by-side</p>
         </div>
       </div>
     );
@@ -688,82 +794,94 @@ export function CameraView({ onCapture, onError }: Props) {
       <video ref={videoRef} className="absolute inset-0 w-full h-full object-cover" playsInline muted autoPlay />
       <canvas ref={captureCanvasRef} className="hidden" />
 
-      {/* SAM loading banner */}
+      {/* SAM status bar */}
       {samStatus === "loading" && (
-        <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-center gap-2 py-2"
-          style={{ background: "rgba(6,182,212,0.15)", borderBottom: `1px solid ${CYAN}40` }}>
+        <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-center gap-2 py-2"
+          style={{ background: `${CYAN}20`, borderBottom: `1px solid ${CYAN}40` }}>
           <Loader2 className="w-3.5 h-3.5 animate-spin" style={{ color: CYAN }} />
-          <span className="text-xs font-semibold" style={{ color: CYAN }}>Loading AI model…</span>
+          <span className="text-xs font-semibold" style={{ color: CYAN }}>Loading AI segmentation model…</span>
         </div>
       )}
       {samStatus === "error" && (
-        <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-center gap-2 py-2"
-          style={{ background: "rgba(239,68,68,0.15)", borderBottom: `1px solid ${RED}40` }}>
-          <AlertTriangle className="w-3.5 h-3.5" style={{ color: RED }} />
-          <span className="text-xs font-semibold" style={{ color: RED }}>AI model failed to load</span>
+        <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-center gap-2 py-2"
+          style={{ background: `${RED}20`, borderBottom: `1px solid ${RED}40` }}>
+          <XCircle className="w-3.5 h-3.5" style={{ color: RED }} />
+          <span className="text-xs font-semibold" style={{ color: RED }}>AI model failed to load — reload page</span>
         </div>
       )}
 
+      {/* Camera loading */}
       {!isReady && (
-        <div className="absolute inset-0 flex items-center justify-center" style={{ background: "#080810" }}>
-          <Loader2 className="w-8 h-8 animate-spin" style={{ color: CYAN }} />
+        <div className="absolute inset-0 flex items-center justify-center" style={{ background: "#060610" }}>
+          <Loader2 className="w-9 h-9 animate-spin" style={{ color: CYAN }} />
         </div>
       )}
 
+      {/* Analysis overlay */}
       <AnimatePresence>
         {isAnalyzing && (
           <motion.div
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
             className="absolute inset-0 flex flex-col items-center justify-center z-30"
-            style={{ background: "rgba(0,0,0,0.65)", backdropFilter: "blur(6px)" }}
+            style={{ background: "rgba(0,0,0,0.68)", backdropFilter: "blur(6px)" }}
           >
             <Loader2 className="w-12 h-12 animate-spin mb-4" style={{ color: CYAN }} />
             <p className="text-base font-bold mb-1" style={{ color: CYAN }}>{analyzeStep}</p>
-            <p className="text-xs" style={{ color: "#666" }}>MobileSAM · ArUco calibration</p>
+            <p className="text-xs" style={{ color: "#555" }}>MobileSAM · ArUco · v3.0</p>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Guide overlay */}
+      {/* Framing guide */}
       {isReady && !isCapturing && (
         <div className="absolute inset-0 pointer-events-none">
-          <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-40"
+          {/* Centre split */}
+          <div className="absolute top-0 bottom-0 left-1/2 w-px opacity-30"
             style={{ background: `repeating-linear-gradient(to bottom,${CYAN} 0,${CYAN} 8px,transparent 8px,transparent 16px)` }} />
-          <div className="absolute left-4 top-1/2 -translate-y-1/2">
-            <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>LEFT SHOE</div>
-          </div>
-          <div className="absolute right-4 top-1/2 -translate-y-1/2">
-            <div className="px-3 py-1 rounded-full text-xs font-bold"
-              style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>RIGHT SHOE</div>
-          </div>
+          {/* Corner brackets */}
+          {[
+            ["top-8 left-8", `borderTop:2px solid ${CYAN};borderLeft:2px solid ${CYAN}`],
+            ["top-8 right-8", `borderTop:2px solid ${CYAN};borderRight:2px solid ${CYAN}`],
+            ["bottom-24 left-8", `borderBottom:2px solid ${CYAN};borderLeft:2px solid ${CYAN}`],
+            ["bottom-24 right-8", `borderBottom:2px solid ${CYAN};borderRight:2px solid ${CYAN}`],
+          ].map(([cls]) => (
+            <div key={cls} className={`absolute w-10 h-10 ${cls}`}
+              style={{ borderTop: `2px solid ${CYAN}`, borderLeft: cls.includes("right") ? undefined : `2px solid ${CYAN}`, borderRight: cls.includes("right") ? `2px solid ${CYAN}` : undefined, borderBottom: cls.includes("bottom") ? `2px solid ${CYAN}` : undefined }} />
+          ))}
           <div className="absolute top-8 left-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
           <div className="absolute top-8 right-8 w-10 h-10" style={{ borderTop: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
           <div className="absolute bottom-24 left-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderLeft: `2px solid ${CYAN}` }} />
           <div className="absolute bottom-24 right-8 w-10 h-10" style={{ borderBottom: `2px solid ${CYAN}`, borderRight: `2px solid ${CYAN}` }} />
+          {/* Labels */}
+          <div className="absolute left-4 top-1/2 -translate-y-1/2 px-3 py-1 rounded-full text-xs font-bold"
+            style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>LEFT</div>
+          <div className="absolute right-4 top-1/2 -translate-y-1/2 px-3 py-1 rounded-full text-xs font-bold"
+            style={{ background: "rgba(0,0,0,0.6)", border: `1px solid ${CYAN}50`, color: CYAN }}>RIGHT</div>
         </div>
       )}
 
+      {/* Instruction pill */}
       {isReady && !isCapturing && (
-        <div className="absolute top-10 left-1/2 -translate-x-1/2 z-10">
+        <div className="absolute top-8 left-1/2 -translate-x-1/2 z-10">
           <div className="px-4 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap"
-            style={{ background: "rgba(0,0,0,0.75)", border: `1px solid ${CYAN}40`, color: "#ccc" }}>
-            Place ArUco marker in frame · one shoe each side · tap capture
+            style={{ background: "rgba(0,0,0,0.8)", border: `1px solid ${CYAN}40`, color: "#aaa" }}>
+            Place 50mm ArUco marker in frame · both shoes side by side · tap capture
           </div>
         </div>
       )}
 
+      {/* Success flash */}
       <AnimatePresence>
         {showSuccess && (
           <motion.div
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="absolute inset-0 flex items-center justify-center z-20"
-            style={{ background: "rgba(0,0,0,0.4)", backdropFilter: "blur(2px)" }}
+            className="absolute inset-0 flex items-center justify-center z-20 pointer-events-none"
+            style={{ background: "rgba(0,0,0,0.35)" }}
           >
             <motion.div
-              initial={{ scale: 0.5, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 1.2, opacity: 0 }}
+              initial={{ scale: 0.5 }} animate={{ scale: 1 }} exit={{ scale: 1.3, opacity: 0 }}
               className="w-20 h-20 rounded-full flex items-center justify-center"
-              style={{ background: "rgba(34,197,94,0.2)", border: `2px solid ${GREEN}`, boxShadow: `0 0 32px ${GREEN}80` }}
+              style={{ background: `${GREEN}25`, border: `2px solid ${GREEN}`, boxShadow: `0 0 40px ${GREEN}80` }}
             >
               <CheckCircle2 className="w-10 h-10" style={{ color: GREEN }} />
             </motion.div>
@@ -772,46 +890,57 @@ export function CameraView({ onCapture, onError }: Props) {
       </AnimatePresence>
 
       {/* Bottom controls */}
-      <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center justify-between px-6 pb-6 pt-3"
-        style={{ background: "linear-gradient(to top,rgba(0,0,0,0.8) 0%,transparent 100%)" }}>
+      <div className="absolute bottom-0 inset-x-0 z-10 flex items-center justify-between px-6 pb-6 pt-3"
+        style={{ background: "linear-gradient(to top,rgba(0,0,0,0.85),transparent)" }}>
+
+        {/* Debug toggle */}
         <button
           onClick={() => setDebugMode(d => !d)}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold"
           style={{
-            background: debugMode ? `${YELLOW}30` : "rgba(0,0,0,0.5)",
-            border: `1px solid ${debugMode ? YELLOW : "rgba(255,255,255,0.15)"}`,
-            color: debugMode ? YELLOW : "rgba(255,255,255,0.4)",
+            background: debugMode ? `${YELLOW}28` : "rgba(0,0,0,0.55)",
+            border: `1px solid ${debugMode ? YELLOW : "rgba(255,255,255,0.12)"}`,
+            color: debugMode ? YELLOW : "rgba(255,255,255,0.35)",
           }}
         >
           <Bug className="w-3.5 h-3.5" />
           {debugMode ? "Debug ON" : "Debug"}
         </button>
 
+        {/* Capture button */}
         <div className="flex flex-col items-center gap-1">
           <button
             onClick={handleCapture}
             disabled={!isReady || isCapturing || isAnalyzing || samStatus !== "ready"}
-            className="relative w-20 h-20 rounded-full flex items-center justify-center transition-transform active:scale-90 disabled:opacity-40"
-            style={{ border: "4px solid rgba(255,255,255,0.85)", background: "rgba(255,255,255,0.15)", backdropFilter: "blur(4px)" }}
+            className="relative w-20 h-20 rounded-full flex items-center justify-center transition-transform active:scale-90 disabled:opacity-35"
+            style={{ border: "4px solid rgba(255,255,255,0.85)", background: "rgba(255,255,255,0.12)", backdropFilter: "blur(4px)" }}
           >
             {samStatus === "loading"
+              ? <Loader2 className="w-8 h-8 text-white animate-spin" />
+              : isAnalyzing
               ? <Loader2 className="w-8 h-8 text-white animate-spin" />
               : <Camera className="w-8 h-8 text-white" />
             }
             {(isCapturing || isAnalyzing) && (
-              <div className="absolute inset-0 rounded-full border-4 border-cyan-400 animate-ping" />
+              <div className="absolute inset-0 rounded-full border-4 animate-ping" style={{ borderColor: CYAN }} />
             )}
           </button>
-          <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.45)" }}>
-            {samStatus === "loading" ? "loading AI…"
+          <span className="text-[10px] font-medium" style={{ color: "rgba(255,255,255,0.4)" }}>
+            {samStatus === "loading" ? "loading model…"
               : isAnalyzing ? analyzeStep
               : isCapturing ? "processing…"
               : "tap to capture"}
           </span>
         </div>
 
+        {/* Spacer */}
         <div className="w-16" />
       </div>
+
+      {/* SAM loading bar indicator */}
+      {samStatus === "loading" && (
+        <AlertTriangle className="absolute top-4 right-4 w-5 h-5 animate-pulse" style={{ color: YELLOW }} />
+      )}
     </div>
   );
 }

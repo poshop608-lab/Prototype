@@ -17,10 +17,14 @@ interface Pt { x: number; y: number; }
 interface ShoeResult {
   bbox: BBox;
   contour: Pt[] | null;
-  topPt: Pt;    // highest shoe pixel (full-res coords)
-  botPt: Pt;    // lowest shoe pixel
-  heightPx: number;
   widthPx: number;
+  // Heel measurement (primary QC metric)
+  heelBBox: BBox;          // heel zone in full-res coords
+  heelTopPt: Pt;           // top of heel collar (full-res)
+  heelBotPt: Pt;           // bottom of outsole under heel (full-res)
+  heelHeightPx: number;    // vertical distance between those two points
+  heelValid: boolean;      // false → scan invalid, request retake
+  // Debug
   debugMask?: Uint8Array;
   debugClean?: Uint8Array;
   thumbW?: number;
@@ -32,26 +36,12 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SEGMENTATION PIPELINE — v3
-//
-// Key fixes vs v2:
-//   • Larger dilation (R=4) before morphological close seals collar opening
-//   • Topological hole-fill: after selecting largest blob, flood-fill any
-//     interior holes (collar cavity, inside logo cutouts) back to foreground
-//   • Per-shoe baseline: height = shoe.maxY − shoe.minY, NOT shared groundY
-//   • Top/bottom measurement points returned explicitly for debug overlay
-//   • BG ring samples only top 8% + left/right 3% strips (not bottom — sole
-//     is often near bottom and corrupts the BG model)
-// ─────────────────────────────────────────────────────────────────────────────
 function detectShoes(
   canvas: HTMLCanvasElement,
   vw: number,
   vh: number,
   debugMode: boolean
 ): {
-  left: BBox; right: BBox;
-  leftContour: Pt[] | null; rightContour: Pt[] | null;
   leftResult: ShoeResult; rightResult: ShoeResult;
 } {
   const SCALE = 0.25;
@@ -335,14 +325,68 @@ function detectShoes(
       maxY: Math.min(vh, Math.round(maxY / SCALE)),
     };
 
-    const heightPx = Math.round((maxY - minY) / SCALE);
-    const widthPx  = Math.round((maxXs - minXs) / SCALE);
-    const topPt  = { x: Math.round((minXs + maxXs) / 2 / SCALE), y: bbox.minY };
-    const botPt  = { x: Math.round((minXs + maxXs) / 2 / SCALE), y: bbox.maxY };
+    const widthPx = Math.round((maxXs - minXs) / SCALE);
+
+    // ── Step 10: Heel detection ───────────────────────────────────────────
+    // Heel = the END of the shoe that has more sole mass (thicker outsole).
+    // Strategy: compare shoe pixel density in the bottom 20% of shoe height
+    // between the left 28% and right 28% of shoe width. Denser side = heel.
+    const shoeW = maxXs - minXs;
+    const shoeH = maxY - minY;
+    const HEEL_ZONE_FRAC = 0.28; // 28% of shoe length = heel zone
+    const SOLE_ZONE_FRAC = 0.20; // bottom 20% of shoe height = sole band
+    const heelZoneW = Math.round(shoeW * HEEL_ZONE_FRAC);
+    const soleYStart = maxY - Math.round(shoeH * SOLE_ZONE_FRAC);
+
+    // Count sole pixels in left end vs right end
+    let leftSoleCount = 0, rightSoleCount = 0;
+    for (let y = soleYStart; y <= maxY; y++) {
+      for (let x = minXs; x < minXs + heelZoneW; x++)
+        if (shoe[y * tw + x]) leftSoleCount++;
+      for (let x = maxXs - heelZoneW; x <= maxXs; x++)
+        if (shoe[y * tw + x]) rightSoleCount++;
+    }
+
+    // heelIsLeft = true means heel is on the minX side of this shoe half
+    const heelIsLeft = leftSoleCount >= rightSoleCount;
+    const hzX0 = heelIsLeft ? minXs : maxXs - heelZoneW;
+    const hzX1 = heelIsLeft ? minXs + heelZoneW : maxXs;
+
+    // Scan heel zone for topmost and bottommost shoe pixels
+    let hMinY = th, hMaxY = 0, heelRowsFilled = 0;
+    for (let y = minY; y <= maxY; y++) {
+      let hasPixel = false;
+      for (let x = hzX0; x <= hzX1; x++) {
+        if (shoe[y * tw + x]) {
+          if (y < hMinY) hMinY = y;
+          if (y > hMaxY) hMaxY = y;
+          hasPixel = true;
+        }
+      }
+      if (hasPixel) heelRowsFilled++;
+    }
+
+    // Validity: heel span must cover at least 40% of total shoe rows
+    // and the heel zone itself must have non-trivial height
+    const heelValid = heelRowsFilled > (shoeH * 0.40) && (hMaxY - hMinY) > (shoeH * 0.30);
+
+    // Full-res coords
+    const hzMidX = Math.round((hzX0 + hzX1) / 2 / SCALE);
+    const heelTopPt: Pt = { x: hzMidX, y: Math.round(hMinY / SCALE) };
+    const heelBotPt: Pt = { x: hzMidX, y: Math.round(hMaxY / SCALE) };
+    const heelHeightPx = Math.round((hMaxY - hMinY) / SCALE);
+
+    const heelBBox: BBox = {
+      minX: Math.max(0, Math.round(hzX0 / SCALE)),
+      maxX: Math.min(vw, Math.round(hzX1 / SCALE)),
+      minY: heelTopPt.y,
+      maxY: heelBotPt.y,
+    };
 
     return {
       bbox, contour: pts,
-      topPt, botPt, heightPx, widthPx,
+      widthPx,
+      heelBBox, heelTopPt, heelBotPt, heelHeightPx, heelValid,
       ...(debugMode ? { debugMask: mask, debugClean: shoe, thumbW: tw, thumbH: th } : {}),
     };
   }
@@ -356,21 +400,22 @@ function detectShoes(
       maxY: Math.round(th * 0.85 / SCALE),
     };
     const midX = (b.minX + b.maxX) / 2;
+    const midY = (b.minY + b.maxY) / 2;
     return {
       bbox: b, contour: null,
-      topPt: { x: midX, y: b.minY }, botPt: { x: midX, y: b.maxY },
-      heightPx: b.maxY - b.minY, widthPx: b.maxX - b.minX,
+      widthPx: b.maxX - b.minX,
+      heelBBox: b,
+      heelTopPt: { x: midX, y: b.minY },
+      heelBotPt: { x: midX, y: b.maxY },
+      heelHeightPx: b.maxY - b.minY,
+      heelValid: false,
     };
   }
 
   const mid = Math.round(tw / 2);
   const L  = processHalf(0, mid);
   const Rh = processHalf(mid, tw);
-  return {
-    left: L.bbox, right: Rh.bbox,
-    leftContour: L.contour, rightContour: Rh.contour,
-    leftResult: L, rightResult: Rh,
-  };
+  return { leftResult: L, rightResult: Rh };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -421,13 +466,13 @@ function renderDebug(
     ctx.fillText(label, pi * panelW + 2, 10);
   });
 
-  // Bottom info bar
-  const { PX_PER_MM } = { PX_PER_MM: pxPerMm };
+  // Bottom info bar — shows heel height values specifically
+  const P = pxPerMm;
   ctx.fillStyle = "#0a0a18";
   ctx.fillRect(0, th, dbgCanvas.width, 22);
-  ctx.fillStyle = "#0cf"; ctx.font = "9px monospace"; ctx.textAlign = "left";
+  ctx.fillStyle = L.heelValid ? "#0cf" : "#f55"; ctx.font = "9px monospace"; ctx.textAlign = "left";
   ctx.fillText(
-    `L: ${L.heightPx}px=${(L.heightPx/PX_PER_MM).toFixed(1)}mm  W=${L.widthPx}px=${(L.widthPx/PX_PER_MM).toFixed(1)}mm  |  R: ${Rh.heightPx}px=${(Rh.heightPx/PX_PER_MM).toFixed(1)}mm  W=${Rh.widthPx}px=${(Rh.widthPx/PX_PER_MM).toFixed(1)}mm  |  px/mm=${PX_PER_MM}`,
+    `L heel: ${L.heelHeightPx}px=${(L.heelHeightPx/P).toFixed(1)}mm [${L.heelValid?"OK":"INVALID"}]  |  R heel: ${Rh.heelHeightPx}px=${(Rh.heelHeightPx/P).toFixed(1)}mm [${Rh.heelValid?"OK":"INVALID"}]  |  W L=${L.widthPx}px  R=${Rh.widthPx}px  |  px/mm=${P}`,
     4, th + 14
   );
 }
@@ -497,10 +542,7 @@ export function CameraView({ onCapture, onError }: Props) {
     await new Promise(r => setTimeout(r, 20));
 
     const det = detectShoes(canvas, vw, vh, debugMode);
-    const { left: lb, right: rb, leftContour: lc, rightContour: rc } = det;
     const LR = det.leftResult, RR = det.rightResult;
-
-    // PX_PER_MM from utils
     const PX_PER_MM = 3.5;
 
     if (debugMode && debugCanvasRef.current) {
@@ -508,6 +550,9 @@ export function CameraView({ onCapture, onError }: Props) {
       setShowDebug(true);
     }
     setIsAnalyzing(false);
+
+    // Invalid scan check — if either heel not detected, request retake
+    const scanInvalid = !LR.heelValid || !RR.heelValid;
 
     const fs = Math.max(18, Math.round(vw * 0.018));
 
@@ -529,13 +574,16 @@ export function CameraView({ onCapture, onError }: Props) {
       ctx.textBaseline = "alphabetic";
     }
 
-    function drawShoe(bounds: BBox, contour: Pt[] | null, sr: ShoeResult, label: string) {
-      const { minX, minY, maxX, maxY } = bounds;
+    function drawShoe(sr: ShoeResult, label: string) {
+      const { bbox, contour, heelBBox, heelTopPt, heelBotPt, heelHeightPx, widthPx, heelValid } = sr;
+      const { minX, minY, maxX, maxY } = bbox;
       const midX = (minX + maxX) / 2;
-      const midY = (minY + maxY) / 2;
       const lw = Math.max(2, vw * 0.002);
+      const refLW = Math.max(3, vw * 0.003);
+      const lineExt = Math.round(vw * 0.012);
+      const tickH = Math.round(vw * 0.014);
 
-      // ── Shoe silhouette (faint fill + outline) ──────────────────────────
+      // ── Faint shoe silhouette ─────────────────────────────────────────
       ctx.beginPath();
       if (contour && contour.length > 2) {
         contour.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
@@ -543,83 +591,95 @@ export function CameraView({ onCapture, onError }: Props) {
       } else {
         ctx.rect(minX, minY, maxX - minX, maxY - minY);
       }
-      ctx.fillStyle = `${GREEN}12`; ctx.fill();
-      ctx.strokeStyle = `${GREEN}60`; ctx.lineWidth = lw;
-      ctx.shadowColor = GREEN; ctx.shadowBlur = 6; ctx.stroke(); ctx.shadowBlur = 0;
+      ctx.fillStyle = `${GREEN}10`; ctx.fill();
+      ctx.strokeStyle = `${GREEN}45`; ctx.lineWidth = lw;
+      ctx.stroke();
 
-      // ── Horizontal reference lines (the core measurement visualization) ──
-      // Top reference line: highest shoe pixel
-      // Bottom reference line: lowest sole pixel
-      // These span the full shoe width with small tick serifs on each end.
-      const lineExt = Math.round(vw * 0.015); // how far line extends beyond shoe edges
-      const tickH   = Math.round(vw * 0.012); // vertical tick height at line ends
-      const refLW   = Math.max(3, vw * 0.003);
+      // ── Heel zone highlight ───────────────────────────────────────────
+      // Shaded band over heel region so user can see what was measured
+      const hz = heelBBox;
+      ctx.fillStyle = heelValid ? `${YELLOW}22` : `${RED}22`;
+      ctx.fillRect(hz.minX, hz.minY, hz.maxX - hz.minX, hz.maxY - hz.minY);
+      ctx.strokeStyle = heelValid ? `${YELLOW}80` : `${RED}80`;
+      ctx.lineWidth = lw; ctx.setLineDash([4, 4]);
+      ctx.strokeRect(hz.minX, hz.minY, hz.maxX - hz.minX, hz.maxY - hz.minY);
+      ctx.setLineDash([]);
+
+      // ── Horizontal reference lines spanning heel zone ─────────────────
+      // TOP line: highest heel collar pixel (cyan)
+      // BOTTOM line: lowest outsole pixel under heel (green)
+      const topY = heelTopPt.y;
+      const botY = heelBotPt.y;
+      const refX0 = hz.minX - lineExt;
+      const refX1 = hz.maxX + lineExt;
 
       function drawRefLine(y: number, color: string) {
-        const x0 = minX - lineExt;
-        const x1 = maxX + lineExt;
         ctx.strokeStyle = color; ctx.lineWidth = refLW;
-        ctx.shadowColor = color; ctx.shadowBlur = 8;
-        // Main horizontal span
-        ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
-        // Left tick (perpendicular serif)
+        ctx.shadowColor = color; ctx.shadowBlur = 10;
+        ctx.beginPath(); ctx.moveTo(refX0, y); ctx.lineTo(refX1, y); ctx.stroke();
         ctx.lineWidth = refLW * 0.7;
-        ctx.beginPath(); ctx.moveTo(x0, y - tickH / 2); ctx.lineTo(x0, y + tickH / 2); ctx.stroke();
-        // Right tick
-        ctx.beginPath(); ctx.moveTo(x1, y - tickH / 2); ctx.lineTo(x1, y + tickH / 2); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(refX0, y - tickH / 2); ctx.lineTo(refX0, y + tickH / 2); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(refX1, y - tickH / 2); ctx.lineTo(refX1, y + tickH / 2); ctx.stroke();
         ctx.shadowBlur = 0;
       }
 
-      // Top line — cyan (highest shoe point)
-      drawRefLine(minY, CYAN);
-      // Bottom line — green (lowest sole point)
-      drawRefLine(maxY, GREEN);
+      drawRefLine(topY, CYAN);    // top of heel collar
+      drawRefLine(botY, GREEN);   // bottom of outsole
 
-      // Vertical arrow connecting them (right side of shoe)
-      const arrowX = maxX + lineExt + Math.round(vw * 0.005);
-      const arrowHeadH = Math.round(vw * 0.008);
-      ctx.strokeStyle = YELLOW; ctx.lineWidth = lw; ctx.shadowColor = YELLOW; ctx.shadowBlur = 6;
-      ctx.beginPath(); ctx.moveTo(arrowX, minY); ctx.lineTo(arrowX, maxY); ctx.stroke();
-      // Arrow head top
+      // ── Vertical measurement arrow (right of heel zone) ───────────────
+      const arrowX = refX1 + Math.round(vw * 0.006);
+      const arrowH2 = Math.round(vw * 0.008);
+      ctx.strokeStyle = YELLOW; ctx.lineWidth = lw;
+      ctx.shadowColor = YELLOW; ctx.shadowBlur = 6;
+      ctx.beginPath(); ctx.moveTo(arrowX, topY); ctx.lineTo(arrowX, botY); ctx.stroke();
+      // top arrowhead
       ctx.beginPath();
-      ctx.moveTo(arrowX - arrowHeadH * 0.6, minY + arrowHeadH);
-      ctx.lineTo(arrowX, minY);
-      ctx.lineTo(arrowX + arrowHeadH * 0.6, minY + arrowHeadH);
+      ctx.moveTo(arrowX - arrowH2 * 0.6, topY + arrowH2);
+      ctx.lineTo(arrowX, topY);
+      ctx.lineTo(arrowX + arrowH2 * 0.6, topY + arrowH2);
       ctx.stroke();
-      // Arrow head bottom
+      // bottom arrowhead
       ctx.beginPath();
-      ctx.moveTo(arrowX - arrowHeadH * 0.6, maxY - arrowHeadH);
-      ctx.lineTo(arrowX, maxY);
-      ctx.lineTo(arrowX + arrowHeadH * 0.6, maxY - arrowHeadH);
+      ctx.moveTo(arrowX - arrowH2 * 0.6, botY - arrowH2);
+      ctx.lineTo(arrowX, botY);
+      ctx.lineTo(arrowX + arrowH2 * 0.6, botY - arrowH2);
       ctx.stroke();
       ctx.shadowBlur = 0;
 
-      // ── Measurements ─────────────────────────────────────────────────────
-      const hPx = sr.heightPx;
-      const wPx = sr.widthPx;
-      const hMm = parseFloat((hPx / PX_PER_MM).toFixed(1));
-      const wMm = parseFloat((wPx / PX_PER_MM).toFixed(1));
+      // ── Measurements ─────────────────────────────────────────────────
+      const hMm = parseFloat((heelHeightPx / PX_PER_MM).toFixed(1));
+      const wMm = parseFloat((widthPx / PX_PER_MM).toFixed(1));
+      const heelMidY = (topY + botY) / 2;
 
-      // H pill: next to vertical arrow, centred vertically
-      const hpx = Math.min(arrowX + fs * 2.2, vw - fs * 2.5);
-      pill(`H ${hMm}mm`, hpx, midY, "rgba(0,0,0,0.88)", YELLOW);
+      // Heel height pill next to arrow
+      const hPillX = Math.min(arrowX + fs * 2.4, vw - fs * 2.5);
+      if (heelValid) {
+        pill(`H ${hMm}mm`, hPillX, heelMidY, "rgba(0,0,0,0.88)", YELLOW);
+      } else {
+        pill("HEEL?", hPillX, heelMidY, "rgba(0,0,0,0.88)", RED);
+      }
 
-      // W pill: above top reference line
+      // Width pill above full shoe
       pill(`W ${wMm}mm`, midX, Math.max(minY - fs * 1.1, fs * 1.1), "rgba(0,0,0,0.88)", CYAN);
 
-      // Label chip below bottom line
+      // Label chip below shoe
       pill(label, midX, Math.min(maxY + fs * 1.2, vh - fs * 0.8), `${GREEN}dd`, "#000");
 
-      // Debug extras
+      // Debug dot: heel top (magenta) and bottom (cyan)
       if (debugMode) {
-        pill(`${hPx}px`, midX, midY, "rgba(0,0,0,0.85)", MAGENTA);
+        const DOT = Math.max(7, vw * 0.005);
+        ctx.fillStyle = MAGENTA;
+        ctx.beginPath(); ctx.arc(heelTopPt.x, topY, DOT, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = CYAN;
+        ctx.beginPath(); ctx.arc(heelBotPt.x, botY, DOT, 0, Math.PI * 2); ctx.fill();
+        pill(`${heelHeightPx}px`, (hz.minX + hz.maxX) / 2, heelMidY, "rgba(0,0,0,0.85)", MAGENTA);
       }
 
       return { hMm, wMm };
     }
 
-    const leftM  = drawShoe(lb, lc, LR, "LEFT");
-    const rightM = drawShoe(rb, rc, RR, "RIGHT");
+    const leftM  = drawShoe(LR, "LEFT");
+    const rightM = drawShoe(RR, "RIGHT");
 
     // Centre divider
     ctx.strokeStyle = `${CYAN}55`; ctx.lineWidth = 1; ctx.setLineDash([6,6]);
@@ -627,30 +687,35 @@ export function CameraView({ onCapture, onError }: Props) {
     ctx.setLineDash([]);
 
     const diff = parseFloat(Math.abs(leftM.hMm - rightM.hMm).toFixed(1));
-    const passed = diff <= 2;
+    const passed = !scanInvalid && diff <= 2;
 
     // Result banner
-    ctx.fillStyle = `${passed ? GREEN : RED}ee`;
     const bh = Math.round(vh * 0.07);
+    ctx.fillStyle = scanInvalid ? `${YELLOW}ee` : passed ? `${GREEN}ee` : `${RED}ee`;
     ctx.fillRect(0, vh - bh, vw, bh);
     ctx.font = `bold ${Math.round(vw * 0.022)}px -apple-system,sans-serif`;
-    ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = scanInvalid ? "#000" : "#fff";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText(
-      passed ? `✓  PASSED   Δ${diff} mm` : `✗  REJECTED   Δ${diff} mm  (limit 2 mm)`,
+      scanInvalid
+        ? "⚠  INVALID — Heel not detected · Retake"
+        : passed
+          ? `✓  PASSED   Δ${diff} mm`
+          : `✗  REJECTED   Δ${diff} mm  (limit 2 mm)`,
       vw / 2, vh - bh / 2
     );
     ctx.textBaseline = "alphabetic";
 
-    // Debug stamp
+    // Debug / info stamp
     if (debugMode) {
       ctx.font = "10px monospace"; ctx.textAlign = "left";
-      const stamp = `DBG | L:${LR.heightPx}px=${leftM.hMm}mm  R:${RR.heightPx}px=${rightM.hMm}mm  px/mm=${PX_PER_MM}`;
-      ctx.fillStyle = "rgba(0,0,0,0.75)";
+      const stamp = `DBG HEEL | L:${LR.heelHeightPx}px=${leftM.hMm}mm[${LR.heelValid?"OK":"!"}]  R:${RR.heelHeightPx}px=${rightM.hMm}mm[${RR.heelValid?"OK":"!"}]  px/mm=${PX_PER_MM}`;
+      ctx.fillStyle = "rgba(0,0,0,0.8)";
       ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
       ctx.fillStyle = YELLOW; ctx.fillText(stamp, 9, 17);
     } else {
       ctx.font = "11px monospace"; ctx.textAlign = "left";
-      const stamp = `CV | L:${leftM.hMm}mm R:${rightM.hMm}mm`;
+      const stamp = `HEEL | L:${leftM.hMm}mm R:${rightM.hMm}mm`;
       ctx.fillStyle = "rgba(0,0,0,0.7)";
       ctx.fillRect(4, 4, ctx.measureText(stamp).width + 10, 18);
       ctx.fillStyle = GREEN; ctx.fillText(stamp, 9, 17);
@@ -659,7 +724,7 @@ export function CameraView({ onCapture, onError }: Props) {
     try {
       const blob = await compressImage(canvas, 0.9);
       const annotatedDataUrl = canvas.toDataURL("image/jpeg", 0.9);
-      if ("vibrate" in navigator) navigator.vibrate([60, 30, 60]);
+      if ("vibrate" in navigator) navigator.vibrate(scanInvalid ? [100, 50, 100, 50, 100] : [60, 30, 60]);
 
       onCapture({
         blob, dataUrl: annotatedDataUrl, annotatedDataUrl,
@@ -667,9 +732,11 @@ export function CameraView({ onCapture, onError }: Props) {
         rightHeightMm: rightM.hMm,
         leftWidthMm:   leftM.wMm,
         rightWidthMm:  rightM.wMm,
-        heightDiffMm:  diff,
-        passed,
-        rejectionReason: passed ? null : `Height difference ${diff}mm exceeds 2mm tolerance`,
+        heightDiffMm:  scanInvalid ? 0 : diff,
+        passed: passed && !scanInvalid,
+        rejectionReason: scanInvalid
+          ? "Heel region not detected — please retake"
+          : passed ? null : `Heel height difference ${diff}mm exceeds 2mm tolerance`,
       });
 
       setShowSuccess(true);

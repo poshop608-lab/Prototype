@@ -2,7 +2,6 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   typescript: { ignoreBuildErrors: true },
-  eslint: { ignoreDuringBuilds: true },
   images: {
     remotePatterns: [{ protocol: "https", hostname: "dbpidvgqfrksgyqkddqf.supabase.co" }],
   },
@@ -18,11 +17,9 @@ const nextConfig: NextConfig = {
       },
     ];
   },
-  // Serve ONNX model files and WASM without modification
-  webpack(config) {
-    config.resolve.fallback = { ...config.resolve.fallback, fs: false };
-    return config;
-  },
+  // Silence Turbopack warning — no webpack config needed (onnxruntime-web
+  // serves WASM from /public, fs fallback not required in Next.js 16)
+  turbopack: {},
 };
 
 export default nextConfig;

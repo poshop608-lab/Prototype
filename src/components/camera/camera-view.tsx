@@ -713,21 +713,11 @@ export function CameraView({ onCapture, onError }: Props) {
       const rightPrompts = gridPrompts(mid, mid, topZ, zoneH, vw, vh, 3);
 
       setAnalyzeStep("Segmenting left shoe…");
-      async function bestValidMask(prompts: [number, number][], fromX: number, toX: number) {
-        let best = await decodeMask(embedding, [prompts[0]], [1], vw, vh);
-        for (let i = 1; i < prompts.length; i++) {
-          const r = await decodeMask(embedding, [prompts[i]], [1], vw, vh);
-          // Prefer mask that passes validation and has higher IoU
-          const rValid = validateMask(r.mask, r.iouScore, vw, vh, fromX, toX).valid;
-          const bValid = validateMask(best.mask, best.iouScore, vw, vh, fromX, toX).valid;
-          if (rValid && (!bValid || r.iouScore > best.iouScore)) best = r;
-        }
-        return best;
-      }
-
+      // Decoder is exported with fixed N=9 points — pass all 9 at once (all foreground)
+      const allLabels = Array(9).fill(1) as number[];
       const [lMask, rMask] = await Promise.all([
-        bestValidMask(leftPrompts,  0,   mid),
-        bestValidMask(rightPrompts, mid, vw),
+        decodeMask(embedding, leftPrompts,  allLabels, vw, vh),
+        decodeMask(embedding, rightPrompts, allLabels, vw, vh),
       ]);
 
       // Validate masks

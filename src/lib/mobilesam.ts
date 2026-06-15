@@ -1,19 +1,24 @@
 // MobileSAM inference via onnxruntime-web
-// Encoder: image → 256-dim embedding
-// Decoder: embedding + prompt points → binary mask
+// Encoder: 1×3×1024×1024 → image_embeddings [1,256,64,64]
+// Decoder: image_embeddings + point_coords[1,9,2] + point_labels[1,9]
+//          → masks[1,3,256,256] + iou_predictions[1,3]
+//
+// IMPORTANT: Decoder is exported with FIXED N=9 prompt points (3×3 grid).
+// Always call decodeMask with exactly 9 points and 9 labels.
 
 import * as ort from "onnxruntime-web";
 
-// WASM files are copied to /public/ by scripts/copy-ort-wasm.mjs at build time.
-// Use single-threaded mode: avoids SharedArrayBuffer requirement (iOS Safari compat).
+// WASM files in /public (copied by scripts/copy-ort-wasm.mjs at build time)
 ort.env.wasm.wasmPaths = "/";
-ort.env.wasm.numThreads = 1;
+ort.env.wasm.numThreads = 1;  // single-threaded: avoids SharedArrayBuffer (iOS safe)
+
+export const DECODER_N_POINTS = 9;  // fixed — must match exported model
 
 export interface SamMask {
-  mask: Uint8Array;   // 1 = foreground, 0 = background (same size as input image)
+  mask: Uint8Array;   // 1=foreground, 0=background, same size as input canvas
   width: number;
   height: number;
-  iouScore: number;  // model's own confidence 0–1
+  iouScore: number;
 }
 
 let encoderSession: ort.InferenceSession | null = null;
@@ -34,12 +39,9 @@ export async function loadSAM(): Promise<void> {
   }
   loading = true;
   try {
-    // graphOptimizationLevel "all" crashes on these Qualcomm-hub models
-    // (ORT transpose_optimization bug). Use "disabled" — model runs correctly
-    // without optimization, just slightly slower.
     const opts: ort.InferenceSession.SessionOptions = {
       executionProviders: ["wasm"],
-      graphOptimizationLevel: "disabled",
+      graphOptimizationLevel: "basic",
     };
     [encoderSession, decoderSession] = await Promise.all([
       ort.InferenceSession.create("/models/encoder.onnx", opts),
@@ -53,26 +55,18 @@ export async function loadSAM(): Promise<void> {
   loading = false;
 }
 
-export function getSAMLoadError(): string | null {
-  return loadError;
-}
+export function getSAMLoadError(): string | null { return loadError; }
+export function isSAMLoaded(): boolean { return !!(encoderSession && decoderSession); }
 
-export function isSAMLoaded(): boolean {
-  return !!(encoderSession && decoderSession);
-}
-
-// Preprocess image to 1024×1024 float32 tensor (SAM expects 1024×1024)
+// Preprocess canvas → SAM float32 tensor [1,3,1024,1024]
 function preprocessImage(canvas: HTMLCanvasElement): ort.Tensor {
   const SAM_SIZE = 1024;
   const tmp = document.createElement("canvas");
   tmp.width = SAM_SIZE; tmp.height = SAM_SIZE;
-  const ctx = tmp.getContext("2d")!;
-  ctx.drawImage(canvas, 0, 0, SAM_SIZE, SAM_SIZE);
-  const { data } = ctx.getImageData(0, 0, SAM_SIZE, SAM_SIZE);
-
-  // SAM normalization: pixel_mean=[123.675,116.28,103.53], pixel_std=[58.395,57.12,57.375]
-  const MEAN = [123.675, 116.28, 103.53];
-  const STD  = [58.395, 57.12, 57.375];
+  tmp.getContext("2d")!.drawImage(canvas, 0, 0, SAM_SIZE, SAM_SIZE);
+  const { data } = tmp.getContext("2d")!.getImageData(0, 0, SAM_SIZE, SAM_SIZE);
+  const MEAN = [123.675, 116.28,  103.53];
+  const STD  = [58.395,  57.12,   57.375];
   const N = SAM_SIZE * SAM_SIZE;
   const tensor = new Float32Array(3 * N);
   for (let i = 0; i < N; i++) {
@@ -83,150 +77,97 @@ function preprocessImage(canvas: HTMLCanvasElement): ort.Tensor {
   return new ort.Tensor("float32", tensor, [1, 3, SAM_SIZE, SAM_SIZE]);
 }
 
-// Run encoder — returns image embedding
+// Encode canvas → image embedding
 export async function encodeImage(canvas: HTMLCanvasElement): Promise<ort.Tensor> {
   if (!encoderSession) throw new Error("SAM encoder not loaded");
-  const imageTensor = preprocessImage(canvas);
-
-  // Find the actual input name from the session
-  const inputName = encoderSession.inputNames[0];
-  const results = await encoderSession.run({ [inputName]: imageTensor });
-  const outputName = encoderSession.outputNames[0];
-  return results[outputName];
+  const img = preprocessImage(canvas);
+  const results = await encoderSession.run({ [encoderSession.inputNames[0]]: img });
+  return results[encoderSession.outputNames[0]];
 }
 
-// Run decoder with prompt points → mask
-// promptPoints: array of [x, y] in 0–1 normalized coordinates (relative to canvas)
-// labels: 1 = foreground point, 0 = background point
+// Decode embedding + EXACTLY 9 prompt points → binary mask
+// promptPoints: exactly 9 [x,y] pairs, normalized 0-1 relative to canvas
+// labels: exactly 9 values (1=foreground, 0=background)
 export async function decodeMask(
   embedding: ort.Tensor,
-  promptPoints: [number, number][],
-  labels: number[],
+  promptPoints: [number, number][],  // must be length 9
+  labels: number[],                  // must be length 9
   origWidth: number,
   origHeight: number,
 ): Promise<SamMask> {
   if (!decoderSession) throw new Error("SAM decoder not loaded");
+  if (promptPoints.length !== DECODER_N_POINTS) {
+    throw new Error(`decodeMask requires exactly ${DECODER_N_POINTS} points, got ${promptPoints.length}`);
+  }
 
   const SAM_SIZE = 1024;
-  const numPoints = promptPoints.length;
-
-  // Scale points to SAM coordinate space (1024×1024)
-  const coords = new Float32Array(numPoints * 2);
-  for (let i = 0; i < numPoints; i++) {
+  const coords = new Float32Array(DECODER_N_POINTS * 2);
+  for (let i = 0; i < DECODER_N_POINTS; i++) {
     coords[i * 2]     = promptPoints[i][0] * SAM_SIZE;
     coords[i * 2 + 1] = promptPoints[i][1] * SAM_SIZE;
   }
 
-  const labelsArr = new Float32Array(labels);
-
-  // Check actual input names from the session
-  const inputNames = decoderSession.inputNames;
-
-  // Build inputs matching model's expected names
-  const feeds: Record<string, ort.Tensor> = {};
-
-  // Map common SAM decoder input names
-  const nameMap: Record<string, ort.Tensor> = {
+  const results = await decoderSession.run({
     "image_embeddings": embedding,
-    "point_coords": new ort.Tensor("float32", coords, [1, numPoints, 2]),
-    "point_labels": new ort.Tensor("float32", labelsArr, [1, numPoints]),
-    "mask_input": new ort.Tensor("float32", new Float32Array(1 * 1 * 256 * 256), [1, 1, 256, 256]),
-    "has_mask_input": new ort.Tensor("float32", new Float32Array([0]), [1]),
-    "orig_im_size": new ort.Tensor("float32", new Float32Array([origHeight, origWidth]), [2]),
-    // Qualcomm hub variant may use these names instead:
-    "val_0": new ort.Tensor("float32", coords, [1, numPoints, 2]),
-    "val_4": new ort.Tensor("float32", labelsArr, [1, numPoints]),
-  };
+    "point_coords":     new ort.Tensor("float32", coords,                             [1, DECODER_N_POINTS, 2]),
+    "point_labels":     new ort.Tensor("float32", new Float32Array(labels),           [1, DECODER_N_POINTS]),
+  });
 
-  for (const name of inputNames) {
-    if (nameMap[name]) feeds[name] = nameMap[name];
+  // Output: masks [1, 3, 256, 256], iou_predictions [1, 3]
+  const masksOut = results["masks"] ?? results[decoderSession.outputNames[0]];
+  const iouOut   = results["iou_predictions"] ?? results[decoderSession.outputNames[1]];
+
+  const iouData = iouOut.data as Float32Array;
+  let bestIdx = 0, bestIou = -Infinity;
+  for (let i = 0; i < iouData.length; i++) {
+    if (iouData[i] > bestIou) { bestIou = iouData[i]; bestIdx = i; }
   }
 
-  const results = await decoderSession.run(feeds);
-
-  // Output: masks [1, 4, H, W], iou_predictions [1, 4]
-  const outputNames = decoderSession.outputNames;
-  let masksOutput: ort.Tensor | undefined;
-  let iouOutput: ort.Tensor | undefined;
-
-  for (const name of outputNames) {
-    if (name.includes("mask") || name.includes("Sigmoid") || results[name].dims.length === 4) {
-      masksOutput = results[name];
-    }
-    if (name.includes("iou") || (results[name].dims.length <= 2)) {
-      iouOutput = results[name];
-    }
-  }
-
-  if (!masksOutput) {
-    // Fallback: first output is masks
-    masksOutput = results[outputNames[0]];
-  }
-
-  const maskData = masksOutput.data as Float32Array;
-  const maskDims = masksOutput.dims;
-
-  // SAM outputs 4 candidate masks — pick the best (highest IoU score)
-  let bestIdx = 0;
-  let bestIou = -1;
-  if (iouOutput) {
-    const iouData = iouOutput.data as Float32Array;
-    for (let i = 0; i < 4 && i < iouData.length; i++) {
-      if (iouData[i] > bestIou) { bestIou = iouData[i]; bestIdx = i; }
-    }
-  }
-
-  // Extract best mask and threshold at 0
-  const maskH = maskDims[maskDims.length - 2];
-  const maskW = maskDims[maskDims.length - 1];
-  const maskOffset = bestIdx * maskH * maskW;
-  const binaryMask = new Uint8Array(maskH * maskW);
+  const maskH = masksOut.dims[masksOut.dims.length - 2];
+  const maskW = masksOut.dims[masksOut.dims.length - 1];
+  const maskData = masksOut.data as Float32Array;
+  const offset = bestIdx * maskH * maskW;
+  const binary = new Uint8Array(maskH * maskW);
   for (let i = 0; i < maskH * maskW; i++) {
-    binaryMask[i] = maskData[maskOffset + i] > 0 ? 1 : 0;
+    binary[i] = maskData[offset + i] > 0 ? 1 : 0;
   }
-
-  // Resize mask back to original image dimensions
-  const finalMask = resizeMask(binaryMask, maskW, maskH, origWidth, origHeight);
 
   return {
-    mask: finalMask,
+    mask: resizeMask(binary, maskW, maskH, origWidth, origHeight),
     width: origWidth,
     height: origHeight,
-    iouScore: bestIou,
+    iouScore: bestIou > -Infinity ? bestIou : 0,
   };
 }
 
-// Nearest-neighbour resize of binary mask
-function resizeMask(
-  src: Uint8Array, sw: number, sh: number,
-  dw: number, dh: number
-): Uint8Array {
+function resizeMask(src: Uint8Array, sw: number, sh: number, dw: number, dh: number): Uint8Array {
   const dst = new Uint8Array(dw * dh);
   for (let y = 0; y < dh; y++) {
-    const sy = Math.round((y / dh) * sh);
+    const sy = Math.min(Math.round((y / dh) * sh), sh - 1);
     for (let x = 0; x < dw; x++) {
-      const sx = Math.round((x / dw) * sw);
-      dst[y * dw + x] = src[Math.min(sy, sh-1) * sw + Math.min(sx, sw-1)];
+      dst[y * dw + x] = src[sy * sw + Math.min(Math.round((x / dw) * sw), sw - 1)];
     }
   }
   return dst;
 }
 
-// Generate a grid of prompt points covering a region
-// Returns normalized [0–1] coords relative to the full image
+// Generate exactly N prompt points in a grid over a region.
+// Returns normalized [0-1] coords relative to full image.
+// gridSize=3 → 9 points (matches DECODER_N_POINTS).
 export function gridPrompts(
   regionX: number, regionW: number,
   regionY: number, regionH: number,
-  imageW: number, imageH: number,
-  gridSize: number = 3,
+  imageW: number,  imageH: number,
+  gridSize = 3,
 ): [number, number][] {
-  const points: [number, number][] = [];
+  const pts: [number, number][] = [];
   for (let row = 0; row < gridSize; row++) {
     for (let col = 0; col < gridSize; col++) {
-      const px = regionX + (col + 0.5) * (regionW / gridSize);
-      const py = regionY + (row + 0.5) * (regionH / gridSize);
-      points.push([px / imageW, py / imageH]);
+      pts.push([
+        (regionX + (col + 0.5) * (regionW / gridSize)) / imageW,
+        (regionY + (row + 0.5) * (regionH / gridSize)) / imageH,
+      ]);
     }
   }
-  return points;
+  return pts;
 }

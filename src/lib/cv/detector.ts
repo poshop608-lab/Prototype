@@ -2,7 +2,7 @@ import type { BBox, DetectedShoe, ShoeDetectionResult } from "./types";
 import { frameToGrayscale } from "./frame";
 
 // ─── Tunables ─────────────────────────────────────────────────────────────────
-const CLOSE_RADIUS    = 18;    // large close to merge fragmented shoe uppers
+const CLOSE_RADIUS    = 6;     // tuned for 640px-wide downsampled input
 const MIN_AREA_FRAC   = 0.03;  // single shoe upper ≥ 3% of frame
 const MAX_AREA_FRAC   = 0.70;  // merged pair blob can be large; filtered separately
 const MIN_ASPECT      = 0.8;   // dark upper alone can be ~square

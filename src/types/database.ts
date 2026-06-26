@@ -1,6 +1,15 @@
+import type { CalibrationData } from "@/lib/cv/types";
+
 export type UserRole = "admin" | "worker" | "qc_inspector";
 export type ScanStatus = "pending" | "passed" | "rejected";
 export type ShoeSide = "pair";
+
+export interface StationSettings {
+  id:          string;
+  station_id:  string;
+  calibration: CalibrationData;
+  updated_at:  string;
+}
 
 export interface Database {
   public: {
@@ -19,6 +28,11 @@ export interface Database {
         Row: ScanImage;
         Insert: Omit<ScanImage, "id" | "created_at">;
         Update: Partial<Omit<ScanImage, "id">>;
+      };
+      station_settings: {
+        Row: StationSettings;
+        Insert: Omit<StationSettings, "id">;
+        Update: Partial<Omit<StationSettings, "id">>;
       };
     };
   };

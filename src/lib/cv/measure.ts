@@ -10,10 +10,17 @@ function median(arr: number[]): number {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
+// Approximate pixels-per-mm from frame width.
+// Assumes ~700mm visible width at typical factory stand heights (40–80cm).
+// Accurate enough for display; pass/fail uses the ratio, not this value.
+function approxPxPerMm(frameWidth: number): number {
+  return frameWidth / 700;
+}
+
 export function measureHeel(
   frame:    ImageData,
   heelBbox: BBox,
-  shoeBbox: BBox,   // used to derive the outsole baseline (bottom of shoe)
+  shoeBbox: BBox,
 ): HeelMeasurement | null {
   const mask = extractForeground(frame, heelBbox);
   const bw   = heelBbox.w;
@@ -41,10 +48,13 @@ export function measureHeel(
   const heightPx = bottomY - medTopY;
   if (heightPx <= 0) return null;
 
+  const heightMm = parseFloat((heightPx / approxPxPerMm(frame.width)).toFixed(1));
+
   return {
     topY:      medTopY,
     bottomY,
     heightPx,
+    heightMm,
     heelBbox,
     confidence,
   };

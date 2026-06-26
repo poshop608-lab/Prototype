@@ -14,8 +14,8 @@ export function compareHeels(
   const passed      = diffPercent <= TOLERANCE_PERCENT;
 
   return {
-    leftPx:          left.heightPx,
-    rightPx:         right.heightPx,
+    leftMm:          left.heightMm,
+    rightMm:         right.heightMm,
     diffPercent,
     passed,
     rejectionReason: passed

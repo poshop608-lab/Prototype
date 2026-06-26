@@ -35,14 +35,15 @@ export interface HeelMeasurement {
   topY:       number;   // px: topmost foreground pixel in heel column
   bottomY:    number;   // px: bottom of shoe bbox (outsole baseline)
   heightPx:   number;   // bottomY - topY
+  heightMm:   number;   // approximate mm (from frame-width heuristic, ±10mm)
   heelBbox:   BBox;
   confidence: number;
 }
 
 export interface ComparisonResult {
-  leftPx:          number;
-  rightPx:         number;
-  diffPercent:     number;   // |left - right| / avg × 100
+  leftMm:          number;
+  rightMm:         number;
+  diffPercent:     number;   // |left - right| / avg × 100 — drives pass/fail
   passed:          boolean;
   rejectionReason: string | null;
 }

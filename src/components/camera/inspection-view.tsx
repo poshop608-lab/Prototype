@@ -115,7 +115,7 @@ export function InspectionView({ onResult }: Props) {
                   {passed ? "PASS" : "REJECT"}
                 </p>
                 <p className="text-xs mt-0.5" style={{ color: "#888" }}>
-                  L {result.comparison.leftPx}px · R {result.comparison.rightPx}px · Δ {result.comparison.diffPercent}%
+                  L ~{result.comparison.leftMm}mm · R ~{result.comparison.rightMm}mm · Δ {result.comparison.diffPercent}%
                 </p>
               </div>
               {state === "COMPLETE" && (

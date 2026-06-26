@@ -138,7 +138,7 @@ export function drawOverlay(
       ctx.beginPath(); ctx.moveTo(ax, left.topY); ctx.lineTo(ax, left.bottomY); ctx.stroke();
       ctx.shadowBlur = 0;
       const midY = (left.topY + left.bottomY) / 2;
-      pill(ctx, `L ${left.heightPx}px`, hb.x + hb.w / 2, midY, "rgba(0,0,0,0.88)", C.yellow, fs);
+      pill(ctx, `L ~${left.heightMm}mm`, hb.x + hb.w / 2, midY, "rgba(0,0,0,0.88)", C.yellow, fs);
     }
 
     if (right) {
@@ -153,7 +153,7 @@ export function drawOverlay(
       ctx.beginPath(); ctx.moveTo(ax, right.topY); ctx.lineTo(ax, right.bottomY); ctx.stroke();
       ctx.shadowBlur = 0;
       const midY = (right.topY + right.bottomY) / 2;
-      pill(ctx, `R ${right.heightPx}px`, hb.x + hb.w / 2, midY, "rgba(0,0,0,0.88)", C.yellow, fs);
+      pill(ctx, `R ~${right.heightMm}mm`, hb.x + hb.w / 2, midY, "rgba(0,0,0,0.88)", C.yellow, fs);
     }
 
     // Result banner

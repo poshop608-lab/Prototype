@@ -6,6 +6,7 @@ import type {
   ShoeDetectionResult,
   StabilityResult,
   InspectionResult,
+  CalibrationData,
 } from "@/lib/cv/types";
 import { extractFrame } from "@/lib/cv/frame";
 import { detectShoes } from "@/lib/cv/detector";
@@ -29,28 +30,40 @@ export interface PipelineOutput {
 }
 
 export function usePipeline(
-  videoRef:  React.RefObject<HTMLVideoElement | null>,
-  onResult:  (result: InspectionResult) => void,
+  videoRef:    React.RefObject<HTMLVideoElement | null>,
+  calibration: CalibrationData | null,
+  onResult:    (result: InspectionResult) => void,
 ): PipelineOutput {
   const overlayRef = useRef<HTMLCanvasElement>(null);
 
-  const [state,     setState]     = useState<PipelineState>("WAITING");
+  const initState: PipelineState = calibration ? "WAITING" : "UNCALIBRATED";
+  const [state,     setState]     = useState<PipelineState>(initState);
   const [detection, setDetection] = useState<ShoeDetectionResult | null>(null);
   const [stability, setStability] = useState<StabilityResult | null>(null);
   const [result,    setResult]    = useState<InspectionResult | null>(null);
 
-  const stateRef      = useRef<PipelineState>("WAITING");
-  const detectionRef  = useRef<ShoeDetectionResult | null>(null);
-  const stabilityRef  = useRef<StabilityResult | null>(null);
-  const resultRef     = useRef<InspectionResult | null>(null);
-  const onResultRef   = useRef(onResult);
-  const historyRef    = useRef<Array<[number, number, number, number]>>([]);
-  const rafRef        = useRef<number>(0);
+  const stateRef       = useRef<PipelineState>(initState);
+  const calibRef       = useRef<CalibrationData | null>(calibration);
+  const detectionRef   = useRef<ShoeDetectionResult | null>(null);
+  const stabilityRef   = useRef<StabilityResult | null>(null);
+  const resultRef      = useRef<InspectionResult | null>(null);
+  const onResultRef    = useRef(onResult);
+  const historyRef     = useRef<Array<[number, number, number, number]>>([]);
+  const rafRef         = useRef<number>(0);
   const resultTimerRef = useRef<ReturnType<typeof setTimeout>>(0 as unknown as ReturnType<typeof setTimeout>);
-  const removalCheckRef = useRef<ReturnType<typeof setInterval>>(0 as unknown as ReturnType<typeof setInterval>);
+  const removalRef     = useRef<ReturnType<typeof setInterval>>(0 as unknown as ReturnType<typeof setInterval>);
 
   useEffect(() => { onResultRef.current = onResult; }, [onResult]);
-  useEffect(() => { stateRef.current = state; }, [state]);
+
+  // When calibration arrives (async load from Supabase), restart pipeline
+  useEffect(() => {
+    calibRef.current = calibration;
+    if (calibration && stateRef.current === "UNCALIBRATED") {
+      transition("WAITING");
+      restartRaf();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [calibration]);
 
   const transition = useCallback((next: PipelineState) => {
     stateRef.current = next;
@@ -80,28 +93,28 @@ export function usePipeline(
     const n = historyRef.current.length;
     let maxDisp = 0;
     for (let i = 1; i < n; i++) {
-      const [plcx, plcy, prcx, prcy] = historyRef.current[i - 1];
+      const [plcx, plcy, prcx, prcy] = historyRef.current[i-1];
       const [clcx, clcy, crcx, crcy] = historyRef.current[i];
-      const dl = Math.hypot(clcx - plcx, clcy - plcy);
-      const dr = Math.hypot(crcx - prcx, crcy - prcy);
+      const dl = Math.hypot(clcx-plcx, clcy-plcy);
+      const dr = Math.hypot(crcx-prcx, crcy-prcy);
       if (dl > maxDisp) maxDisp = dl;
       if (dr > maxDisp) maxDisp = dr;
     }
 
     return {
-      stable:             n >= STABILITY_FRAMES && maxDisp < STABILITY_THRESHOLD,
-      framesRecorded:     n,
-      maxDisplacementPx:  maxDisp,
-      progressFraction:   Math.min(n / STABILITY_FRAMES, 1),
+      stable:            n >= STABILITY_FRAMES && maxDisp < STABILITY_THRESHOLD,
+      framesRecorded:    n,
+      maxDisplacementPx: maxDisp,
+      progressFraction:  Math.min(n / STABILITY_FRAMES, 1),
     };
   }
 
   async function runMeasurement(): Promise<void> {
     const video = videoRef.current;
+    const cal   = calibRef.current;
     const det   = detectionRef.current;
-    if (!video || !det?.found || !det.left || !det.right) {
-      transition("WAITING");
-      return;
+    if (!video || !cal || !det?.found || !det.left || !det.right) {
+      transition("WAITING"); return;
     }
 
     const frame = extractFrame(video, 1);
@@ -111,13 +124,10 @@ export function usePipeline(
       const leftRegion  = findHeelSide(frame, det.left.bbox);
       const rightRegion = findHeelSide(frame, det.right.bbox);
 
-      const leftMeasure  = measureHeel(frame, leftRegion.heelBbox,  det.left.bbox);
-      const rightMeasure = measureHeel(frame, rightRegion.heelBbox, det.right.bbox);
+      const leftMeasure  = measureHeel(frame, leftRegion.heelBbox,  det.left.bbox,  cal.pxPerMm);
+      const rightMeasure = measureHeel(frame, rightRegion.heelBbox, det.right.bbox, cal.pxPerMm);
 
-      if (!leftMeasure || !rightMeasure) {
-        transition("WAITING");
-        return;
-      }
+      if (!leftMeasure || !rightMeasure) { transition("WAITING"); return; }
 
       const comparison = compareHeels(leftMeasure, rightMeasure);
 
@@ -127,12 +137,11 @@ export function usePipeline(
         const insp: InspectionResult = { left: leftMeasure, right: rightMeasure, comparison, annotatedBlob: null };
         drawOverlay(overlay, "RESULT", det, null, insp);
         const comp = document.createElement("canvas");
-        comp.width  = overlay.width;
-        comp.height = overlay.height;
+        comp.width = overlay.width; comp.height = overlay.height;
         const ctx = comp.getContext("2d")!;
         ctx.drawImage(video, 0, 0, comp.width, comp.height);
         ctx.drawImage(overlay, 0, 0);
-        await new Promise<void>(res => comp.toBlob(blob => { annotatedBlob = blob; res(); }, "image/jpeg", 0.88));
+        await new Promise<void>(res => comp.toBlob(b => { annotatedBlob = b; res(); }, "image/jpeg", 0.88));
       }
 
       const inspection: InspectionResult = { left: leftMeasure, right: rightMeasure, comparison, annotatedBlob };
@@ -147,27 +156,22 @@ export function usePipeline(
         startRemovalCheck();
       }, RESULT_DISPLAY_MS);
 
-    } catch {
-      transition("WAITING");
-    }
+    } catch { transition("WAITING"); }
   }
 
   function startRemovalCheck(): void {
-    clearInterval(removalCheckRef.current);
-    removalCheckRef.current = setInterval(() => {
+    clearInterval(removalRef.current);
+    removalRef.current = setInterval(() => {
       const video = videoRef.current;
       if (!video) return;
       const frame = extractFrame(video, DETECTION_SCALE);
       if (!frame) return;
-      const det = detectShoes(frame);
-      if (!det.found) {
-        clearInterval(removalCheckRef.current);
+      if (!detectShoes(frame).found) {
+        clearInterval(removalRef.current);
         transition("RESETTING");
         setTimeout(() => {
-          resultRef.current   = null;
-          detectionRef.current = null;
-          setResult(null);
-          setDetection(null);
+          resultRef.current = null; detectionRef.current = null;
+          setResult(null); setDetection(null);
           resetStability();
           transition("WAITING");
           restartRaf();
@@ -180,30 +184,26 @@ export function usePipeline(
     const video = videoRef.current;
     const s     = stateRef.current;
 
-    if (!video || s === "RESULT" || s === "COMPLETE" || s === "RESETTING") {
+    if (!video || s === "UNCALIBRATED" || s === "RESULT" || s === "COMPLETE" || s === "RESETTING") {
       rafRef.current = requestAnimationFrame(rafLoop);
       return;
     }
 
     const frame = extractFrame(video, DETECTION_SCALE);
-    if (!frame) {
-      rafRef.current = requestAnimationFrame(rafLoop);
-      return;
-    }
+    if (!frame) { rafRef.current = requestAnimationFrame(rafLoop); return; }
 
-    const invScale = 1 / DETECTION_SCALE;
-    const rawDet   = detectShoes(frame);
-    const det: ShoeDetectionResult = rawDet.found && rawDet.left && rawDet.right
+    const inv = 1 / DETECTION_SCALE;
+    const raw = detectShoes(frame);
+    const det: ShoeDetectionResult = raw.found && raw.left && raw.right
       ? {
           found: true,
-          left:  { ...rawDet.left,  bbox: { x: rawDet.left.bbox.x  * invScale, y: rawDet.left.bbox.y  * invScale, w: rawDet.left.bbox.w  * invScale, h: rawDet.left.bbox.h  * invScale } },
-          right: { ...rawDet.right, bbox: { x: rawDet.right.bbox.x * invScale, y: rawDet.right.bbox.y * invScale, w: rawDet.right.bbox.w * invScale, h: rawDet.right.bbox.h * invScale } },
+          left:  { ...raw.left,  bbox: { x: raw.left.bbox.x*inv,  y: raw.left.bbox.y*inv,  w: raw.left.bbox.w*inv,  h: raw.left.bbox.h*inv  } },
+          right: { ...raw.right, bbox: { x: raw.right.bbox.x*inv, y: raw.right.bbox.y*inv, w: raw.right.bbox.w*inv, h: raw.right.bbox.h*inv } },
         }
-      : rawDet;
+      : raw;
 
     detectionRef.current = det;
     setDetection(det);
-
     const stab = updateStability(det);
     stabilityRef.current = stab;
     setStability(stab);
@@ -229,18 +229,20 @@ export function usePipeline(
     rafRef.current = requestAnimationFrame(rafLoop);
   }
 
-  function restartRaf(): void {
+  function restartRaf() {
     cancelAnimationFrame(rafRef.current);
     rafRef.current = requestAnimationFrame(rafLoop);
   }
 
   useEffect(() => {
-    transition("WAITING");
-    rafRef.current = requestAnimationFrame(rafLoop);
+    if (calibration) {
+      transition("WAITING");
+      rafRef.current = requestAnimationFrame(rafLoop);
+    }
     return () => {
       cancelAnimationFrame(rafRef.current);
       clearTimeout(resultTimerRef.current);
-      clearInterval(removalCheckRef.current);
+      clearInterval(removalRef.current);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

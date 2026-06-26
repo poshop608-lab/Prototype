@@ -7,7 +7,7 @@ import type {
   InspectionResult,
   PipelineState,
 } from "./types";
-import { TOLERANCE_PERCENT } from "./compare";
+import { TOLERANCE_MM } from "./compare";
 
 const C = {
   cyan:   "#06b6d4",
@@ -138,7 +138,7 @@ export function drawOverlay(
       ctx.beginPath(); ctx.moveTo(ax, left.topY); ctx.lineTo(ax, left.bottomY); ctx.stroke();
       ctx.shadowBlur = 0;
       const midY = (left.topY + left.bottomY) / 2;
-      pill(ctx, `L ~${left.heightMm}mm`, hb.x + hb.w / 2, midY, "rgba(0,0,0,0.88)", C.yellow, fs);
+      pill(ctx, `L ${left.heightMm}mm`, hb.x + hb.w / 2, midY, "rgba(0,0,0,0.88)", C.yellow, fs);
     }
 
     if (right) {
@@ -153,7 +153,7 @@ export function drawOverlay(
       ctx.beginPath(); ctx.moveTo(ax, right.topY); ctx.lineTo(ax, right.bottomY); ctx.stroke();
       ctx.shadowBlur = 0;
       const midY = (right.topY + right.bottomY) / 2;
-      pill(ctx, `R ~${right.heightMm}mm`, hb.x + hb.w / 2, midY, "rgba(0,0,0,0.88)", C.yellow, fs);
+      pill(ctx, `R ${right.heightMm}mm`, hb.x + hb.w / 2, midY, "rgba(0,0,0,0.88)", C.yellow, fs);
     }
 
     // Result banner
@@ -164,8 +164,8 @@ export function drawOverlay(
     ctx.fillStyle = C.white;
     ctx.textAlign = "center"; ctx.textBaseline = "middle";
     const bannerText = passed
-      ? `✓ PASS  Δ${comparison.diffPercent}% ≤ ${TOLERANCE_PERCENT}%`
-      : `✗ REJECT  Δ${comparison.diffPercent}% > ${TOLERANCE_PERCENT}%`;
+      ? `✓ PASS  Δ${comparison.diffMm}mm ≤ ${TOLERANCE_MM}mm`
+      : `✗ REJECT  Δ${comparison.diffMm}mm > ${TOLERANCE_MM}mm`;
     ctx.fillText(bannerText, w / 2, h - bh2 / 2);
     ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
   }

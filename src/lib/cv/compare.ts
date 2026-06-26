@@ -1,25 +1,15 @@
 import type { ComparisonResult, HeelMeasurement } from "./types";
 
-// Tolerance: heel heights must be within this % of each other to PASS.
-// 5% on a 100px heel = 5px difference allowed.
-export const TOLERANCE_PERCENT = 5.0;
+export const TOLERANCE_MM = 2.0;
 
-export function compareHeels(
-  left:  HeelMeasurement,
-  right: HeelMeasurement,
-): ComparisonResult {
-  const avg         = (left.heightPx + right.heightPx) / 2;
-  const diffPx      = Math.abs(left.heightPx - right.heightPx);
-  const diffPercent = parseFloat(((diffPx / avg) * 100).toFixed(1));
-  const passed      = diffPercent <= TOLERANCE_PERCENT;
-
+export function compareHeels(left: HeelMeasurement, right: HeelMeasurement): ComparisonResult {
+  const diffMm  = parseFloat(Math.abs(left.heightMm - right.heightMm).toFixed(2));
+  const passed  = diffMm <= TOLERANCE_MM;
   return {
     leftMm:          left.heightMm,
     rightMm:         right.heightMm,
-    diffPercent,
+    diffMm,
     passed,
-    rejectionReason: passed
-      ? null
-      : `Heel height difference ${diffPercent}% exceeds ${TOLERANCE_PERCENT}% tolerance`,
+    rejectionReason: passed ? null : `Heel difference ${diffMm}mm exceeds ${TOLERANCE_MM}mm tolerance`,
   };
 }

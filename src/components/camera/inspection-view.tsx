@@ -1,13 +1,15 @@
 "use client";
 
 import { motion, AnimatePresence } from "framer-motion";
-import { Loader2, CheckCircle2, XCircle, RotateCcw } from "lucide-react";
+import { Loader2, CheckCircle2, XCircle, RotateCcw, AlertTriangle } from "lucide-react";
 import { useCamera } from "@/hooks/use-camera";
 import { usePipeline } from "@/hooks/use-pipeline";
-import type { InspectionResult } from "@/lib/cv/types";
+import type { CalibrationData, InspectionResult } from "@/lib/cv/types";
 
 interface Props {
-  onResult: (result: InspectionResult) => void;
+  calibration:       CalibrationData | null;
+  onResult:          (result: InspectionResult) => void;
+  onNeedCalibration: () => void;
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -20,9 +22,9 @@ const STATUS_LABELS: Record<string, string> = {
   RESETTING: "Ready for next pair",
 };
 
-export function InspectionView({ onResult }: Props) {
+export function InspectionView({ calibration, onResult, onNeedCalibration }: Props) {
   const { videoRef, status: camStatus, error: camError } = useCamera();
-  const { state, detection, stability, result, overlayRef } = usePipeline(videoRef, onResult);
+  const { state, detection, stability, result, overlayRef } = usePipeline(videoRef, calibration, onResult);
 
   const isResult    = state === "RESULT" || state === "COMPLETE";
   const passed      = result?.comparison.passed;
@@ -115,7 +117,7 @@ export function InspectionView({ onResult }: Props) {
                   {passed ? "PASS" : "REJECT"}
                 </p>
                 <p className="text-xs mt-0.5" style={{ color: "#888" }}>
-                  L ~{result.comparison.leftMm}mm · R ~{result.comparison.rightMm}mm · Δ {result.comparison.diffPercent}%
+                  L {result.comparison.leftMm}mm · R {result.comparison.rightMm}mm · Δ {result.comparison.diffMm}mm
                 </p>
               </div>
               {state === "COMPLETE" && (
@@ -150,6 +152,26 @@ export function InspectionView({ onResult }: Props) {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Uncalibrated gate — admin must calibrate first */}
+      {state === "UNCALIBRATED" && (
+        <div className="absolute inset-0 flex items-center justify-center p-8 bg-black">
+          <div className="text-center max-w-xs">
+            <AlertTriangle className="w-12 h-12 mx-auto mb-3" style={{ color: "#f59e0b" }} />
+            <p className="font-bold text-white text-base mb-2">Station not calibrated</p>
+            <p className="text-sm mb-5" style={{ color: "#666" }}>
+              An admin must perform one-time calibration before workers can use this station.
+            </p>
+            <button
+              onClick={onNeedCalibration}
+              className="px-5 py-2.5 rounded-xl text-sm font-bold text-black"
+              style={{ background: "linear-gradient(135deg,#06b6d4,#3b82f6)" }}
+            >
+              Go to Calibration
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

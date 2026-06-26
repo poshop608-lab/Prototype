@@ -183,37 +183,43 @@ export function detectShoes(frame: ImageData): ShoeDetectionResult {
   let left: DetectedShoe | null  = null;
   let right: DetectedShoe | null = null;
 
-  // Case A: found 2+ separate blobs — use two largest
-  const singles = valid.filter(c => {
-    const bw = c.maxX - c.minX + 1;
-    const bh = c.maxY - c.minY + 1;
-    return (bw / bh) < 4.5; // single shoe shouldn't be extremely wide
-  });
+  // Helper: does blob A horizontally contain blob B (B is a sub-region of A)?
+  function contains(a: Component, b: Component): boolean {
+    return b.minX >= a.minX - 10 && b.maxX <= a.maxX + 10;
+  }
 
-  if (singles.length >= 2) {
-    const top2 = singles.slice(0, 2);
+  // Case A: two truly separate blobs — neither contains the other
+  // Must be non-overlapping in X (each shoe occupies its own half)
+  const nonContained = valid.filter((c, i) =>
+    !valid.slice(0, i).some(bigger => contains(bigger, c))
+  );
+
+  if (nonContained.length >= 2) {
+    const top2 = nonContained.slice(0, 2);
     top2.sort((a, b) => (a.minX + a.maxX) - (b.minX + b.maxX));
     const [l, r] = top2;
-    const lCx = (l.minX + l.maxX) / 2;
-    const rCx = (r.minX + r.maxX) / 2;
-    if (rCx - lCx >= w * 0.10) {
+    // Check they don't significantly overlap in X
+    const overlapX = Math.max(0, l.maxX - r.minX);
+    const minWidth = Math.min(l.maxX - l.minX, r.maxX - r.minX);
+    if (overlapX < minWidth * 0.3) {
       left  = { bbox: expandToSole({ x: l.minX, y: l.minY, w: l.maxX-l.minX+1, h: l.maxY-l.minY+1 }, h, borderY), confidence: 1 };
       right = { bbox: expandToSole({ x: r.minX, y: r.minY, w: r.maxX-r.minX+1, h: r.maxY-r.minY+1 }, h, borderY), confidence: 1 };
     }
   }
 
-  // Case B: one wide blob (merged pair) — try valley split
+  // Case B: largest blob is a merged pair (wide aspect) — valley split
   if ((!left || !right) && valid.length >= 1) {
     const merged = valid[0];
     const bw = merged.maxX - merged.minX + 1;
     const bh = merged.maxY - merged.minY + 1;
-    if (bw / bh > 2.5 && bw > w * 0.35) {
+    // A merged pair fills most of the frame width and has high aspect ratio
+    if (bw > w * 0.30) {
       const valleyX = findValley(closed, w, merged.minX, merged.maxX, merged.minY, merged.maxY);
-      const lBbox = expandToSole({ x: merged.minX, y: merged.minY, w: valleyX - merged.minX, h: bh }, h, borderY);
-      const rBbox = expandToSole({ x: valleyX,     y: merged.minY, w: merged.maxX - valleyX, h: bh }, h, borderY);
+      const lBbox = expandToSole({ x: merged.minX, y: merged.minY, w: valleyX - merged.minX,      h: bh }, h, borderY);
+      const rBbox = expandToSole({ x: valleyX,     y: merged.minY, w: merged.maxX - valleyX + 1,  h: bh }, h, borderY);
       if (lBbox.w > w * 0.10 && rBbox.w > w * 0.10) {
-        left  = { bbox: lBbox, confidence: 0.8 };
-        right = { bbox: rBbox, confidence: 0.8 };
+        left  = { bbox: lBbox, confidence: 0.85 };
+        right = { bbox: rBbox, confidence: 0.85 };
       }
     }
   }

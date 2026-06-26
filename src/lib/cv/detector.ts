@@ -12,13 +12,13 @@ import { frameToGrayscale } from "./frame";
 // ─── Tunables ─────────────────────────────────────────────────────────────────
 // Expressed as fractions of frame dimensions so they scale with resolution.
 const ADAPTIVE_BLOCK   = 51;      // px — local neighbourhood for threshold
-const ADAPTIVE_C       = 8;       // constant subtracted from local mean
-const CLOSE_RADIUS     = 8;       // morphological close kernel radius (px)
-const MIN_AREA_FRAC    = 0.015;   // blob must be ≥1.5% of half-frame area
-const MAX_AREA_FRAC    = 0.70;    // blob must be ≤70% of half-frame area
-const MIN_ASPECT       = 1.3;     // width/height: shoes are always wider than tall
-const MAX_ASPECT       = 7.0;
-const BORDER_PAD_FRAC  = 0.03;    // blobs touching within 3% of frame edge = invalid
+const ADAPTIVE_C       = 4;       // constant subtracted from local mean (lower = more sensitive)
+const CLOSE_RADIUS     = 10;      // morphological close kernel radius (px)
+const MIN_AREA_FRAC    = 0.008;   // blob must be ≥0.8% of frame area
+const MAX_AREA_FRAC    = 0.60;    // blob must be ≤60% of frame area
+const MIN_ASPECT       = 1.2;     // width/height: shoes are always wider than tall
+const MAX_ASPECT       = 8.0;
+const BORDER_PAD_FRAC  = 0.01;    // blobs touching within 1% of frame edge = invalid
 
 // ─── Grayscale CLAHE-lite (per-tile contrast stretch) ────────────────────────
 // Divides image into tiles, stretches each tile's histogram independently.
@@ -103,8 +103,10 @@ function adaptiveThreshold(gray: Uint8Array, w: number, h: number): Uint8Array {
                   - ii[(y1 + 1) * (w + 1) + x0]
                   + ii[y0       * (w + 1) + x0];
       const mean = sum / count;
-      // Foreground (shoe) = darker than local mean minus C
-      out[y * w + x] = gray[y * w + x] < mean - ADAPTIVE_C ? 1 : 0;
+      const diff = gray[y * w + x] - mean;
+      // Foreground = darker OR brighter than local mean by threshold
+      // Captures both dark shoe bodies and bright white soles against mid-tone backgrounds
+      out[y * w + x] = (diff < -ADAPTIVE_C || diff > ADAPTIVE_C * 3) ? 1 : 0;
     }
   }
   return out;
@@ -208,9 +210,9 @@ function connectedComponents(bin: Uint8Array, w: number, h: number): Component[]
 // ─── Public detector ──────────────────────────────────────────────────────────
 export function detectShoes(frame: ImageData): ShoeDetectionResult {
   const { width: w, height: h } = frame;
-  const halfArea = (w / 2) * h;
-  const borderX  = Math.round(w * BORDER_PAD_FRAC);
-  const borderY  = Math.round(h * BORDER_PAD_FRAC);
+  const frameArea = w * h;
+  const borderX   = Math.round(w * BORDER_PAD_FRAC);
+  const borderY   = Math.round(h * BORDER_PAD_FRAC);
 
   const raw       = frameToGrayscale(frame);
   const stretched = clahe(raw, w, h);
@@ -219,16 +221,15 @@ export function detectShoes(frame: ImageData): ShoeDetectionResult {
   const closed    = morphClose(binary, w, h, CLOSE_RADIUS);
   const comps     = connectedComponents(closed, w, h);
 
-  // Filter components to shoe candidates
   const candidates: DetectedShoe[] = comps
     .filter(c => {
-      const bw = c.maxX - c.minX + 1;
-      const bh = c.maxY - c.minY + 1;
+      const bw     = c.maxX - c.minX + 1;
+      const bh     = c.maxY - c.minY + 1;
       const aspect = bw / bh;
       const area   = c.area;
       return (
-        area   > halfArea * MIN_AREA_FRAC &&
-        area   < halfArea * MAX_AREA_FRAC &&
+        area   > frameArea * MIN_AREA_FRAC &&
+        area   < frameArea * MAX_AREA_FRAC &&
         aspect > MIN_ASPECT               &&
         aspect < MAX_ASPECT               &&
         c.minX > borderX                  &&
@@ -246,7 +247,7 @@ export function detectShoes(frame: ImageData): ShoeDetectionResult {
     return { found: false, left: null, right: null };
   }
 
-  // Pick two largest blobs
+  // Pick two largest by bbox area
   candidates.sort((a, b) => b.bbox.w * b.bbox.h - a.bbox.w * a.bbox.h);
   const top2 = candidates.slice(0, 2);
 
@@ -255,8 +256,10 @@ export function detectShoes(frame: ImageData): ShoeDetectionResult {
 
   const [left, right] = top2;
 
-  // Sanity: left shoe must be fully to the left of right shoe (no overlap allowed)
-  if (left.bbox.x + left.bbox.w > right.bbox.x + right.bbox.w * 0.4) {
+  // Sanity: x-centers must be separated (not the same object split in two)
+  const leftCx  = left.bbox.x  + left.bbox.w  / 2;
+  const rightCx = right.bbox.x + right.bbox.w / 2;
+  if (rightCx - leftCx < w * 0.08) {
     return { found: false, left: null, right: null };
   }
 

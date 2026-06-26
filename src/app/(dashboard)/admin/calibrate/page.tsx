@@ -1,134 +1,112 @@
 "use client";
 
-import { useRef, useState, useCallback } from "react";
+import { useRef, useState, useCallback, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { motion } from "framer-motion";
-import { Camera, ArrowLeft, CheckCircle2, AlertTriangle, Ruler } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
+import { CheckCircle2, AlertTriangle, Loader2 } from "lucide-react";
 import { useCamera } from "@/hooks/use-camera";
 import { extractFrame, frameToGrayscale } from "@/lib/cv/frame";
 import { saveCalibration } from "@/lib/calibration";
 import type { CalibrationData } from "@/lib/cv/types";
 
-// ─── Surface line detection ────────────────────────────────────────────────────
-// Finds the brightest horizontal band in the lower 50% of the frame.
-// The inspection table surface reflects more light than the wall background.
+const STATION_ID = "station-1";
+// Horizontal FOV for typical factory inspection phone (iPhone ~65°, Samsung S-series ~67°)
+const DEFAULT_H_FOV_DEG = 65;
+
+// Finds the brightest horizontal band in the lower 60% — the lit table surface.
 function detectSurfaceLine(frame: ImageData): number {
   const { width: w, height: h } = frame;
   const gray = frameToGrayscale(frame);
-  const startY = Math.floor(h * 0.4); // search lower 60%
-
-  // Row brightness: average luminance per row
+  const startY = Math.floor(h * 0.4);
   let maxBrightness = 0, surfaceY = Math.floor(h * 0.85);
   for (let y = startY; y < h; y++) {
     let rowSum = 0;
     for (let x = 0; x < w; x++) rowSum += gray[y * w + x];
-    const rowBrightness = rowSum / w;
-    if (rowBrightness > maxBrightness) {
-      maxBrightness = rowBrightness;
-      surfaceY = y;
-    }
+    const avg = rowSum / w;
+    if (avg > maxBrightness) { maxBrightness = avg; surfaceY = y; }
   }
   return surfaceY;
 }
 
-// ─── Reference object edge detection (px/mm calibration) ──────────────────────
-// Finds the leftmost and rightmost dark vertical edges in the middle 60% of height.
-function detectObjectEdges(frame: ImageData): { leftX: number; rightX: number } | null {
-  const { width: w, height: h } = frame;
-  const gray = frameToGrayscale(frame);
-  const yStart = Math.floor(h * 0.2), yEnd = Math.floor(h * 0.8);
-
-  // Vertical Sobel per column (sum of absolute horizontal gradient across middle rows)
-  const colGrad = new Float64Array(w);
-  for (let x = 1; x < w - 1; x++) {
-    let s = 0;
-    for (let y = yStart; y < yEnd; y++) {
-      s += Math.abs(gray[y * w + x + 1] - gray[y * w + x - 1]);
-    }
-    colGrad[x] = s;
-  }
-
-  // Find left edge (first strong gradient from left, in left 50%)
-  const THRESH = 300;
-  let leftX = -1, rightX = -1;
-  for (let x = 5; x < w / 2; x++) {
-    if (colGrad[x] > THRESH) { leftX = x; break; }
-  }
-  for (let x = w - 5; x > w / 2; x--) {
-    if (colGrad[x] > THRESH) { rightX = x; break; }
-  }
-
-  if (leftX < 0 || rightX < 0 || rightX <= leftX) return null;
-  return { leftX, rightX };
+// pxPerMm from camera geometry: frameWidth / (2 * heightMm * tan(hFOV/2))
+function computePxPerMm(frameWidth: number, heightCm: number, hFovDeg: number): number {
+  const heightMm = heightCm * 10;
+  const halfFovRad = (hFovDeg / 2) * (Math.PI / 180);
+  const fovWidthMm = 2 * heightMm * Math.tan(halfFovRad);
+  return frameWidth / fovWidthMm;
 }
 
-const STATION_ID = "station-1";
-
-type Step = "surface" | "scale" | "done";
+type Phase = "input" | "running" | "done" | "error";
 
 export default function CalibratePage() {
   const router = useRouter();
   const { videoRef, status: camStatus } = useCamera();
-  const captureRef = useRef<HTMLCanvasElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
 
-  const [step,       setStep]       = useState<Step>("surface");
-  const [surfaceY,   setSurfaceY]   = useState<number>(0);
-  const [refWidthMm, setRefWidthMm] = useState("297"); // default: A4 width
-  const [pxPerMm,    setPxPerMm]    = useState<number>(0);
-  const [message,    setMessage]    = useState<string>("");
-  const [busy,       setBusy]       = useState(false);
+  const [heightCm, setHeightCm] = useState("60");
+  const [phase,    setPhase]    = useState<Phase>("input");
+  const [errMsg,   setErrMsg]   = useState("");
+  const [result,   setResult]   = useState<{ surfaceY: number; pxPerMm: number } | null>(null);
 
-  // ── Step 1: capture surface line ──────────────────────────────────────────
-  const captureSurface = useCallback(async () => {
+  // Draw a horizontal guide line on overlay at surfaceY when done
+  useEffect(() => {
+    const canvas = overlayRef.current;
+    const video  = videoRef.current;
+    if (!canvas || !video || !result) return;
+    canvas.width  = video.videoWidth  || canvas.offsetWidth;
+    canvas.height = video.videoHeight || canvas.offsetHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Scale surfaceY from video coords to canvas display coords
+    const scaleY = canvas.height / (video.videoHeight || canvas.height);
+    const displayY = result.surfaceY * scaleY;
+
+    ctx.strokeStyle = "#22c55e";
+    ctx.lineWidth   = 2;
+    ctx.setLineDash([12, 6]);
+    ctx.beginPath();
+    ctx.moveTo(0, displayY);
+    ctx.lineTo(canvas.width, displayY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = "#22c55e";
+    ctx.font = "bold 13px 'Space Grotesk', sans-serif";
+    ctx.fillText("Surface line", 12, displayY - 6);
+  }, [result, videoRef]);
+
+  const handleCalibrate = useCallback(async () => {
     const video = videoRef.current;
     if (!video || camStatus !== "ready") return;
-    setBusy(true);
-    setMessage("");
 
-    // Average 5 frames
+    const cm = parseFloat(heightCm);
+    if (!cm || cm < 10 || cm > 300) {
+      setErrMsg("Enter a valid height between 10 and 300 cm.");
+      return;
+    }
+
+    setPhase("running");
+    setErrMsg("");
+
+    // Average 5 frames ~400ms apart for stable surface detection
     const frames: ImageData[] = [];
     for (let i = 0; i < 5; i++) {
       const f = extractFrame(video, 1);
       if (f) frames.push(f);
       await new Promise(r => setTimeout(r, 80));
     }
-    if (!frames.length) { setMessage("Could not capture frame. Try again."); setBusy(false); return; }
 
-    // Use first frame (averaging across frames is overkill for static surface)
-    const sY = detectSurfaceLine(frames[0]);
-    setSurfaceY(sY);
-    setMessage(`Surface line detected at Y=${sY}px`);
-    setStep("scale");
-    setBusy(false);
-  }, [videoRef, camStatus]);
+    if (!frames.length) {
+      setErrMsg("Could not read camera frame. Allow camera access and try again.");
+      setPhase("error");
+      return;
+    }
 
-  // ── Step 2: measure reference object ─────────────────────────────────────
-  const captureScale = useCallback(async () => {
-    const video = videoRef.current;
-    if (!video || camStatus !== "ready") return;
-    const mmVal = parseFloat(refWidthMm);
-    if (!mmVal || mmVal <= 0) { setMessage("Enter a valid width in mm."); return; }
-    setBusy(true);
-    setMessage("");
-
-    const frame = extractFrame(video, 1);
-    if (!frame) { setMessage("Could not capture frame."); setBusy(false); return; }
-
-    const edges = detectObjectEdges(frame);
-    if (!edges) { setMessage("Could not detect object edges. Ensure the reference object fills the frame against a clear background."); setBusy(false); return; }
-
-    const widthPx = edges.rightX - edges.leftX;
-    const computed = widthPx / mmVal;
-    setPxPerMm(computed);
-    setMessage(`Detected ${widthPx}px = ${mmVal}mm → ${computed.toFixed(3)} px/mm`);
-    setBusy(false);
-  }, [videoRef, camStatus, refWidthMm]);
-
-  // ── Save calibration ──────────────────────────────────────────────────────
-  const handleSave = useCallback(async () => {
-    const video = videoRef.current;
-    if (!video || !surfaceY || !pxPerMm) return;
-    setBusy(true);
+    const surfaceY = detectSurfaceLine(frames[0]);
+    const frameW   = frames[0].width;
+    const pxPerMm  = computePxPerMm(frameW, cm, DEFAULT_H_FOV_DEG);
 
     const cal: CalibrationData = {
       pxPerMm,
@@ -139,157 +117,169 @@ export default function CalibratePage() {
       stationId:    STATION_ID,
     };
 
-    await saveCalibration(cal);
-    setStep("done");
-    setBusy(false);
-  }, [videoRef, surfaceY, pxPerMm]);
+    try {
+      await saveCalibration(cal);
+      setResult({ surfaceY, pxPerMm });
+      setPhase("done");
+    } catch (err) {
+      setErrMsg(err instanceof Error ? err.message : "Save failed.");
+      setPhase("error");
+    }
+  }, [videoRef, camStatus, heightCm]);
 
   return (
-    <div className="max-w-lg mx-auto space-y-6 pb-8">
+    <div className="max-w-lg mx-auto space-y-5 pb-10">
+
       {/* Header */}
-      <div className="flex items-center gap-3">
-        <button
-          onClick={() => router.back()}
-          className="w-8 h-8 rounded-lg flex items-center justify-center"
-          style={{ color: "#666", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)" }}
-        >
-          <ArrowLeft className="w-4 h-4" />
-        </button>
-        <div>
-          <h1 className="text-xl font-bold text-white" style={{ fontFamily: "'Space Grotesk',sans-serif" }}>
-            Station Calibration
-          </h1>
-          <p className="text-xs mt-0.5" style={{ color: "#555" }}>
-            Admin only · Performed once at installation
-          </p>
-        </div>
+      <div>
+        <h1 className="text-xl font-bold text-white" style={{ fontFamily: "'Space Grotesk',sans-serif" }}>
+          Station Setup
+        </h1>
+        <p className="text-xs mt-0.5" style={{ color: "#555" }}>
+          Admin only · Done once at installation
+        </p>
       </div>
 
-      {/* Live preview */}
+      {/* Camera preview */}
       <div className="relative rounded-2xl overflow-hidden bg-black" style={{ aspectRatio: "16/9" }}>
         <video ref={videoRef} className="w-full h-full object-cover" playsInline muted autoPlay />
-        <canvas ref={captureRef} className="hidden" />
+        <canvas ref={overlayRef} className="absolute inset-0 w-full h-full object-cover pointer-events-none" />
+
         {camStatus === "starting" && (
           <div className="absolute inset-0 flex items-center justify-center bg-black">
-            <p className="text-sm text-white">Starting camera…</p>
+            <Loader2 className="w-8 h-8 animate-spin" style={{ color: "#06b6d4" }} />
           </div>
         )}
+
+        {/* Running overlay */}
+        <AnimatePresence>
+          {phase === "running" && (
+            <motion.div
+              key="scanning"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 flex flex-col items-center justify-center gap-3"
+              style={{ background: "rgba(0,0,0,0.65)" }}
+            >
+              <Loader2 className="w-10 h-10 animate-spin" style={{ color: "#06b6d4" }} />
+              <p className="text-white text-sm font-semibold">Detecting surface…</p>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
 
-      {/* Steps */}
-      {step === "surface" && (
-        <motion.div
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="rounded-2xl p-5 space-y-4"
-          style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.08)" }}
-        >
-          <div className="flex items-center gap-2">
-            <Ruler className="w-4 h-4" style={{ color: "#06b6d4" }} />
-            <p className="text-sm font-semibold text-white">Step 1 — Surface Line</p>
-          </div>
-          <p className="text-xs" style={{ color: "#666" }}>
-            Clear the inspection surface. Remove all shoes and objects.
-            Point the camera at the empty table surface and tap Capture.
-          </p>
-          <button
-            onClick={captureSurface}
-            disabled={busy || camStatus !== "ready"}
-            className="w-full flex items-center justify-center gap-2 py-3 rounded-xl text-sm font-bold text-black disabled:opacity-40"
-            style={{ background: "linear-gradient(135deg,#06b6d4,#3b82f6)" }}
+      {/* Input card */}
+      <AnimatePresence mode="wait">
+        {(phase === "input" || phase === "error") && (
+          <motion.div
+            key="input"
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
+            className="rounded-2xl p-5 space-y-5"
+            style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.08)" }}
           >
-            <Camera className="w-4 h-4" />
-            {busy ? "Capturing…" : "Capture Surface"}
-          </button>
-        </motion.div>
-      )}
+            <div className="space-y-1">
+              <p className="text-sm font-semibold text-white">
+                How high is the camera above the table?
+              </p>
+              <p className="text-xs" style={{ color: "#555" }}>
+                Measure from the table surface up to the phone lens.
+                No tools or reference sheets needed.
+              </p>
+            </div>
 
-      {step === "scale" && (
-        <motion.div
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="rounded-2xl p-5 space-y-4"
-          style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.08)" }}
-        >
-          <div className="flex items-center gap-2">
-            <Ruler className="w-4 h-4" style={{ color: "#06b6d4" }} />
-            <p className="text-sm font-semibold text-white">Step 2 — Scale Calibration</p>
-          </div>
-          <p className="text-xs" style={{ color: "#666" }}>
-            Place a reference object of known width flat on the surface (e.g. an A4 sheet, 297 mm wide).
-            Centre it in frame so both left and right edges are visible.
-            Enter the known width and tap Measure.
-          </p>
-          <div className="space-y-2">
-            <label className="text-xs font-semibold uppercase tracking-wider" style={{ color: "#555" }}>
-              Known width (mm)
-            </label>
-            <input
-              type="number"
-              value={refWidthMm}
-              onChange={e => setRefWidthMm(e.target.value)}
-              className="w-full px-3 py-2 rounded-lg text-white text-sm"
-              style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}
-              placeholder="e.g. 297"
-            />
-          </div>
-          <button
-            onClick={captureScale}
-            disabled={busy || camStatus !== "ready"}
-            className="w-full flex items-center justify-center gap-2 py-3 rounded-xl text-sm font-bold text-black disabled:opacity-40"
-            style={{ background: "linear-gradient(135deg,#06b6d4,#3b82f6)" }}
-          >
-            <Ruler className="w-4 h-4" />
-            {busy ? "Measuring…" : "Measure Reference"}
-          </button>
-          {pxPerMm > 0 && (
+            <div className="flex items-center gap-3">
+              <div className="flex-1 relative">
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  value={heightCm}
+                  onChange={e => setHeightCm(e.target.value)}
+                  min={10}
+                  max={300}
+                  className="w-full px-3 py-3 rounded-xl text-white text-lg font-semibold text-center"
+                  style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}
+                />
+              </div>
+              <span className="text-sm font-semibold" style={{ color: "#555", minWidth: "2rem" }}>cm</span>
+            </div>
+
+            {/* Quick presets */}
+            <div className="flex gap-2">
+              {[40, 50, 60, 70, 80].map(v => (
+                <button
+                  key={v}
+                  onClick={() => setHeightCm(String(v))}
+                  className="flex-1 py-1.5 rounded-lg text-xs font-semibold transition-all"
+                  style={{
+                    background: heightCm === String(v) ? "rgba(6,182,212,0.2)" : "rgba(255,255,255,0.04)",
+                    border: heightCm === String(v) ? "1px solid rgba(6,182,212,0.5)" : "1px solid rgba(255,255,255,0.06)",
+                    color: heightCm === String(v) ? "#06b6d4" : "#555",
+                  }}
+                >
+                  {v}
+                </button>
+              ))}
+            </div>
+
+            {errMsg && (
+              <div
+                className="flex items-start gap-2 rounded-xl px-3 py-2.5 text-xs"
+                style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", color: "#ef4444" }}
+              >
+                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                {errMsg}
+              </div>
+            )}
+
             <button
-              onClick={handleSave}
-              disabled={busy}
-              className="w-full flex items-center justify-center gap-2 py-3 rounded-xl text-sm font-bold text-black disabled:opacity-40"
+              onClick={handleCalibrate}
+              disabled={camStatus !== "ready"}
+              className="w-full py-3.5 rounded-xl text-sm font-bold text-black disabled:opacity-40"
+              style={{ background: "linear-gradient(135deg,#06b6d4,#3b82f6)" }}
+            >
+              Calibrate Station
+            </button>
+          </motion.div>
+        )}
+
+        {phase === "done" && result && (
+          <motion.div
+            key="done"
+            initial={{ opacity: 0, scale: 0.96 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="rounded-2xl p-6 text-center space-y-3"
+            style={{ background: "rgba(34,197,94,0.07)", border: "1px solid rgba(34,197,94,0.2)" }}
+          >
+            <CheckCircle2 className="w-12 h-12 mx-auto" style={{ color: "#22c55e" }} />
+            <p className="font-bold text-white text-lg" style={{ fontFamily: "'Space Grotesk',sans-serif" }}>
+              Station Ready
+            </p>
+            <p className="text-xs" style={{ color: "#666" }}>
+              Scale: {result.pxPerMm.toFixed(3)} px/mm · Surface Y: {result.surfaceY}px
+            </p>
+            <p className="text-xs" style={{ color: "#444" }}>
+              Workers can now start scanning. No further setup needed.
+            </p>
+            <button
+              onClick={() => router.push("/scan")}
+              className="px-6 py-2.5 rounded-xl text-sm font-bold text-black mt-2"
               style={{ background: "linear-gradient(135deg,#22c55e,#16a34a)" }}
             >
-              <CheckCircle2 className="w-4 h-4" />
-              Save Calibration
+              Start Inspecting
             </button>
-          )}
-        </motion.div>
-      )}
-
-      {step === "done" && (
-        <motion.div
-          initial={{ opacity: 0, scale: 0.95 }}
-          animate={{ opacity: 1, scale: 1 }}
-          className="rounded-2xl p-6 text-center space-y-3"
-          style={{ background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)" }}
-        >
-          <CheckCircle2 className="w-12 h-12 mx-auto" style={{ color: "#22c55e" }} />
-          <p className="font-bold text-white text-lg" style={{ fontFamily: "'Space Grotesk',sans-serif" }}>
-            Calibration Saved
-          </p>
-          <p className="text-xs" style={{ color: "#666" }}>
-            Surface Y: {surfaceY}px · Scale: {pxPerMm.toFixed(3)} px/mm
-          </p>
-          <button
-            onClick={() => router.push("/scan")}
-            className="px-6 py-2.5 rounded-xl text-sm font-bold text-black mt-2"
-            style={{ background: "linear-gradient(135deg,#22c55e,#16a34a)" }}
-          >
-            Start Inspecting
-          </button>
-        </motion.div>
-      )}
-
-      {/* Status message */}
-      {message && (
-        <div
-          className="rounded-xl px-4 py-3 text-xs font-medium flex items-start gap-2"
-          style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", color: "#aaa" }}
-        >
-          <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" style={{ color: "#f59e0b" }} />
-          {message}
-        </div>
-      )}
+            <button
+              onClick={() => { setPhase("input"); setResult(null); }}
+              className="block w-full text-xs mt-1 py-1"
+              style={{ color: "#444" }}
+            >
+              Recalibrate
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

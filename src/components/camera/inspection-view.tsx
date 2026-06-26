@@ -1,70 +1,53 @@
 "use client";
 
-import { useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Loader2, CheckCircle2, XCircle, RotateCcw, AlertTriangle } from "lucide-react";
+import { Loader2, CheckCircle2, XCircle, RotateCcw } from "lucide-react";
 import { useCamera } from "@/hooks/use-camera";
 import { usePipeline } from "@/hooks/use-pipeline";
-import type { CalibrationData, InspectionResult } from "@/lib/cv/types";
+import type { InspectionResult } from "@/lib/cv/types";
 
 interface Props {
-  calibration: CalibrationData | null;
-  onResult:    (result: InspectionResult) => void;
-  onNeedCalibration: () => void;
+  onResult: (result: InspectionResult) => void;
 }
 
 const STATUS_LABELS: Record<string, string> = {
-  UNCALIBRATED: "Station not calibrated",
-  WAITING:      "Place both shoes on the surface",
-  DETECTING:    "Hold steady…",
-  STABLE:       "Measuring…",
-  MEASURING:    "Measuring…",
-  RESULT:       "",
-  COMPLETE:     "Saved ✓",
-  RESETTING:    "Ready for next pair",
+  WAITING:   "Place both shoes on the surface",
+  DETECTING: "Hold steady…",
+  STABLE:    "Measuring…",
+  MEASURING: "Measuring…",
+  RESULT:    "",
+  COMPLETE:  "Saved ✓",
+  RESETTING: "Ready for next pair",
 };
 
-export function InspectionView({ calibration, onResult, onNeedCalibration }: Props) {
+export function InspectionView({ onResult }: Props) {
   const { videoRef, status: camStatus, error: camError } = useCamera();
-  const { state, detection, stability, result, overlayRef } = usePipeline(
-    videoRef,
-    calibration,
-    onResult,
-  );
+  const { state, detection, stability, result, overlayRef } = usePipeline(videoRef, onResult);
 
-  // Notify parent if we end up uncalibrated
-  useEffect(() => {
-    if (state === "UNCALIBRATED") onNeedCalibration();
-  }, [state, onNeedCalibration]);
-
-  const isResult   = state === "RESULT" || state === "COMPLETE";
-  const passed     = result?.comparison.passed;
+  const isResult    = state === "RESULT" || state === "COMPLETE";
+  const passed      = result?.comparison.passed;
   const resultColor = passed ? "#22c55e" : "#ef4444";
 
   return (
     <div className="relative w-full h-full bg-black overflow-hidden">
 
-      {/* Live video */}
       <video
         ref={videoRef}
         className="absolute inset-0 w-full h-full object-cover"
         playsInline muted autoPlay
       />
 
-      {/* CV annotation overlay */}
       <canvas
         ref={overlayRef}
         className="absolute inset-0 w-full h-full object-cover pointer-events-none"
       />
 
-      {/* Camera starting */}
       {camStatus === "starting" && (
         <div className="absolute inset-0 flex items-center justify-center bg-black">
           <Loader2 className="w-10 h-10 animate-spin" style={{ color: "#06b6d4" }} />
         </div>
       )}
 
-      {/* Camera error */}
       {camStatus === "error" && (
         <div className="absolute inset-0 flex items-center justify-center p-8 bg-black">
           <div className="text-center max-w-xs">
@@ -75,7 +58,7 @@ export function InspectionView({ calibration, onResult, onNeedCalibration }: Pro
         </div>
       )}
 
-      {/* Status bar — bottom */}
+      {/* Status bar */}
       {camStatus === "ready" && !isResult && (
         <div
           className="absolute bottom-0 inset-x-0 flex items-center justify-center gap-3 px-4 py-3"
@@ -107,7 +90,7 @@ export function InspectionView({ calibration, onResult, onNeedCalibration }: Pro
         </div>
       )}
 
-      {/* Result overlay */}
+      {/* Result panel */}
       <AnimatePresence>
         {isResult && result && (
           <motion.div
@@ -125,14 +108,14 @@ export function InspectionView({ calibration, onResult, onNeedCalibration }: Pro
             >
               {passed
                 ? <CheckCircle2 className="w-10 h-10 flex-shrink-0" style={{ color: resultColor }} />
-                : <XCircle     className="w-10 h-10 flex-shrink-0" style={{ color: resultColor }} />
+                : <XCircle      className="w-10 h-10 flex-shrink-0" style={{ color: resultColor }} />
               }
               <div className="flex-1 min-w-0">
                 <p className="text-xl font-black" style={{ color: resultColor, fontFamily: "'Space Grotesk',sans-serif" }}>
                   {passed ? "PASS" : "REJECT"}
                 </p>
                 <p className="text-xs mt-0.5" style={{ color: "#888" }}>
-                  L {result.comparison.leftMm}mm · R {result.comparison.rightMm}mm · Δ {result.comparison.diffMm}mm
+                  L {result.comparison.leftPx}px · R {result.comparison.rightPx}px · Δ {result.comparison.diffPercent}%
                 </p>
               </div>
               {state === "COMPLETE" && (
@@ -142,11 +125,8 @@ export function InspectionView({ calibration, onResult, onNeedCalibration }: Pro
                 </div>
               )}
             </div>
-
             <p className="text-center text-xs mt-3" style={{ color: "#555" }}>
-              {state === "COMPLETE"
-                ? "Remove shoes to scan next pair"
-                : "Saving…"}
+              {state === "COMPLETE" ? "Remove shoes to scan next pair" : "Saving…"}
             </p>
           </motion.div>
         )}
@@ -170,26 +150,6 @@ export function InspectionView({ calibration, onResult, onNeedCalibration }: Pro
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* Uncalibrated warning */}
-      {state === "UNCALIBRATED" && (
-        <div className="absolute inset-0 flex items-center justify-center p-8 bg-black">
-          <div className="text-center max-w-xs">
-            <AlertTriangle className="w-12 h-12 mx-auto mb-3" style={{ color: "#f59e0b" }} />
-            <p className="font-bold text-white text-base mb-2">Station not calibrated</p>
-            <p className="text-sm mb-5" style={{ color: "#666" }}>
-              An admin must calibrate this inspection station before use.
-            </p>
-            <button
-              onClick={onNeedCalibration}
-              className="px-4 py-2 rounded-xl text-sm font-semibold text-black"
-              style={{ background: "linear-gradient(135deg,#06b6d4,#3b82f6)" }}
-            >
-              Go to Calibration
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

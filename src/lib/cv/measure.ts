@@ -1,30 +1,7 @@
-// Heel height measurement.
-//
-// Inputs:
-//   frame    — full-resolution ImageData from the live camera
-//   heelBbox — narrow column at the heel end (from heel-finder.ts)
-//   surfaceY — calibrated surface line Y coordinate (pixels, fixed per installation)
-//   pxPerMm  — pixels per millimetre (from calibration)
-//
-// Output: HeelMeasurement
-//
-// Top boundary:
-//   Topmost foreground pixel in the heel column = top of heel collar.
-//   Uses extractForeground() which is color-independent (local contrast delta).
-//
-// Bottom boundary:
-//   surfaceY — calibrated once at installation, never detected per-frame.
-//   The camera is fixed. The table never moves. The surface line is constant.
-//   This eliminates the white-outsole-on-white-cloth detection problem entirely.
-//
-// Confidence:
-//   Coefficient of variation of per-column top-Y values.
-//   Low spread → consistent top boundary → high confidence.
-
 import type { BBox, HeelMeasurement } from "./types";
 import { extractForeground } from "./detector";
 
-const MIN_COLUMNS = 4;   // need at least this many foreground columns to measure
+const MIN_COLUMNS = 4;
 
 function median(arr: number[]): number {
   if (!arr.length) return 0;
@@ -36,42 +13,38 @@ function median(arr: number[]): number {
 export function measureHeel(
   frame:    ImageData,
   heelBbox: BBox,
-  surfaceY: number,
-  pxPerMm:  number,
+  shoeBbox: BBox,   // used to derive the outsole baseline (bottom of shoe)
 ): HeelMeasurement | null {
   const mask = extractForeground(frame, heelBbox);
   const bw   = heelBbox.w;
   const bh   = heelBbox.h;
 
-  // Per-column: find topmost foreground row
   const topRows: number[] = [];
-
   for (let rx = 0; rx < bw; rx++) {
     let topRow = -1;
     for (let ry = 0; ry < bh; ry++) {
       if (mask[ry * bw + rx]) { topRow = ry; break; }
     }
-    if (topRow >= 0) topRows.push(heelBbox.y + topRow); // convert to frame coords
+    if (topRow >= 0) topRows.push(heelBbox.y + topRow);
   }
 
   if (topRows.length < MIN_COLUMNS) return null;
 
-  const medTopY  = Math.round(median(topRows));
+  const medTopY = Math.round(median(topRows));
 
-  // Confidence: coefficient of variation of top-row positions
   const mean = topRows.reduce((a, b) => a + b, 0) / topRows.length;
   const variance = topRows.reduce((a, b) => a + (b - mean) ** 2, 0) / topRows.length;
   const cv = mean > 0 ? Math.sqrt(variance) / mean : 1;
   const confidence = Math.max(0, Math.min(1, 1 - cv / 0.05));
 
-  const heightPx = surfaceY - medTopY;
+  const bottomY  = shoeBbox.y + shoeBbox.h;
+  const heightPx = bottomY - medTopY;
   if (heightPx <= 0) return null;
 
   return {
-    topY:       medTopY,
-    surfaceY,
+    topY:      medTopY,
+    bottomY,
     heightPx,
-    heightMm:   parseFloat((heightPx / pxPerMm).toFixed(1)),
     heelBbox,
     confidence,
   };

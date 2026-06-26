@@ -7,36 +7,22 @@ import { InspectionView } from "@/components/camera/inspection-view";
 import { useScanStore } from "@/store/scan";
 import { useAuthStore } from "@/store/auth";
 import { createClient } from "@/lib/supabase/client";
-import { getLocalCalibration, loadCalibration } from "@/lib/calibration";
 import { generateScanId } from "@/lib/utils";
-import type { InspectionResult, CalibrationData } from "@/lib/cv/types";
-
-const STATION_ID = "station-1"; // could come from env or URL param in future
+import type { InspectionResult } from "@/lib/cv/types";
 
 export default function CapturePage() {
-  const router  = useRouter();
+  const router   = useRouter();
   const supabase = createClient();
   const { profile }  = useAuthStore();
   const { config }   = useScanStore();
 
-  const [calibration, setCalibration] = useState<CalibrationData | null>(null);
-  const [saveStatus,  setSaveStatus]  = useState<"idle" | "saving" | "saved" | "error">("idle");
-  const [saveError,   setSaveError]   = useState<string | null>(null);
+  const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [saveError,  setSaveError]  = useState<string | null>(null);
 
-  // Load calibration on mount
-  useEffect(() => {
-    const local = getLocalCalibration();
-    if (local) setCalibration(local);
-    // Also fetch from Supabase (refreshes cache)
-    loadCalibration(STATION_ID).then(cal => { if (cal) setCalibration(cal); });
-  }, []);
-
-  // If no batch config, redirect to scan setup
   useEffect(() => {
     if (!config) router.replace("/scan");
   }, [config, router]);
 
-  // Auto-save fires immediately when the pipeline emits a result
   const handleResult = useCallback(async (result: InspectionResult) => {
     if (!config || !profile) return;
     setSaveStatus("saving");
@@ -47,9 +33,8 @@ export default function CapturePage() {
 
     try {
       const scanId = generateScanId();
-      const { comparison: cmp, left, right } = result;
+      const { comparison: cmp } = result;
 
-      // 1. Insert scan record
       const { data: scan, error: scanErr } = await db
         .from("scans")
         .insert({
@@ -58,11 +43,11 @@ export default function CapturePage() {
           batch_id:         config.batchId,
           size:             "N/A",
           status:           cmp.passed ? "passed" : "rejected",
-          left_height_mm:   left.heightMm,
-          right_height_mm:  right.heightMm,
+          left_height_mm:   result.left.heightPx,
+          right_height_mm:  result.right.heightPx,
           left_width_mm:    null,
           right_width_mm:   null,
-          height_diff_mm:   cmp.diffMm,
+          height_diff_mm:   cmp.diffPercent,
           passed:           cmp.passed,
           rejection_reason: cmp.rejectionReason,
         })
@@ -72,7 +57,6 @@ export default function CapturePage() {
       if (scanErr) throw new Error(scanErr.message ?? JSON.stringify(scanErr));
       if (!scan)   throw new Error("No scan record returned");
 
-      // 2. Upload annotated image (non-blocking — failure doesn't abort save)
       if (result.annotatedBlob) {
         const filename = `${scan.id}/pair-${Date.now()}.jpg`;
         const { error: storageErr } = await supabase.storage
@@ -97,15 +81,10 @@ export default function CapturePage() {
     }
   }, [config, profile, supabase]);
 
-  const handleNeedCalibration = useCallback(() => {
-    router.push("/admin/calibrate");
-  }, [router]);
-
   if (!config) return null;
 
   return (
     <div className="fixed inset-0 flex flex-col" style={{ background: "#080810" }}>
-      {/* Header */}
       <div
         className="flex items-center gap-3 px-4 py-3 z-10 flex-shrink-0"
         style={{ background: "rgba(8,8,16,0.9)", borderBottom: "1px solid rgba(255,255,255,0.06)" }}
@@ -125,7 +104,6 @@ export default function CapturePage() {
             {config.batchId} · Fully automatic
           </p>
         </div>
-        {/* Save status chip */}
         {saveStatus === "saving" && (
           <span className="text-xs font-medium px-2 py-1 rounded-full" style={{ background: "rgba(6,182,212,0.15)", color: "#06b6d4" }}>
             Saving…
@@ -143,13 +121,8 @@ export default function CapturePage() {
         )}
       </div>
 
-      {/* Camera fills remaining space */}
       <div className="flex-1 relative">
-        <InspectionView
-          calibration={calibration}
-          onResult={handleResult}
-          onNeedCalibration={handleNeedCalibration}
-        />
+        <InspectionView onResult={handleResult} />
       </div>
     </div>
   );

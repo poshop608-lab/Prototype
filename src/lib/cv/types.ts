@@ -1,88 +1,70 @@
 // ─── Shared CV types ─────────────────────────────────────────────────────────
-// All modules in lib/cv/* depend only on these types.
-// The detector interface is abstract so YOLO can replace the deterministic
-// implementation without changing any downstream module.
 
 export interface BBox {
-  x: number;   // left edge in pixels (full-resolution frame coords)
-  y: number;   // top edge in pixels
-  w: number;   // width in pixels
-  h: number;   // height in pixels
+  x: number;
+  y: number;
+  w: number;
+  h: number;
 }
 
 export interface DetectedShoe {
-  bbox: BBox;
-  confidence: number;   // 0–1; deterministic detector always returns 1.0
+  bbox:       BBox;
+  confidence: number;
 }
 
-// Two shoes, sorted left-to-right by x-center.
 export interface ShoeDetectionResult {
   found: boolean;
   left:  DetectedShoe | null;
   right: DetectedShoe | null;
 }
 
-// Stability tracker output
 export interface StabilityResult {
-  stable:              boolean;
-  framesRecorded:      number;   // 0 – STABILITY_FRAMES
-  maxDisplacementPx:   number;
-  progressFraction:    number;   // 0.0–1.0 for UI ring
+  stable:             boolean;
+  framesRecorded:     number;
+  maxDisplacementPx:  number;
+  progressFraction:   number;
 }
 
-// Foreground mask for a single shoe region
 export interface ForegroundMask {
-  data:   Uint8Array;   // 1 = foreground, 0 = background; same size as input frame
+  data:   Uint8Array;
   width:  number;
   height: number;
 }
 
 export interface HeelMeasurement {
-  topY:        number;   // px: topmost foreground pixel in heel column (heel collar top)
-  surfaceY:    number;   // px: calibrated surface line (constant per installation)
-  heightPx:    number;   // surfaceY - topY
-  heightMm:    number;   // heightPx / pxPerMm
-  heelBbox:    BBox;     // the narrow column that was actually measured
-  confidence:  number;   // 0–1: consistency of column heights (low spread = high)
+  topY:       number;   // px: topmost foreground pixel in heel column
+  bottomY:    number;   // px: bottom of shoe bbox (outsole baseline)
+  heightPx:   number;   // bottomY - topY
+  heelBbox:   BBox;
+  confidence: number;
 }
 
 export interface ComparisonResult {
-  leftMm:          number;
-  rightMm:         number;
-  diffMm:          number;
+  leftPx:          number;
+  rightPx:         number;
+  diffPercent:     number;   // |left - right| / avg × 100
   passed:          boolean;
   rejectionReason: string | null;
 }
 
 export interface InspectionResult {
-  left:           HeelMeasurement;
-  right:          HeelMeasurement;
-  comparison:     ComparisonResult;
-  annotatedBlob:  Blob | null;
+  left:          HeelMeasurement;
+  right:         HeelMeasurement;
+  comparison:    ComparisonResult;
+  annotatedBlob: Blob | null;
 }
 
-// Calibration stored in Supabase + mirrored to localStorage as a fast cache
-export interface CalibrationData {
-  pxPerMm:       number;
-  surfaceY:      number;   // calibrated surface line Y in frame pixels
-  frameWidth:    number;   // camera resolution at calibration time
-  frameHeight:   number;
-  calibratedAt:  string;   // ISO timestamp
-  stationId:     string;   // e.g. "station-1"
-}
-
-// ─── Detector interface (abstract — swap implementation without changing callers) ─
+// ─── Detector interface (abstract — YOLO drops in here later) ─────────────────
 export interface ShoeDetector {
   detect(frame: ImageData): ShoeDetectionResult;
 }
 
 // ─── Pipeline state machine ───────────────────────────────────────────────────
 export type PipelineState =
-  | "UNCALIBRATED"   // no calibration found
-  | "WAITING"        // calibrated, no shoes present
-  | "DETECTING"      // shoes found, stability accumulating
-  | "STABLE"         // stability threshold met → trigger measurement
-  | "MEASURING"      // heel measurement in progress (<10ms)
-  | "RESULT"         // PASS/REJECT displayed, auto-save running
-  | "COMPLETE"       // save done, brief confirmation
-  | "RESETTING";     // shoes removed, animating out
+  | "WAITING"      // no shoes present
+  | "DETECTING"    // shoes found, stability accumulating
+  | "STABLE"       // stability threshold met
+  | "MEASURING"    // measurement in progress
+  | "RESULT"       // PASS/REJECT displayed
+  | "COMPLETE"     // save done
+  | "RESETTING";   // shoes removed, animating out

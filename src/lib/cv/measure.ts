@@ -31,23 +31,16 @@ export function measureHeel(
 
   if (topRows.length < MIN_COLUMNS) return null;
 
-  const medTopY = Math.round(median(topRows));
-
-  const mean     = topRows.reduce((a, b) => a + b, 0) / topRows.length;
-  const variance = topRows.reduce((a, b) => a + (b - mean) ** 2, 0) / topRows.length;
-  const cv       = mean > 0 ? Math.sqrt(variance) / mean : 1;
-  const confidence = Math.max(0, Math.min(1, 1 - cv / 0.05));
-
+  const medTopY  = Math.round(median(topRows));
   const bottomY  = shoeBbox.y + shoeBbox.h;
   const heightPx = bottomY - medTopY;
   if (heightPx <= 0) return null;
 
   return {
-    topY:      medTopY,
+    topY:     medTopY,
     bottomY,
     heightPx,
-    heightMm:  parseFloat((heightPx / pxPerMm).toFixed(1)),
+    heightMm: parseFloat((heightPx / pxPerMm).toFixed(1)),
     heelBbox,
-    confidence,
   };
 }

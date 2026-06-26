@@ -2,24 +2,20 @@ import type { BBox, DetectedShoe, ShoeDetectionResult } from "./types";
 import { frameToGrayscale } from "./frame";
 
 // ─── Tunables ─────────────────────────────────────────────────────────────────
-const CLOSE_RADIUS    = 12;     // morphological close to fill gaps in shoe outline
-const MIN_AREA_FRAC   = 0.005;  // blob ≥ 0.5% of frame area
-const MAX_AREA_FRAC   = 0.55;   // blob ≤ 55% of frame area
-const MIN_ASPECT      = 1.1;    // shoes are wider than tall
-const MAX_ASPECT      = 9.0;
-const BORDER_PAD_FRAC = 0.01;
+const CLOSE_RADIUS    = 18;    // large close to merge fragmented shoe uppers
+const MIN_AREA_FRAC   = 0.03;  // single shoe upper ≥ 3% of frame
+const MAX_AREA_FRAC   = 0.70;  // merged pair blob can be large; filtered separately
+const MIN_ASPECT      = 0.8;   // dark upper alone can be ~square
+const MAX_ASPECT      = 10.0;
+const BORDER_PAD_FRAC = 0.005; // very thin border exclusion
 
 // ─── Otsu's threshold ─────────────────────────────────────────────────────────
-// Finds the optimal global threshold to separate dark foreground from light background.
-// Works well for dark shoes on light/neutral backgrounds.
 function otsuThreshold(gray: Uint8Array): number {
   const hist = new Int32Array(256);
   for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
-
   const total = gray.length;
   let sumB = 0, wB = 0, sum = 0;
   for (let i = 0; i < 256; i++) sum += i * hist[i];
-
   let maxVar = 0, threshold = 128;
   for (let t = 0; t < 256; t++) {
     wB += hist[t];
@@ -37,23 +33,22 @@ function otsuThreshold(gray: Uint8Array): number {
 
 // ─── Gaussian blur 3×3 ────────────────────────────────────────────────────────
 function blur3(gray: Uint8Array, w: number, h: number): Uint8Array {
-  const k = [1, 2, 1, 2, 4, 2, 1, 2, 1];
+  const k = [1,2,1,2,4,2,1,2,1];
   const out = new Uint8Array(gray.length);
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
+  for (let y = 1; y < h-1; y++)
+    for (let x = 1; x < w-1; x++) {
       let s = 0;
       for (let dy = -1; dy <= 1; dy++)
         for (let dx = -1; dx <= 1; dx++)
-          s += gray[(y + dy) * w + (x + dx)] * k[(dy + 1) * 3 + (dx + 1)];
-      out[y * w + x] = s >> 4;
+          s += gray[(y+dy)*w+(x+dx)] * k[(dy+1)*3+(dx+1)];
+      out[y*w+x] = s >> 4;
     }
-  }
-  for (let x = 0; x < w; x++) { out[x] = gray[x]; out[(h-1)*w+x] = gray[(h-1)*w+x]; }
-  for (let y = 0; y < h; y++) { out[y*w] = gray[y*w]; out[y*w+w-1] = gray[y*w+w-1]; }
+  for (let x = 0; x < w; x++) { out[x]=gray[x]; out[(h-1)*w+x]=gray[(h-1)*w+x]; }
+  for (let y = 0; y < h; y++) { out[y*w]=gray[y*w]; out[y*w+w-1]=gray[y*w+w-1]; }
   return out;
 }
 
-// ─── Morphological close ──────────────────────────────────────────────────────
+// ─── Morphological ops ────────────────────────────────────────────────────────
 function morphOp(src: Uint8Array, w: number, h: number, r: number, dilate: boolean): Uint8Array {
   const out = new Uint8Array(src.length);
   const target = dilate ? 1 : 0;
@@ -61,15 +56,13 @@ function morphOp(src: Uint8Array, w: number, h: number, r: number, dilate: boole
     for (let x = 0; x < w; x++) {
       let hit = !dilate;
       outer: for (let dy = -r; dy <= r; dy++) {
-        const ny = y + dy;
-        if (ny < 0 || ny >= h) continue;
+        const ny = y+dy; if (ny<0||ny>=h) continue;
         for (let dx = -r; dx <= r; dx++) {
-          const nx = x + dx;
-          if (nx < 0 || nx >= w) continue;
-          if (src[ny * w + nx] === target) { hit = dilate; break outer; }
+          const nx = x+dx; if (nx<0||nx>=w) continue;
+          if (src[ny*w+nx]===target) { hit=dilate; break outer; }
         }
       }
-      out[y * w + x] = hit ? 1 : 0;
+      out[y*w+x] = hit ? 1 : 0;
     }
   }
   return out;
@@ -79,7 +72,7 @@ function morphClose(bin: Uint8Array, w: number, h: number, r: number): Uint8Arra
   return morphOp(morphOp(bin, w, h, r, true), w, h, r, false);
 }
 
-// ─── Connected components (union-find, 4-connectivity) ───────────────────────
+// ─── Connected components (union-find) ────────────────────────────────────────
 interface Component {
   minX: number; maxX: number; minY: number; maxY: number; area: number;
 }
@@ -100,36 +93,53 @@ function connectedComponents(bin: Uint8Array, w: number, h: number): Component[]
   let nextLabel = 1;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      const idx = y * w + x;
+      const idx = y*w+x;
       if (!bin[idx]) continue;
       const up   = y > 0 ? labels[(y-1)*w+x] : 0;
       const left = x > 0 ? labels[idx-1]      : 0;
-      if (!up && !left) {
-        labels[idx] = nextLabel;
-        parent.push(nextLabel);
-        nextLabel++;
-      } else if (up && !left) { labels[idx] = up; }
-        else if (!up && left) { labels[idx] = left; }
-        else { labels[idx] = up; union(up, left); }
+      if (!up && !left) { labels[idx]=nextLabel; parent.push(nextLabel); nextLabel++; }
+      else if (up  && !left) labels[idx] = up;
+      else if (!up && left)  labels[idx] = left;
+      else { labels[idx]=up; union(up,left); }
     }
   }
 
   const comps = new Map<number, Component>();
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      const lbl = labels[y * w + x];
-      if (!lbl) continue;
+      const lbl = labels[y*w+x]; if (!lbl) continue;
       const root = find(lbl);
       let c = comps.get(root);
-      if (!c) { c = { minX: x, maxX: x, minY: y, maxY: y, area: 0 }; comps.set(root, c); }
-      if (x < c.minX) c.minX = x;
-      if (x > c.maxX) c.maxX = x;
-      if (y < c.minY) c.minY = y;
-      if (y > c.maxY) c.maxY = y;
+      if (!c) { c={minX:x,maxX:x,minY:y,maxY:y,area:0}; comps.set(root,c); }
+      if (x<c.minX) c.minX=x; if (x>c.maxX) c.maxX=x;
+      if (y<c.minY) c.minY=y; if (y>c.maxY) c.maxY=y;
       c.area++;
     }
   }
   return Array.from(comps.values());
+}
+
+// ─── Vertical valley split ────────────────────────────────────────────────────
+// If two shoes merged into one blob, find the vertical column with least
+// foreground pixels between x0 and x1, split there.
+function findValley(bin: Uint8Array, w: number, minX: number, maxX: number, minY: number, maxY: number): number {
+  let valleyX = Math.floor((minX + maxX) / 2);
+  let minFill = Infinity;
+  const mid = Math.floor((minX + maxX) / 2);
+  const searchW = Math.floor((maxX - minX) * 0.25); // search middle 50%
+  for (let x = mid - searchW; x <= mid + searchW; x++) {
+    let fill = 0;
+    for (let y = minY; y <= maxY; y++) fill += bin[y * w + x];
+    if (fill < minFill) { minFill = fill; valleyX = x; }
+  }
+  return valleyX;
+}
+
+// ─── Expand bbox to include sole ─────────────────────────────────────────────
+// The dark upper detection doesn't capture the white sole.
+// Extend the bbox bottom to near the frame bottom to include the full shoe height.
+function expandToSole(bbox: BBox, frameH: number, borderY: number): BBox {
+  return { ...bbox, h: (frameH - borderY) - bbox.y };
 }
 
 // ─── Public detector ──────────────────────────────────────────────────────────
@@ -142,72 +152,91 @@ export function detectShoes(frame: ImageData): ShoeDetectionResult {
   const gray    = frameToGrayscale(frame);
   const blurred = blur3(gray, w, h);
 
-  // Otsu threshold: marks dark objects (shoes) as foreground
-  const t      = otsuThreshold(blurred);
+  // Use Otsu to find the dark/light split, but cap at 140 to avoid
+  // thresholding bright soles and wall as foreground.
+  const t      = Math.min(otsuThreshold(blurred), 140);
   const binary = new Uint8Array(w * h);
   for (let i = 0; i < blurred.length; i++) binary[i] = blurred[i] <= t ? 1 : 0;
 
   const closed = morphClose(binary, w, h, CLOSE_RADIUS);
   const comps  = connectedComponents(closed, w, h);
 
-  const candidates: DetectedShoe[] = comps
-    .filter(c => {
-      const bw     = c.maxX - c.minX + 1;
-      const bh     = c.maxY - c.minY + 1;
-      const aspect = bw / bh;
-      return (
-        c.area > frameArea * MIN_AREA_FRAC &&
-        c.area < frameArea * MAX_AREA_FRAC &&
-        aspect > MIN_ASPECT &&
-        aspect < MAX_ASPECT &&
-        c.minX > borderX    &&
-        c.maxX < w - borderX &&
-        c.minY > borderY    &&
-        c.maxY < h - borderY
-      );
-    })
-    .map(c => ({
-      bbox:       { x: c.minX, y: c.minY, w: c.maxX - c.minX + 1, h: c.maxY - c.minY + 1 },
-      confidence: 1.0,
-    }));
+  // Filter: pick blobs that could be one shoe OR a merged pair
+  const valid = comps.filter(c => {
+    const bw = c.maxX - c.minX + 1;
+    const bh = c.maxY - c.minY + 1;
+    const aspect = bw / bh;
+    return (
+      c.area > frameArea * MIN_AREA_FRAC &&
+      c.area < frameArea * MAX_AREA_FRAC &&
+      aspect > MIN_ASPECT &&
+      aspect < MAX_ASPECT &&
+      c.minX > borderX    &&
+      c.maxX < w - borderX &&
+      c.minY > borderY
+    );
+  });
 
-  if (candidates.length < 2) return { found: false, left: null, right: null };
+  // Sort by area descending
+  valid.sort((a, b) => b.area - a.area);
 
-  // Two largest blobs by filled area (most foreground pixels)
-  candidates.sort((a, b) => b.bbox.w * b.bbox.h - a.bbox.w * a.bbox.h);
-  const top2 = candidates.slice(0, 2);
-  top2.sort((a, b) => (a.bbox.x + a.bbox.w / 2) - (b.bbox.x + b.bbox.w / 2));
+  let left: DetectedShoe | null  = null;
+  let right: DetectedShoe | null = null;
 
-  const [left, right] = top2;
+  // Case A: found 2+ separate blobs — use two largest
+  const singles = valid.filter(c => {
+    const bw = c.maxX - c.minX + 1;
+    const bh = c.maxY - c.minY + 1;
+    return (bw / bh) < 4.5; // single shoe shouldn't be extremely wide
+  });
 
-  // x-centers must be meaningfully separated
-  const leftCx  = left.bbox.x  + left.bbox.w  / 2;
-  const rightCx = right.bbox.x + right.bbox.w / 2;
-  if (rightCx - leftCx < w * 0.08) return { found: false, left: null, right: null };
+  if (singles.length >= 2) {
+    const top2 = singles.slice(0, 2);
+    top2.sort((a, b) => (a.minX + a.maxX) - (b.minX + b.maxX));
+    const [l, r] = top2;
+    const lCx = (l.minX + l.maxX) / 2;
+    const rCx = (r.minX + r.maxX) / 2;
+    if (rCx - lCx >= w * 0.10) {
+      left  = { bbox: expandToSole({ x: l.minX, y: l.minY, w: l.maxX-l.minX+1, h: l.maxY-l.minY+1 }, h, borderY), confidence: 1 };
+      right = { bbox: expandToSole({ x: r.minX, y: r.minY, w: r.maxX-r.minX+1, h: r.maxY-r.minY+1 }, h, borderY), confidence: 1 };
+    }
+  }
 
+  // Case B: one wide blob (merged pair) — try valley split
+  if ((!left || !right) && valid.length >= 1) {
+    const merged = valid[0];
+    const bw = merged.maxX - merged.minX + 1;
+    const bh = merged.maxY - merged.minY + 1;
+    if (bw / bh > 2.5 && bw > w * 0.35) {
+      const valleyX = findValley(closed, w, merged.minX, merged.maxX, merged.minY, merged.maxY);
+      const lBbox = expandToSole({ x: merged.minX, y: merged.minY, w: valleyX - merged.minX, h: bh }, h, borderY);
+      const rBbox = expandToSole({ x: valleyX,     y: merged.minY, w: merged.maxX - valleyX, h: bh }, h, borderY);
+      if (lBbox.w > w * 0.10 && rBbox.w > w * 0.10) {
+        left  = { bbox: lBbox, confidence: 0.8 };
+        right = { bbox: rBbox, confidence: 0.8 };
+      }
+    }
+  }
+
+  if (!left || !right) return { found: false, left: null, right: null };
   return { found: true, left, right };
 }
 
 // ─── Foreground mask for heel measurement ────────────────────────────────────
-// Within shoe bbox, marks pixels darker than Otsu threshold as foreground.
-// This catches the dark shoe body (heel collar area) reliably.
-export function extractForeground(
-  frame:     ImageData,
-  bbox:      BBox,
-): Uint8Array {
+// Uses local Otsu within the shoe bbox to find the dark shoe body.
+export function extractForeground(frame: ImageData, bbox: BBox): Uint8Array {
   const { data, width: fw } = frame;
   const { x: bx, y: by, w: bw, h: bh } = bbox;
 
-  // Sample grayscale values in the bbox to compute local Otsu threshold
   const samples = new Uint8Array(bw * bh);
   for (let ry = 0; ry < bh; ry++) {
     for (let rx = 0; rx < bw; rx++) {
-      const fi = ((by + ry) * fw + (bx + rx)) * 4;
-      samples[ry * bw + rx] = (data[fi] * 77 + data[fi+1] * 150 + data[fi+2] * 29) >> 8;
+      const fi = ((by+ry)*fw + (bx+rx)) * 4;
+      samples[ry*bw+rx] = (data[fi]*77 + data[fi+1]*150 + data[fi+2]*29) >> 8;
     }
   }
 
-  const t    = otsuThreshold(samples);
+  const t = Math.min(otsuThreshold(samples), 140);
   const mask = new Uint8Array(bw * bh);
   for (let i = 0; i < samples.length; i++) mask[i] = samples[i] <= t ? 1 : 0;
   return mask;

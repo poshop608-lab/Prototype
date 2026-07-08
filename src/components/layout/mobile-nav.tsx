@@ -17,8 +17,8 @@ export function MobileNav() {
   const pathname = usePathname();
   const { profile } = useAuthStore();
 
-  // Hide nav on capture page — it uses fixed inset-0 fullscreen
-  if (pathname === "/scan/capture") return null;
+  // Hide nav on full-screen camera and result pages
+  if (pathname === "/scan" || pathname === "/scan/result" || pathname === "/scan/capture") return null;
 
   const filtered = navItems.filter(
     (item) => !profile?.role || item.roles.includes(profile.role)

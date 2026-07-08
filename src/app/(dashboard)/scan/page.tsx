@@ -11,10 +11,8 @@ import { getLocalCalibration, loadCalibration } from "@/lib/calibration";
 import { useScanStore } from "@/store/scan";
 import type { ScanResult } from "@/lib/cv/types";
 
-const STATION_ID = "station-1";
-// Fallback pxPerMm if admin hasn't calibrated (approx 3.5px/mm at ~60cm height).
-// Good enough for prototype relative comparison.
-const FALLBACK_PX_PER_MM = 3.5;
+const STATION_ID    = "station-1";
+const FALLBACK_PXMM = 3.5;
 
 export default function ScanPage() {
   const router = useRouter();
@@ -24,9 +22,8 @@ export default function ScanPage() {
   const [processing, setProcessing] = useState(false);
   const [errMsg,     setErrMsg]     = useState<string | null>(null);
   const calibLoadedRef = useRef(false);
-  const pxPerMmRef     = useRef<number>(FALLBACK_PX_PER_MM);
+  const pxPerMmRef     = useRef<number>(FALLBACK_PXMM);
 
-  // Load calibration once camera is ready
   const loadCal = useCallback(async () => {
     if (calibLoadedRef.current) return;
     calibLoadedRef.current = true;
@@ -59,11 +56,10 @@ export default function ScanPage() {
       return;
     }
 
-    // Store result in Zustand, navigate to result screen
     const r: ScanResult = outcome.result;
     setConfig({ batchId: `BATCH-${Date.now()}` });
     setCaptured({
-      blob:             new Blob(),          // populated on save
+      blob:             new Blob(),
       dataUrl:          r.annotatedDataUrl,
       annotatedDataUrl: r.annotatedDataUrl,
       leftHeightMm:     r.leftMm,
@@ -80,78 +76,134 @@ export default function ScanPage() {
   }, [videoRef, camStatus, processing, loadCal, setCaptured, setConfig, router]);
 
   return (
-    <div className="fixed inset-0 flex flex-col" style={{ background: "#080810" }}>
+    /*
+     * fixed + inset-0 escapes the dashboard layout's padding/max-width wrapper.
+     * 100dvh = dynamic viewport height (accounts for Safari address bar).
+     */
+    <div
+      className="fixed inset-0 z-50"
+      style={{ background: "#000", height: "100dvh" }}
+    >
+      {/* ── Full-screen video ─────────────────────────────────────────────── */}
+      <video
+        ref={videoRef}
+        className="absolute inset-0 w-full h-full"
+        style={{ objectFit: "cover" }}
+        playsInline
+        muted
+        autoPlay
+      />
 
-      {/* Header */}
-      <div
-        className="flex items-center gap-3 px-4 py-3 z-10 flex-shrink-0"
-        style={{ background: "rgba(8,8,16,0.95)", borderBottom: "1px solid rgba(255,255,255,0.06)" }}
-      >
-        <button
-          onClick={() => router.back()}
-          className="w-8 h-8 rounded-lg flex items-center justify-center"
-          style={{ color: "#666", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)" }}
-        >
-          <ArrowLeft className="w-4 h-4" />
-        </button>
-        <div className="flex-1">
-          <p className="text-white text-sm font-semibold" style={{ fontFamily: "'Space Grotesk',sans-serif" }}>
-            Shoe Pair Inspection
-          </p>
-          <p className="text-xs" style={{ color: "#555" }}>
-            Position both shoes, then tap Capture
-          </p>
+      {/* ── Loading state ─────────────────────────────────────────────────── */}
+      {camStatus === "starting" && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black">
+          <Loader2 className="w-10 h-10 animate-spin" style={{ color: "#06b6d4" }} />
+          <p className="text-sm font-medium" style={{ color: "#555" }}>Starting camera…</p>
         </div>
-      </div>
+      )}
 
-      {/* Camera feed — fills all space */}
-      <div className="flex-1 relative overflow-hidden bg-black">
-        <video
-          ref={videoRef}
-          className="absolute inset-0 w-full h-full object-cover"
-          playsInline muted autoPlay
-        />
-
-        {/* Camera starting */}
-        {camStatus === "starting" && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black">
-            <Loader2 className="w-10 h-10 animate-spin" style={{ color: "#06b6d4" }} />
+      {/* ── Camera error ──────────────────────────────────────────────────── */}
+      {camStatus === "error" && (
+        <div className="absolute inset-0 flex items-center justify-center p-8 bg-black">
+          <div className="text-center max-w-xs">
+            <AlertTriangle className="w-12 h-12 mx-auto mb-3" style={{ color: "#f59e0b" }} />
+            <p className="text-white font-bold mb-2">Camera unavailable</p>
+            <p className="text-sm" style={{ color: "#666" }}>{camError}</p>
           </div>
-        )}
+        </div>
+      )}
 
-        {/* Camera error */}
-        {camStatus === "error" && (
-          <div className="absolute inset-0 flex items-center justify-center p-8 bg-black">
-            <div className="text-center max-w-xs">
-              <AlertTriangle className="w-12 h-12 mx-auto mb-3" style={{ color: "#f59e0b" }} />
-              <p className="text-white font-bold mb-2">Camera unavailable</p>
-              <p className="text-sm" style={{ color: "#666" }}>{camError}</p>
-            </div>
-          </div>
-        )}
+      {/* ── Overlay UI (header + guides + button) — all on top of video ──── */}
+      <div className="absolute inset-0 pointer-events-none" style={{ zIndex: 10 }}>
 
-        {/* Framing guide corners */}
-        {camStatus === "ready" && !processing && (
-          <div className="absolute inset-0 pointer-events-none">
-            {([
-              ["top-6 left-6", "border-t-2 border-l-2 rounded-tl-lg"],
-              ["top-6 right-6", "border-t-2 border-r-2 rounded-tr-lg"],
-              ["bottom-24 left-6", "border-b-2 border-l-2 rounded-bl-lg"],
-              ["bottom-24 right-6", "border-b-2 border-r-2 rounded-br-lg"],
-            ] as [string, string][]).map(([pos, border]) => (
-              <div
-                key={pos}
-                className={`absolute w-8 h-8 ${pos} ${border}`}
-                style={{ borderColor: "rgba(6,182,212,0.6)" }}
-              />
-            ))}
-            <p
-              className="absolute bottom-28 inset-x-0 text-center text-xs font-semibold"
-              style={{ color: "rgba(255,255,255,0.5)" }}
-            >
-              Place both shoes heels facing centre
+        {/* Header bar — semi-transparent, floats over video */}
+        <div
+          className="pointer-events-auto flex items-center gap-3 px-4"
+          style={{
+            paddingTop: "env(safe-area-inset-top, 12px)",
+            paddingBottom: "12px",
+            background: "linear-gradient(to bottom, rgba(0,0,0,0.7) 0%, rgba(0,0,0,0) 100%)",
+          }}
+        >
+          <button
+            onClick={() => router.back()}
+            className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
+            style={{
+              background: "rgba(0,0,0,0.45)",
+              border: "1px solid rgba(255,255,255,0.15)",
+              backdropFilter: "blur(8px)",
+              color: "#fff",
+            }}
+          >
+            <ArrowLeft className="w-4 h-4" />
+          </button>
+          <div className="flex-1">
+            <p className="text-white text-sm font-semibold leading-tight" style={{ fontFamily: "'Space Grotesk',sans-serif", textShadow: "0 1px 4px rgba(0,0,0,0.8)" }}>
+              Shoe Pair Inspection
+            </p>
+            <p className="text-xs leading-tight" style={{ color: "rgba(255,255,255,0.55)", textShadow: "0 1px 3px rgba(0,0,0,0.8)" }}>
+              Position both shoes, then tap Capture
             </p>
           </div>
+        </div>
+
+        {/* Framing guides — only when camera ready and not processing */}
+        {camStatus === "ready" && !processing && (
+          <>
+            {/* Corner brackets */}
+            {([
+              { pos: { top: "20%",    left:  "6%" }, t:true,  l:true,  r:false, b:false },
+              { pos: { top: "20%",    right: "6%" }, t:true,  l:false, r:true,  b:false },
+              { pos: { bottom: "28%", left:  "6%" }, t:false, l:true,  r:false, b:true  },
+              { pos: { bottom: "28%", right: "6%" }, t:false, l:false, r:true,  b:true  },
+            ]).map(({ pos, t, l, r, b }, i) => (
+              <div
+                key={i}
+                className="absolute w-8 h-8"
+                style={{
+                  ...pos,
+                  borderTopWidth:    t ? "2px" : 0,
+                  borderLeftWidth:   l ? "2px" : 0,
+                  borderRightWidth:  r ? "2px" : 0,
+                  borderBottomWidth: b ? "2px" : 0,
+                  borderStyle: "solid",
+                  borderColor: "rgba(6,182,212,0.8)",
+                  borderRadius: "2px",
+                }}
+              />
+            ))}
+
+            {/* Centre vertical dashed guide */}
+            <div
+              className="absolute"
+              style={{
+                left: "50%",
+                top: "20%",
+                bottom: "28%",
+                width: "1px",
+                transform: "translateX(-0.5px)",
+                background: "repeating-linear-gradient(to bottom, rgba(6,182,212,0.5) 0px, rgba(6,182,212,0.5) 6px, transparent 6px, transparent 12px)",
+              }}
+            />
+
+            {/* Instruction label */}
+            <div
+              className="absolute inset-x-0 flex justify-center"
+              style={{ bottom: "calc(28% + 16px)" }}
+            >
+              <span
+                className="px-3 py-1.5 rounded-full text-xs font-semibold"
+                style={{
+                  background: "rgba(0,0,0,0.55)",
+                  color: "rgba(255,255,255,0.8)",
+                  backdropFilter: "blur(6px)",
+                  border: "1px solid rgba(255,255,255,0.1)",
+                }}
+              >
+                Place both shoes with heels facing each other
+              </span>
+            </div>
+          </>
         )}
 
         {/* Processing overlay */}
@@ -162,11 +214,12 @@ export default function ScanPage() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className="absolute inset-0 flex flex-col items-center justify-center gap-4"
-              style={{ background: "rgba(0,0,0,0.75)" }}
+              className="absolute inset-0 flex flex-col items-center justify-center gap-4 pointer-events-auto"
+              style={{ background: "rgba(0,0,0,0.72)" }}
             >
-              <Loader2 className="w-12 h-12 animate-spin" style={{ color: "#06b6d4" }} />
-              <p className="text-white font-semibold text-sm">Analysing…</p>
+              <Loader2 className="w-14 h-14 animate-spin" style={{ color: "#06b6d4" }} />
+              <p className="text-white font-semibold">Analysing…</p>
+              <p className="text-xs" style={{ color: "#555" }}>This takes 1–2 seconds</p>
             </motion.div>
           )}
         </AnimatePresence>
@@ -176,35 +229,70 @@ export default function ScanPage() {
           {errMsg && (
             <motion.div
               key="err"
-              initial={{ opacity: 0, y: 20 }}
+              initial={{ opacity: 0, y: 16 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 20 }}
-              className="absolute bottom-24 inset-x-4 rounded-2xl px-4 py-3 flex items-start gap-3"
-              style={{ background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.3)" }}
+              exit={{ opacity: 0, y: 16 }}
+              className="absolute inset-x-4 rounded-2xl px-4 py-3 flex items-start gap-3 pointer-events-auto"
+              style={{
+                bottom: "calc(env(safe-area-inset-bottom, 0px) + 130px)",
+                background: "rgba(239,68,68,0.15)",
+                border: "1px solid rgba(239,68,68,0.4)",
+                backdropFilter: "blur(8px)",
+              }}
             >
               <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" style={{ color: "#ef4444" }} />
               <p className="text-sm" style={{ color: "#fca5a5" }}>{errMsg}</p>
             </motion.div>
           )}
         </AnimatePresence>
-      </div>
 
-      {/* Capture button */}
-      <div
-        className="flex-shrink-0 flex items-center justify-center py-6"
-        style={{ background: "rgba(8,8,16,0.95)", borderTop: "1px solid rgba(255,255,255,0.06)" }}
-      >
-        <button
-          onClick={handleCapture}
-          disabled={camStatus !== "ready" || processing}
-          className="w-20 h-20 rounded-full flex items-center justify-center disabled:opacity-40 transition-transform active:scale-95"
+        {/* Capture button — floats at bottom centre like native camera */}
+        <div
+          className="absolute inset-x-0 flex flex-col items-center gap-3 pointer-events-auto"
           style={{
-            background: "linear-gradient(135deg,#06b6d4,#3b82f6)",
-            boxShadow: "0 0 32px rgba(6,182,212,0.4)",
+            bottom: "calc(env(safe-area-inset-bottom, 16px) + 24px)",
+            background: "linear-gradient(to top, rgba(0,0,0,0.65) 0%, rgba(0,0,0,0) 100%)",
+            paddingTop: "40px",
+            paddingBottom: "8px",
           }}
         >
-          <Camera className="w-8 h-8 text-black" />
-        </button>
+          <button
+            onClick={handleCapture}
+            disabled={camStatus !== "ready" || processing}
+            aria-label="Capture"
+            className="disabled:opacity-40 active:scale-95 transition-transform"
+            style={{ display: "flex", alignItems: "center", justifyContent: "center" }}
+          >
+            {/* Outer ring — mimics iOS camera button */}
+            <span
+              className="flex items-center justify-center rounded-full"
+              style={{
+                width: 80,
+                height: 80,
+                border: "3px solid rgba(255,255,255,0.85)",
+                padding: 4,
+              }}
+            >
+              {/* Inner filled circle */}
+              <span
+                className="flex items-center justify-center rounded-full"
+                style={{
+                  width: "100%",
+                  height: "100%",
+                  background: processing
+                    ? "rgba(255,255,255,0.3)"
+                    : "rgba(255,255,255,0.95)",
+                  boxShadow: "0 0 20px rgba(255,255,255,0.3)",
+                }}
+              >
+                {!processing && <Camera className="w-7 h-7" style={{ color: "#111" }} />}
+              </span>
+            </span>
+          </button>
+          <p className="text-xs font-medium" style={{ color: "rgba(255,255,255,0.45)" }}>
+            Tap to capture
+          </p>
+        </div>
       </div>
     </div>
   );

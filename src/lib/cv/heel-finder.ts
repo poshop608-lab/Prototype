@@ -9,7 +9,7 @@ import type { BBox } from "./types";
 import { extractForeground } from "./detector";
 
 const STRIP_COUNT = 6;    // divide shoe width into this many strips
-const HEEL_FRAC   = 0.22; // heel measurement zone = rear 22% of shoe width
+const HEEL_FRAC   = 0.40; // heel measurement zone = rear 40% of shoe width
 
 export type HeelSide = "left" | "right";
 

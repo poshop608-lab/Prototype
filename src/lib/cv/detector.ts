@@ -144,23 +144,49 @@ function connectedComponents(bin: Uint8Array, w: number, h: number): Component[]
 }
 
 // ─── Valley split ─────────────────────────────────────────────────────────────
-// Scan full blob width on the RAW (unclosed) binary for the column with the
-// fewest foreground pixels. Searching the closed binary fails because morphClose
-// fills the physical gap between shoes. Raw binary preserves the gap.
-// Returns { valleyX, minFill }.
+// Build a per-column fill profile on the RAW binary, smooth it, then find
+// the minimum in the smoothed profile. Using the raw binary (not closed)
+// preserves the physical gap between shoes. Smoothing before argmin prevents
+// single noisy columns from winning over the actual inter-shoe gap.
+// Returns { valleyX, minFill } where minFill is the raw (unsmoothed) fill
+// at that column (used to gauge gap quality).
 
 function findValley(
   rawBin: Uint8Array, w: number,
   minX: number, maxX: number,
   scanMinY: number, scanMaxY: number,
 ): { valleyX: number; minFill: number } {
-  let valleyX = Math.floor((minX + maxX) / 2);
-  let minFill = Infinity;
-  for (let x = minX; x <= maxX; x++) {
+  const blobW = maxX - minX + 1;
+  const colFill = new Float64Array(blobW);
+
+  for (let i = 0; i < blobW; i++) {
+    const x = minX + i;
     let fill = 0;
     for (let y = scanMinY; y <= scanMaxY; y++) fill += rawBin[y * w + x];
-    if (fill < minFill) { minFill = fill; valleyX = x; }
+    colFill[i] = fill;
   }
+
+  // Box-smooth the column profile (radius 3) to suppress single-column noise
+  const smoothed = new Float64Array(blobW);
+  const smoothR = 3;
+  for (let i = 0; i < blobW; i++) {
+    let s = 0, n = 0;
+    for (let d = -smoothR; d <= smoothR; d++) {
+      const j = i + d;
+      if (j >= 0 && j < blobW) { s += colFill[j]; n++; }
+    }
+    smoothed[i] = s / n;
+  }
+
+  // Find minimum of smoothed profile
+  let minSmooth = Infinity;
+  let bestI = Math.floor(blobW / 2);
+  for (let i = 0; i < blobW; i++) {
+    if (smoothed[i] < minSmooth) { minSmooth = smoothed[i]; bestI = i; }
+  }
+
+  const valleyX = minX + bestI;
+  const minFill = colFill[bestI];
   return { valleyX, minFill };
 }
 

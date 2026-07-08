@@ -106,49 +106,45 @@ export function measureHeel(
   if (soleRows.length < MIN_COLUMNS) return null;
   const medBottomY = Math.round(median(soleRows));
 
-  // ── Step 2: Heel collar top — find row of MAXIMUM shoe-body width ─────────
+  // ── Step 2: Heel collar top — first row where profile reaches ≥70% of peak ──
   //
-  // Compute how many dark pixels exist per row (row-width profile).
-  // The heel collar rim = the row in the UPPER HALF of the shoe where
-  // the row width is at its maximum. Above the collar the silhouette
-  // narrows (ankle/throat); below the collar it is the heel cup body.
+  // The row-width profile rises from near-zero (ankle/throat area above collar)
+  // to a plateau (the full heel body width). The collar rim = the first row
+  // where the profile crosses 70% of the peak value found in the upper half.
   //
-  // We restrict the search to the upper portion of the shoe
-  // (rows above the vertical midpoint) to exclude the wide sole area.
+  // Using first-threshold-crossing is more stable than argmax because:
+  //   - argmax chases the single noisiest peak (jumps scan-to-scan)
+  //   - The 70% crossing point is on the rising edge which is consistent
+  //     regardless of slight shoe position shifts
+  //
+  // Search window: shoeTopRow → shoeTopRow + 50% of bbox height
+  // (collar is always in the upper half of the heel bbox)
 
-  const profile = rowWidthProfile(gray, bw, bh, darkT);
-  const smoothed = smooth(profile, 3);
+  const profile  = rowWidthProfile(gray, bw, bh, darkT);
+  const smoothed = smooth(profile, 5); // wider smooth for stability
 
-  // Find the topmost row that has any dark pixels (top of shoe silhouette)
+  // Find topmost row with any dark pixels
   let shoeTopRow = -1;
   for (let ry = NOISE_SKIP; ry < bh - NOISE_SKIP; ry++) {
     if (profile[ry] >= 2) { shoeTopRow = ry; break; }
   }
   if (shoeTopRow < 0) return null;
 
-  // The collar rim is NOT the absolute topmost row — it is the row of
-  // maximum width within the UPPER THIRD of the shoe body.
-  // "Upper third" = from shoeTopRow down to shoeTopRow + (shoe body height / 3).
-  //
-  // Shoe body height = from shoeTopRow to the outsole top.
-  // Outsole top ≈ medBottomY - (by) - estimated sole thickness.
-  // We approximate: search from shoeTopRow to shoeTopRow + bh*0.45.
-  //
-  // Why upper third? The collar rim on any shoe type is within the
-  // top 40% of the shoe body height (above the heel cup).
-  const searchEnd = Math.min(bh - NOISE_SKIP, shoeTopRow + Math.round(bh * 0.45));
+  const searchEnd = Math.min(bh - NOISE_SKIP, shoeTopRow + Math.round(bh * 0.55));
 
-  let maxWidth     = 0;
-  let collarRow    = shoeTopRow;
-
+  // Find peak width in search window
+  let peakWidth = 0;
   for (let ry = shoeTopRow; ry <= searchEnd; ry++) {
-    if (smoothed[ry] > maxWidth) {
-      maxWidth  = smoothed[ry];
-      collarRow = ry;
-    }
+    if (smoothed[ry] > peakWidth) peakWidth = smoothed[ry];
   }
 
-  // collarRow is in heelBbox-local coordinates → convert to frame coordinates
+  // First row that reaches 70% of peak = collar rim
+  const threshold = peakWidth * 0.70;
+  let collarRow   = shoeTopRow;
+  for (let ry = shoeTopRow; ry <= searchEnd; ry++) {
+    if (smoothed[ry] >= threshold) { collarRow = ry; break; }
+  }
+
   const medTopY = by + collarRow;
 
   const heightPx = medBottomY - medTopY;

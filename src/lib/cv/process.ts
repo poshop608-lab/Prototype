@@ -72,15 +72,21 @@ export async function processImage(
 
   const leftDetection  = { ...detection.left,  bbox: scaleBbox(detection.left.bbox,  scaleX, scaleY) };
   const rightDetection = { ...detection.right, bbox: scaleBbox(detection.right.bbox, scaleX, scaleY) };
-  const fullDetection  = { found: true, left: leftDetection, right: rightDetection };
+  // Scale splitX to full resolution — this is the hard boundary between shoes
+  const splitX = Math.round(detection.splitX * scaleX);
+  const fullDetection  = { found: true, left: leftDetection, right: rightDetection, splitX };
 
   console.info("[process] frame", fw, "×", fh,
+    "| splitX:", splitX,
     "| L bbox x:", leftDetection.bbox.x,  "w:", leftDetection.bbox.w,
     "| R bbox x:", rightDetection.bbox.x, "w:", rightDetection.bbox.w);
 
   // ── 4. Find heel side + measure on full-res ──────────────────────────────
-  const leftRegion  = findHeelSide(fullFrame, leftDetection.bbox);
-  const rightRegion = findHeelSide(fullFrame, rightDetection.bbox);
+  // Pass splitX so each shoe's heelBbox is clamped to its own side.
+  // This prevents the heelBbox of an inward-facing heel from crossing into
+  // the opposite shoe's pixel space.
+  const leftRegion  = findHeelSide(fullFrame, leftDetection.bbox,  splitX, "left");
+  const rightRegion = findHeelSide(fullFrame, rightDetection.bbox, splitX, "right");
 
   console.info("[process] L heel side:", leftRegion.side,
     "heelBbox x:", leftRegion.heelBbox.x, "w:", leftRegion.heelBbox.w,

@@ -11,9 +11,10 @@ export interface DetectedShoe {
 }
 
 export interface ShoeDetectionResult {
-  found: boolean;
-  left:  DetectedShoe | null;
-  right: DetectedShoe | null;
+  found:  boolean;
+  left:   DetectedShoe | null;
+  right:  DetectedShoe | null;
+  splitX: number; // X boundary separating left shoe from right shoe (full-frame coords after scaling)
 }
 
 export interface HeelMeasurement {

@@ -230,20 +230,23 @@ function expandToSole(bbox: BBox, frameH: number, borderY: number): BBox {
 // ─── Blob → shoe pair extraction ─────────────────────────────────────────────
 
 interface AttemptResult {
-  left: DetectedShoe;
-  right: DetectedShoe;
+  left:       DetectedShoe;
+  right:      DetectedShoe;
   confidence: number;
+  splitX:     number; // pixel column boundary: left shoe owns x < splitX, right owns x >= splitX
 }
 
 function makePair(
   lMinX: number, lMinY: number, lMaxX: number, lMaxY: number,
   rMinX: number, rMinY: number, rMaxX: number, rMaxY: number,
   h: number, borderY: number, conf: number,
+  splitX: number,
 ): AttemptResult {
   return {
     left:  { bbox: expandToSole({ x: lMinX, y: lMinY, w: lMaxX-lMinX+1, h: lMaxY-lMinY+1 }, h, borderY), confidence: conf },
     right: { bbox: expandToSole({ x: rMinX, y: rMinY, w: rMaxX-rMinX+1, h: rMaxY-rMinY+1 }, h, borderY), confidence: conf },
     confidence: conf,
+    splitX,
   };
 }
 
@@ -303,9 +306,11 @@ function blobsToShoes(
     const overlapX = Math.max(0, l.maxX - r.minX);
     const minWidth = Math.min(l.maxX - l.minX, r.maxX - r.minX);
     if (overlapX < minWidth * 0.5) {
+      // splitX = midpoint of the overlap zone (or the gap between non-overlapping blobs)
+      const splitX = Math.floor((l.maxX + r.minX) / 2);
       if (process.env.NODE_ENV === "development")
-        console.debug(`[detector:${label}] Case A — two separate blobs`);
-      return makePair(l.minX, l.minY, l.maxX, l.maxY, r.minX, r.minY, r.maxX, r.maxY, h, borderY, 0.95);
+        console.debug(`[detector:${label}] Case A — two blobs, splitX=${splitX}`);
+      return makePair(l.minX, l.minY, l.maxX, l.maxY, r.minX, r.minY, r.maxX, r.maxY, h, borderY, 0.95, splitX);
     }
   }
 
@@ -335,7 +340,7 @@ function blobsToShoes(
         return makePair(
           merged.minX, merged.minY, valleyX - 1, merged.maxY,
           valleyX,     merged.minY, merged.maxX,  merged.maxY,
-          h, borderY, conf,
+          h, borderY, conf, valleyX,
         );
       }
 
@@ -346,7 +351,7 @@ function blobsToShoes(
       return makePair(
         merged.minX, merged.minY, midX - 1,   merged.maxY,
         midX,        merged.minY, merged.maxX, merged.maxY,
-        h, borderY, 0.50,
+        h, borderY, 0.50, midX,
       );
     }
   }
@@ -503,14 +508,14 @@ export function detectShoes(frame: ImageData): ShoeDetectionResult {
 
     if (result) {
       if (process.env.NODE_ENV === "development")
-        console.info(`[detector] SUCCESS via strategy "${s.label}" confidence=${result.confidence}`);
-      return { found: true, left: result.left, right: result.right };
+        console.info(`[detector] SUCCESS via strategy "${s.label}" confidence=${result.confidence} splitX=${result.splitX}`);
+      return { found: true, left: result.left, right: result.right, splitX: result.splitX };
     }
   }
 
   if (process.env.NODE_ENV === "development")
     console.warn("[detector] All 8 strategies failed — returning NO_SHOES");
-  return { found: false, left: null, right: null };
+  return { found: false, left: null, right: null, splitX: 0 };
 }
 
 // ─── Foreground mask for heel measurement (unchanged) ─────────────────────────

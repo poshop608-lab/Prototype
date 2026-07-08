@@ -1,13 +1,7 @@
 import type { BBox, HeelMeasurement } from "./types";
 
-const MIN_COLLAR_COLUMNS = 3;  // min columns with valid collar top
-const MIN_SOLE_COLUMNS   = 3;  // min columns with valid sole bottom
-const NOISE_SKIP         = 2;  // ignore outermost N px to skip JPEG fringing
-
-// Heel collar sits in the rearmost ~8% of shoe width.
-// Using a narrow strip at the extreme heel end isolates the collar
-// from mid-shoe features (tongue, padding bumps, ankle tab edge).
-const COLLAR_FRAC = 0.08;
+const MIN_COLUMNS  = 3;
+const NOISE_SKIP   = 2;
 
 function median(arr: number[]): number {
   if (!arr.length) return 0;
@@ -45,74 +39,117 @@ function otsu(gray: Uint8Array): number {
   return t;
 }
 
+// ── Row-width profile ─────────────────────────────────────────────────────────
+//
+// For each row in the heelBbox, count how many columns are foreground.
+// Returns array of length bh, each entry = foreground pixel count for that row.
+//
+// The heel collar rim is the row where the heel body is at MAXIMUM width.
+// Anatomy:
+//   Above collar rim → shoe narrows into ankle / throat
+//   At collar rim    → widest point of heel upper  ← TARGET
+//   Below collar rim → heel cup, then outsole
+//
+// This is independent of absolute pixel brightness and works for any shoe colour.
+
+function rowWidthProfile(gray: Uint8Array, bw: number, bh: number, darkT: number): Int32Array {
+  const profile = new Int32Array(bh);
+  for (let ry = 0; ry < bh; ry++) {
+    let count = 0;
+    for (let rx = 0; rx < bw; rx++) {
+      if (gray[ry * bw + rx] <= darkT) count++;
+    }
+    profile[ry] = count;
+  }
+  return profile;
+}
+
+// ── Smooth a 1-D array with a simple box filter ───────────────────────────────
+function smooth(arr: Int32Array, radius: number): Float64Array {
+  const out = new Float64Array(arr.length);
+  for (let i = 0; i < arr.length; i++) {
+    let s = 0, n = 0;
+    for (let d = -radius; d <= radius; d++) {
+      const j = i + d;
+      if (j >= 0 && j < arr.length) { s += arr[j]; n++; }
+    }
+    out[i] = s / n;
+  }
+  return out;
+}
+
 export function measureHeel(
   frame:     ImageData,
   heelBbox:  BBox,
-  _shoeBbox: BBox,   // kept for API compatibility
+  _shoeBbox: BBox,
   pxPerMm:   number,
 ): HeelMeasurement | null {
   const { x: bx, y: by, w: bw, h: bh } = heelBbox;
 
-  // ── Step 1: Collar top — scan narrow strip at extreme heel end ──────────
-  //
-  // The heel collar opening is at the rearmost edge of the shoe.
-  // heelBbox is already positioned at the heel end (by findHeelSide).
-  // We take only the rear COLLAR_FRAC of that bbox to get a tight column
-  // directly over the collar rim, away from mid-shoe body features.
-  //
-  // heelBbox.side = "left"  → heel is on the LEFT  side of shoe → collar at heelBbox.x (left edge)
-  // heelBbox.side = "right" → heel is on the RIGHT side of shoe → collar at heelBbox.x+w (right edge)
-  //
-  // Since we don't have side info here, we scan ALL columns and take the
-  // topmost COLLAR_FRAC (smallest Y) rows — those come from the heel end.
-
   const gray  = regionGray(frame, heelBbox);
-  const darkT = Math.min(otsu(gray), 160);  // generous cap; dark leather can be 100–150
-  const bgT   = 210;                         // definitely background (wall, table surface)
+  const darkT = Math.min(otsu(gray), 160);
+  const bgT   = 210;
 
-  // Collect per-column first-dark-pixel and last-non-bg-pixel
-  const collarRows: number[] = [];
-  const soleRows:   number[] = [];
-
+  // ── Step 1: Bottom of outsole — scan each column bottom-up ───────────────
+  // The outsole bottom is the last non-background pixel per column.
+  // Background = wall/table (very light) OR empty space below shoe.
+  // We use bgT = 210 as "definitely background".
+  const soleRows: number[] = [];
   for (let rx = 0; rx < bw; rx++) {
-    let firstDark = -1;
-    let lastNonBg = -1;
-
-    for (let ry = NOISE_SKIP; ry < bh - NOISE_SKIP; ry++) {
-      if (gray[ry * bw + rx] <= darkT) { firstDark = ry; break; }
+    for (let ry = bh - 1 - NOISE_SKIP; ry >= NOISE_SKIP; ry--) {
+      if (gray[ry * bw + rx] < bgT) {
+        soleRows.push(by + ry);
+        break;
+      }
     }
-    if (firstDark < 0) continue;
+  }
+  if (soleRows.length < MIN_COLUMNS) return null;
+  const medBottomY = Math.round(median(soleRows));
 
-    for (let ry = bh - 1 - NOISE_SKIP; ry > firstDark; ry--) {
-      if (gray[ry * bw + rx] < bgT) { lastNonBg = ry; break; }
+  // ── Step 2: Heel collar top — find row of MAXIMUM shoe-body width ─────────
+  //
+  // Compute how many dark pixels exist per row (row-width profile).
+  // The heel collar rim = the row in the UPPER HALF of the shoe where
+  // the row width is at its maximum. Above the collar the silhouette
+  // narrows (ankle/throat); below the collar it is the heel cup body.
+  //
+  // We restrict the search to the upper portion of the shoe
+  // (rows above the vertical midpoint) to exclude the wide sole area.
+
+  const profile = rowWidthProfile(gray, bw, bh, darkT);
+  const smoothed = smooth(profile, 3);
+
+  // Find the topmost row that has any dark pixels (top of shoe silhouette)
+  let shoeTopRow = -1;
+  for (let ry = NOISE_SKIP; ry < bh - NOISE_SKIP; ry++) {
+    if (profile[ry] >= 2) { shoeTopRow = ry; break; }
+  }
+  if (shoeTopRow < 0) return null;
+
+  // The collar rim is NOT the absolute topmost row — it is the row of
+  // maximum width within the UPPER THIRD of the shoe body.
+  // "Upper third" = from shoeTopRow down to shoeTopRow + (shoe body height / 3).
+  //
+  // Shoe body height = from shoeTopRow to the outsole top.
+  // Outsole top ≈ medBottomY - (by) - estimated sole thickness.
+  // We approximate: search from shoeTopRow to shoeTopRow + bh*0.45.
+  //
+  // Why upper third? The collar rim on any shoe type is within the
+  // top 40% of the shoe body height (above the heel cup).
+  const searchEnd = Math.min(bh - NOISE_SKIP, shoeTopRow + Math.round(bh * 0.45));
+
+  let maxWidth     = 0;
+  let collarRow    = shoeTopRow;
+
+  for (let ry = shoeTopRow; ry <= searchEnd; ry++) {
+    if (smoothed[ry] > maxWidth) {
+      maxWidth  = smoothed[ry];
+      collarRow = ry;
     }
-    if (lastNonBg < 0) lastNonBg = firstDark;
-
-    collarRows.push(by + firstDark);
-    soleRows.push(by + lastNonBg);
   }
 
-  if (collarRows.length < MIN_COLLAR_COLUMNS) return null;
-  if (soleRows.length   < MIN_SOLE_COLUMNS)   return null;
-
-  // ── Step 2: Collar top — use the HIGHEST (lowest Y) readings ───────────
-  //
-  // The heel collar opening is the topmost feature of the heel region.
-  // Mid-shoe columns will also report a top-pixel, but it will be lower
-  // (larger Y) than the true collar top. By taking the 20th percentile
-  // (near-minimum) of collarRows rather than the median, we reliably
-  // land on the collar rim without being dragged down by body columns.
-  //
-  // 20th percentile = sort ascending, take index at 20% of length.
-  // This filters out stray high noise pixels while capturing the true
-  // top of the collar opening.
-
-  const sortedCollar = [...collarRows].sort((a, b) => a - b);
-  const p20idx = Math.max(0, Math.floor(sortedCollar.length * 0.20) - 1);
-  const medTopY = sortedCollar[p20idx];
-
-  // ── Step 3: Sole bottom — use median (robust to noise at sole edge) ────
-  const medBottomY = Math.round(median(soleRows));
+  // collarRow is in heelBbox-local coordinates → convert to frame coordinates
+  const medTopY = by + collarRow;
 
   const heightPx = medBottomY - medTopY;
   if (heightPx <= 0) return null;

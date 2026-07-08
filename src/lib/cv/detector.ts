@@ -144,24 +144,24 @@ function connectedComponents(bin: Uint8Array, w: number, h: number): Component[]
 }
 
 // ─── Valley split ─────────────────────────────────────────────────────────────
-// Search the full middle 80% of blob width for the thinnest vertical column.
-// Only scan rows within the upper shoe portion (above shoe-table boundary).
+// Scan full blob width on the RAW (unclosed) binary for the column with the
+// fewest foreground pixels. Searching the closed binary fails because morphClose
+// fills the physical gap between shoes. Raw binary preserves the gap.
+// Returns { valleyX, minFill }.
 
 function findValley(
-  bin: Uint8Array, w: number,
+  rawBin: Uint8Array, w: number,
   minX: number, maxX: number,
   scanMinY: number, scanMaxY: number,
-): number {
-  const mid     = Math.floor((minX + maxX) / 2);
-  const searchW = Math.floor((maxX - minX) * 0.40); // search middle 80%
-  let valleyX   = mid;
-  let minFill   = Infinity;
-  for (let x = mid - searchW; x <= mid + searchW; x++) {
+): { valleyX: number; minFill: number } {
+  let valleyX = Math.floor((minX + maxX) / 2);
+  let minFill = Infinity;
+  for (let x = minX; x <= maxX; x++) {
     let fill = 0;
-    for (let y = scanMinY; y <= scanMaxY; y++) fill += bin[y * w + x];
+    for (let y = scanMinY; y <= scanMaxY; y++) fill += rawBin[y * w + x];
     if (fill < minFill) { minFill = fill; valleyX = x; }
   }
-  return valleyX;
+  return { valleyX, minFill };
 }
 
 // Find the row where the merged blob transitions from shoe to table.
@@ -224,6 +224,7 @@ function makePair(
 function blobsToShoes(
   comps: Component[],
   closed: Uint8Array,
+  binary: Uint8Array,
   w: number,
   h: number,
   borderY: number,
@@ -282,50 +283,44 @@ function blobsToShoes(
     }
   }
 
-  // ── Case B: one merged blob — clip table then valley split ───────────────
+  // ── Case B/C: one merged blob — find physical gap via raw binary ────────
   if (valid.length >= 1) {
     const merged = valid[0];
     const bw = merged.maxX - merged.minX + 1;
 
     if (bw > w * 0.20) {
-      // Find where shoe ends and table begins, clip blob bottom there
+      // Clip table rows so valley search stays in shoe-body rows only
       const tableY   = findShoeTableBoundary(closed, w, merged.minX, merged.maxX, merged.minY, merged.maxY);
       const scanMaxY = Math.max(merged.minY + 10, tableY);
 
-      // Valley split within shoe-only rows
-      const valleyX  = findValley(closed, w, merged.minX, merged.maxX, merged.minY, scanMaxY);
-      const leftW    = valleyX - merged.minX;
-      const rightW   = merged.maxX - valleyX + 1;
+      // Search RAW binary (pre-morphClose) for the column with fewest foreground
+      // pixels. morphClose fills the gap between shoes so searching `closed` fails.
+      const { valleyX, minFill } = findValley(binary, w, merged.minX, merged.maxX, merged.minY, scanMaxY);
+      const leftW  = valleyX - merged.minX;
+      const rightW = merged.maxX - valleyX + 1;
 
+      // minFill=0 means a completely empty column — definite gap.
+      // Even with some fill (shoes nearly touching), use this split if both
+      // halves are wide enough to be a real shoe.
       if (leftW > w * 0.07 && rightW > w * 0.07) {
+        const conf = minFill === 0 ? 0.90 : 0.75;
         if (process.env.NODE_ENV === "development")
-          console.debug(`[detector:${label}] Case B — valley split at x=${valleyX}, tableY=${tableY}`);
+          console.debug(`[detector:${label}] Case B/C — raw-valley split at x=${valleyX} fill=${minFill} conf=${conf}`);
         return makePair(
-          merged.minX, merged.minY, valleyX - 1,    merged.maxY,
-          valleyX,     merged.minY, merged.maxX,     merged.maxY,
-          h, borderY, 0.80,
+          merged.minX, merged.minY, valleyX - 1, merged.maxY,
+          valleyX,     merged.minY, merged.maxX,  merged.maxY,
+          h, borderY, conf,
         );
       }
 
-      // ── Case C: valley split failed min-width — scan full width for minimum ─
-      // Don't use geometric midpoint — it ignores actual pixel distribution.
-      // Instead scan every column across the entire merged blob (not just middle
-      // 80%) and find the column with the absolute fewest foreground pixels.
-      // This correctly finds the physical gap between two shoes even when the
-      // gap is narrow or near the edge of the merged bbox.
-      let caseC_minFill = Infinity;
-      let caseC_splitX  = Math.floor((merged.minX + merged.maxX) / 2);
-      for (let x = merged.minX + 1; x < merged.maxX; x++) {
-        let fill = 0;
-        for (let y = merged.minY; y <= scanMaxY; y++) fill += closed[y * w + x];
-        if (fill < caseC_minFill) { caseC_minFill = fill; caseC_splitX = x; }
-      }
+      // Last resort: geometric midpoint
+      const midX = Math.floor((merged.minX + merged.maxX) / 2);
       if (process.env.NODE_ENV === "development")
-        console.debug(`[detector:${label}] Case C — min-fill split at x=${caseC_splitX} fill=${caseC_minFill}`);
+        console.debug(`[detector:${label}] Case C fallback — midpoint split at x=${midX}`);
       return makePair(
-        merged.minX, merged.minY, caseC_splitX - 1, merged.maxY,
-        caseC_splitX, merged.minY, merged.maxX,      merged.maxY,
-        h, borderY, 0.65,
+        merged.minX, merged.minY, midX - 1,   merged.maxY,
+        midX,        merged.minY, merged.maxX, merged.maxY,
+        h, borderY, 0.50,
       );
     }
   }
@@ -474,7 +469,7 @@ export function detectShoes(frame: ImageData): ShoeDetectionResult {
     const comps   = connectedComponents(closed, w, h);
 
     const result = blobsToShoes(
-      comps, closed, w, h, borderY,
+      comps, closed, binary, w, h, borderY,
       s.minAreaFrac, s.maxAreaFrac,
       s.minAspect,   s.maxAspect,
       borderX,       s.label,

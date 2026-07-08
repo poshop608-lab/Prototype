@@ -1,7 +1,13 @@
 import type { BBox, HeelMeasurement } from "./types";
 
-const MIN_COLUMNS = 4;   // minimum columns that must have valid top+bottom
-const NOISE_SKIP  = 2;   // ignore top/bottom N px of bbox to skip jpeg artifacts
+const MIN_COLLAR_COLUMNS = 3;  // min columns with valid collar top
+const MIN_SOLE_COLUMNS   = 3;  // min columns with valid sole bottom
+const NOISE_SKIP         = 2;  // ignore outermost N px to skip JPEG fringing
+
+// Heel collar sits in the rearmost ~8% of shoe width.
+// Using a narrow strip at the extreme heel end isolates the collar
+// from mid-shoe features (tongue, padding bumps, ankle tab edge).
+const COLLAR_FRAC = 0.08;
 
 function median(arr: number[]): number {
   if (!arr.length) return 0;
@@ -10,7 +16,6 @@ function median(arr: number[]): number {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-// ─── Grayscale from RGBA ImageData for a sub-region ──────────────────────────
 function regionGray(frame: ImageData, bbox: BBox): Uint8Array {
   const { data, width: fw } = frame;
   const { x: bx, y: by, w: bw, h: bh } = bbox;
@@ -23,7 +28,6 @@ function regionGray(frame: ImageData, bbox: BBox): Uint8Array {
   return out;
 }
 
-// ─── Simple Otsu within array ─────────────────────────────────────────────────
 function otsu(gray: Uint8Array): number {
   const hist = new Int32Array(256);
   for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
@@ -41,81 +45,76 @@ function otsu(gray: Uint8Array): number {
   return t;
 }
 
-// ─── Core measurement ─────────────────────────────────────────────────────────
-//
-// Strategy: scan the heel column (heelBbox) pixel-by-pixel.
-// For each horizontal column of pixels:
-//   topRow    = first row where pixel is "shoe" (dark upper or any shoe body)
-//   bottomRow = last  row where pixel is "shoe" (includes white sole)
-//
-// We use TWO thresholds from the same column:
-//   darkT  = Otsu on the column → catches dark upper
-//   lightT = a fixed generous threshold → also catches white/light sole
-//
-// A pixel belongs to the shoe if it is either:
-//   (a) darker  than darkT  (dark upper, midsole seam)
-//   (b) lighter than lightT AND below the dark-upper top (white sole region)
-//
-// This way:
-//   topY    = top of heel collar (dark upper top edge)
-//   bottomY = bottom of white outsole (last non-background pixel)
-//
-// Both landmarks come from actual shoe pixels — no frame reference.
-
 export function measureHeel(
-  frame:    ImageData,
-  heelBbox: BBox,
-  _shoeBbox: BBox,       // kept for API compatibility — no longer used
-  pxPerMm:  number,
+  frame:     ImageData,
+  heelBbox:  BBox,
+  _shoeBbox: BBox,   // kept for API compatibility
+  pxPerMm:   number,
 ): HeelMeasurement | null {
-  const { width: fw } = frame;
   const { x: bx, y: by, w: bw, h: bh } = heelBbox;
 
-  // Sample grayscale for the full heel column
-  const gray = regionGray(frame, heelBbox);
+  // ── Step 1: Collar top — scan narrow strip at extreme heel end ──────────
+  //
+  // The heel collar opening is at the rearmost edge of the shoe.
+  // heelBbox is already positioned at the heel end (by findHeelSide).
+  // We take only the rear COLLAR_FRAC of that bbox to get a tight column
+  // directly over the collar rim, away from mid-shoe body features.
+  //
+  // heelBbox.side = "left"  → heel is on the LEFT  side of shoe → collar at heelBbox.x (left edge)
+  // heelBbox.side = "right" → heel is on the RIGHT side of shoe → collar at heelBbox.x+w (right edge)
+  //
+  // Since we don't have side info here, we scan ALL columns and take the
+  // topmost COLLAR_FRAC (smallest Y) rows — those come from the heel end.
 
-  // Global Otsu on this region to separate dark upper from background
-  const darkT = Math.min(otsu(gray), 150);
+  const gray  = regionGray(frame, heelBbox);
+  const darkT = Math.min(otsu(gray), 160);  // generous cap; dark leather can be 100–150
+  const bgT   = 210;                         // definitely background (wall, table surface)
 
-  // Background threshold: sky/wall/table is usually > 180 in typical factory settings.
-  // Anything below 200 could be part of the shoe (dark upper or coloured sole).
-  // We use 200 as a generous "definitely background" cutoff.
-  const bgT = 200;
-
-  const topRows:    number[] = [];
-  const bottomRows: number[] = [];
+  // Collect per-column first-dark-pixel and last-non-bg-pixel
+  const collarRows: number[] = [];
+  const soleRows:   number[] = [];
 
   for (let rx = 0; rx < bw; rx++) {
-    let firstShoe = -1;
-    let lastShoe  = -1;
+    let firstDark = -1;
+    let lastNonBg = -1;
 
-    // Phase 1: find the dark-upper top (scan top → bottom, look for dark pixels)
     for (let ry = NOISE_SKIP; ry < bh - NOISE_SKIP; ry++) {
-      const v = gray[ry * bw + rx];
-      if (v <= darkT) { firstShoe = ry; break; }
+      if (gray[ry * bw + rx] <= darkT) { firstDark = ry; break; }
     }
+    if (firstDark < 0) continue;
 
-    if (firstShoe < 0) continue; // no dark pixel in this column — skip
-
-    // Phase 2: find outsole bottom (scan bottom → top, look for any non-background pixel)
-    // This catches white/cream soles that are above darkT
-    for (let ry = bh - 1 - NOISE_SKIP; ry > firstShoe; ry--) {
-      const v = gray[ry * bw + rx];
-      if (v < bgT) { lastShoe = ry; break; }
+    for (let ry = bh - 1 - NOISE_SKIP; ry > firstDark; ry--) {
+      if (gray[ry * bw + rx] < bgT) { lastNonBg = ry; break; }
     }
+    if (lastNonBg < 0) lastNonBg = firstDark;
 
-    if (lastShoe < 0) lastShoe = firstShoe; // sole not found, use upper bottom as fallback
-
-    topRows.push(by + firstShoe);
-    bottomRows.push(by + lastShoe);
+    collarRows.push(by + firstDark);
+    soleRows.push(by + lastNonBg);
   }
 
-  if (topRows.length < MIN_COLUMNS) return null;
+  if (collarRows.length < MIN_COLLAR_COLUMNS) return null;
+  if (soleRows.length   < MIN_SOLE_COLUMNS)   return null;
 
-  const medTopY    = Math.round(median(topRows));
-  const medBottomY = Math.round(median(bottomRows));
-  const heightPx   = medBottomY - medTopY;
+  // ── Step 2: Collar top — use the HIGHEST (lowest Y) readings ───────────
+  //
+  // The heel collar opening is the topmost feature of the heel region.
+  // Mid-shoe columns will also report a top-pixel, but it will be lower
+  // (larger Y) than the true collar top. By taking the 20th percentile
+  // (near-minimum) of collarRows rather than the median, we reliably
+  // land on the collar rim without being dragged down by body columns.
+  //
+  // 20th percentile = sort ascending, take index at 20% of length.
+  // This filters out stray high noise pixels while capturing the true
+  // top of the collar opening.
 
+  const sortedCollar = [...collarRows].sort((a, b) => a - b);
+  const p20idx = Math.max(0, Math.floor(sortedCollar.length * 0.20) - 1);
+  const medTopY = sortedCollar[p20idx];
+
+  // ── Step 3: Sole bottom — use median (robust to noise at sole edge) ────
+  const medBottomY = Math.round(median(soleRows));
+
+  const heightPx = medBottomY - medTopY;
   if (heightPx <= 0) return null;
 
   return {

@@ -144,19 +144,57 @@ function connectedComponents(bin: Uint8Array, w: number, h: number): Component[]
 }
 
 // ─── Valley split ─────────────────────────────────────────────────────────────
+// Search the full middle 80% of blob width for the thinnest vertical column.
+// Only scan rows within the upper shoe portion (above shoe-table boundary).
 
-function findValley(bin: Uint8Array, w: number, minX: number, maxX: number, minY: number, maxY: number): number {
-  // Search middle 60% of blob width for the thinnest vertical column
-  const mid      = Math.floor((minX + maxX) / 2);
-  const searchW  = Math.floor((maxX - minX) * 0.30);
-  let valleyX    = mid;
-  let minFill    = Infinity;
+function findValley(
+  bin: Uint8Array, w: number,
+  minX: number, maxX: number,
+  scanMinY: number, scanMaxY: number,
+): number {
+  const mid     = Math.floor((minX + maxX) / 2);
+  const searchW = Math.floor((maxX - minX) * 0.40); // search middle 80%
+  let valleyX   = mid;
+  let minFill   = Infinity;
   for (let x = mid - searchW; x <= mid + searchW; x++) {
     let fill = 0;
-    for (let y = minY; y <= maxY; y++) fill += bin[y * w + x];
+    for (let y = scanMinY; y <= scanMaxY; y++) fill += bin[y * w + x];
     if (fill < minFill) { minFill = fill; valleyX = x; }
   }
   return valleyX;
+}
+
+// Find the row where the merged blob transitions from shoe to table.
+// Method: horizontal fill per row — shoes are compact objects, table is
+// a wide fill that merges left/right shoes into one solid row.
+// The shoe-table boundary is where per-row fill drops then widens suddenly.
+// We find the row with the MINIMUM fill in the lower 40% of the blob
+// (where table starts) and use the row just above it as the bbox bottom.
+function findShoeTableBoundary(
+  bin: Uint8Array, w: number,
+  minX: number, maxX: number,
+  minY: number, maxY: number,
+): number {
+  const blobH  = maxY - minY + 1;
+  const startY = minY + Math.floor(blobH * 0.45); // look in lower 55%
+  let minFill  = Infinity;
+  let boundaryY = maxY;
+  for (let y = startY; y <= maxY; y++) {
+    let fill = 0;
+    for (let x = minX; x <= maxX; x++) fill += bin[y * w + x];
+    // Normalised fill: what fraction of the row is foreground
+    const norm = fill / (maxX - minX + 1);
+    // Table rows: very high fill (>80%) because dark table spans full width
+    // Shoe rows: moderate fill (<70%) because there's a gap between shoes
+    if (norm < 0.65 && y < boundaryY) {
+      // still in shoe territory — this is a row with a gap (between shoes)
+      // The last such row before fill goes solid is our boundary
+      boundaryY = y;
+    }
+    if (fill < minFill) minFill = fill;
+  }
+  // Return the row just below the last gap row, capped at maxY
+  return Math.min(boundaryY + Math.floor(blobH * 0.10), maxY);
 }
 
 function expandToSole(bbox: BBox, frameH: number, borderY: number): BBox {
@@ -164,13 +202,23 @@ function expandToSole(bbox: BBox, frameH: number, borderY: number): BBox {
 }
 
 // ─── Blob → shoe pair extraction ─────────────────────────────────────────────
-// Given a set of valid blobs, try to find left+right shoe pair.
-// Returns [left, right] or null.
 
 interface AttemptResult {
   left: DetectedShoe;
   right: DetectedShoe;
   confidence: number;
+}
+
+function makePair(
+  lMinX: number, lMinY: number, lMaxX: number, lMaxY: number,
+  rMinX: number, rMinY: number, rMaxX: number, rMaxY: number,
+  h: number, borderY: number, conf: number,
+): AttemptResult {
+  return {
+    left:  { bbox: expandToSole({ x: lMinX, y: lMinY, w: lMaxX-lMinX+1, h: lMaxY-lMinY+1 }, h, borderY), confidence: conf },
+    right: { bbox: expandToSole({ x: rMinX, y: rMinY, w: rMaxX-rMinX+1, h: rMaxY-rMinY+1 }, h, borderY), confidence: conf },
+    confidence: conf,
+  };
 }
 
 function blobsToShoes(
@@ -212,12 +260,11 @@ function blobsToShoes(
     })));
   }
 
-  // Helper
+  // ── Case A: two clearly separate blobs ──────────────────────────────────
   function contains(a: Component, b: Component): boolean {
     return b.minX >= a.minX - 20 && b.maxX <= a.maxX + 20;
   }
 
-  // Case A: two separate non-overlapping blobs
   const nonContained = valid.filter((c, i) =>
     !valid.slice(0, i).some(bigger => contains(bigger, c))
   );
@@ -228,34 +275,48 @@ function blobsToShoes(
     const [l, r] = top2;
     const overlapX = Math.max(0, l.maxX - r.minX);
     const minWidth = Math.min(l.maxX - l.minX, r.maxX - r.minX);
-    if (overlapX < minWidth * 0.5) {  // was 0.3 — allow more overlap (shoes close together)
+    if (overlapX < minWidth * 0.5) {
       if (process.env.NODE_ENV === "development")
-        console.debug(`[detector:${label}] Case A success — two separate blobs`);
-      return {
-        left:  { bbox: expandToSole({ x: l.minX, y: l.minY, w: l.maxX-l.minX+1, h: l.maxY-l.minY+1 }, h, borderY), confidence: 0.95 },
-        right: { bbox: expandToSole({ x: r.minX, y: r.minY, w: r.maxX-r.minX+1, h: r.maxY-r.minY+1 }, h, borderY), confidence: 0.95 },
-        confidence: 0.95,
-      };
+        console.debug(`[detector:${label}] Case A — two separate blobs`);
+      return makePair(l.minX, l.minY, l.maxX, l.maxY, r.minX, r.minY, r.maxX, r.maxY, h, borderY, 0.95);
     }
   }
 
-  // Case B: single wide merged blob — valley split
+  // ── Case B: one merged blob — clip table then valley split ───────────────
   if (valid.length >= 1) {
     const merged = valid[0];
     const bw = merged.maxX - merged.minX + 1;
-    if (bw > w * 0.20) {  // was 0.30 — try split even on narrower merged blobs
-      const valleyX = findValley(closed, w, merged.minX, merged.maxX, merged.minY, merged.maxY);
-      const lBbox = expandToSole({ x: merged.minX, y: merged.minY, w: valleyX - merged.minX,     h: merged.maxY-merged.minY+1 }, h, borderY);
-      const rBbox = expandToSole({ x: valleyX,     y: merged.minY, w: merged.maxX - valleyX + 1, h: merged.maxY-merged.minY+1 }, h, borderY);
-      if (lBbox.w > w * 0.07 && rBbox.w > w * 0.07) {  // was 0.10
+
+    if (bw > w * 0.20) {
+      // Find where shoe ends and table begins, clip blob bottom there
+      const tableY   = findShoeTableBoundary(closed, w, merged.minX, merged.maxX, merged.minY, merged.maxY);
+      const scanMaxY = Math.max(merged.minY + 10, tableY);
+
+      // Valley split within shoe-only rows
+      const valleyX  = findValley(closed, w, merged.minX, merged.maxX, merged.minY, scanMaxY);
+      const leftW    = valleyX - merged.minX;
+      const rightW   = merged.maxX - valleyX + 1;
+
+      if (leftW > w * 0.07 && rightW > w * 0.07) {
         if (process.env.NODE_ENV === "development")
-          console.debug(`[detector:${label}] Case B success — valley split at x=${valleyX}`);
-        return {
-          left:  { bbox: lBbox, confidence: 0.80 },
-          right: { bbox: rBbox, confidence: 0.80 },
-          confidence: 0.80,
-        };
+          console.debug(`[detector:${label}] Case B — valley split at x=${valleyX}, tableY=${tableY}`);
+        return makePair(
+          merged.minX, merged.minY, valleyX - 1,    merged.maxY,
+          valleyX,     merged.minY, merged.maxX,     merged.maxY,
+          h, borderY, 0.80,
+        );
       }
+
+      // ── Case C: valley split failed min-width — force midpoint split ────
+      // Both halves are guaranteed equal width. Confidence is lower.
+      const midX = Math.floor((merged.minX + merged.maxX) / 2);
+      if (process.env.NODE_ENV === "development")
+        console.debug(`[detector:${label}] Case C — forced midpoint split at x=${midX}`);
+      return makePair(
+        merged.minX, merged.minY, midX - 1,     merged.maxY,
+        midX,        merged.minY, merged.maxX,   merged.maxY,
+        h, borderY, 0.65,
+      );
     }
   }
 

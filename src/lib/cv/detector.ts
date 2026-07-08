@@ -307,14 +307,24 @@ function blobsToShoes(
         );
       }
 
-      // ── Case C: valley split failed min-width — force midpoint split ────
-      // Both halves are guaranteed equal width. Confidence is lower.
-      const midX = Math.floor((merged.minX + merged.maxX) / 2);
+      // ── Case C: valley split failed min-width — scan full width for minimum ─
+      // Don't use geometric midpoint — it ignores actual pixel distribution.
+      // Instead scan every column across the entire merged blob (not just middle
+      // 80%) and find the column with the absolute fewest foreground pixels.
+      // This correctly finds the physical gap between two shoes even when the
+      // gap is narrow or near the edge of the merged bbox.
+      let caseC_minFill = Infinity;
+      let caseC_splitX  = Math.floor((merged.minX + merged.maxX) / 2);
+      for (let x = merged.minX + 1; x < merged.maxX; x++) {
+        let fill = 0;
+        for (let y = merged.minY; y <= scanMaxY; y++) fill += closed[y * w + x];
+        if (fill < caseC_minFill) { caseC_minFill = fill; caseC_splitX = x; }
+      }
       if (process.env.NODE_ENV === "development")
-        console.debug(`[detector:${label}] Case C — forced midpoint split at x=${midX}`);
+        console.debug(`[detector:${label}] Case C — min-fill split at x=${caseC_splitX} fill=${caseC_minFill}`);
       return makePair(
-        merged.minX, merged.minY, midX - 1,     merged.maxY,
-        midX,        merged.minY, merged.maxX,   merged.maxY,
+        merged.minX, merged.minY, caseC_splitX - 1, merged.maxY,
+        caseC_splitX, merged.minY, merged.maxX,      merged.maxY,
         h, borderY, 0.65,
       );
     }
@@ -371,6 +381,16 @@ export function detectShoes(frame: ImageData): ShoeDetectionResult {
   // All strategies run in order; first success wins.
   // Filters relax progressively so we accept more variation each pass.
   const strategies: Strategy[] = [
+    {
+      // Pass 0: tight close radius — preserves narrow gap between close-together shoes.
+      // radius=2 at 640px = 4px diameter, leaves gaps ≥5px open so Case A fires.
+      label: "otsu-dark-tight",
+      makeBinary:  (g) => makeBinaryOtsu(g, 140, false),
+      closeRadius: 2,
+      minAreaFrac: 0.020, maxAreaFrac: 0.70,
+      minAspect:   0.5,   maxAspect:   12,
+      borderXFrac: 0.005,
+    },
     {
       // Pass 1: standard — dark objects on light background (Otsu capped at 140)
       label: "otsu-dark-obj",

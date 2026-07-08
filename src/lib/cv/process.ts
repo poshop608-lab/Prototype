@@ -74,9 +74,18 @@ export async function processImage(
   const rightDetection = { ...detection.right, bbox: scaleBbox(detection.right.bbox, scaleX, scaleY) };
   const fullDetection  = { found: true, left: leftDetection, right: rightDetection };
 
+  console.info("[process] frame", fw, "×", fh,
+    "| L bbox x:", leftDetection.bbox.x,  "w:", leftDetection.bbox.w,
+    "| R bbox x:", rightDetection.bbox.x, "w:", rightDetection.bbox.w);
+
   // ── 4. Find heel side + measure on full-res ──────────────────────────────
   const leftRegion  = findHeelSide(fullFrame, leftDetection.bbox);
   const rightRegion = findHeelSide(fullFrame, rightDetection.bbox);
+
+  console.info("[process] L heel side:", leftRegion.side,
+    "heelBbox x:", leftRegion.heelBbox.x, "w:", leftRegion.heelBbox.w,
+    "| R heel side:", rightRegion.side,
+    "heelBbox x:", rightRegion.heelBbox.x, "w:", rightRegion.heelBbox.w);
 
   const leftM  = measureHeel(fullFrame, leftRegion.heelBbox,  leftDetection.bbox,  pxPerMm);
   const rightM = measureHeel(fullFrame, rightRegion.heelBbox, rightDetection.bbox, pxPerMm);

@@ -1,15 +1,8 @@
 import type { BBox, DetectedShoe, ShoeDetectionResult } from "./types";
 import { frameToGrayscale } from "./frame";
 
-// ─── Tunables ─────────────────────────────────────────────────────────────────
-const CLOSE_RADIUS    = 6;     // tuned for 640px-wide downsampled input
-const MIN_AREA_FRAC   = 0.03;  // single shoe upper ≥ 3% of frame
-const MAX_AREA_FRAC   = 0.70;  // merged pair blob can be large; filtered separately
-const MIN_ASPECT      = 0.8;   // dark upper alone can be ~square
-const MAX_ASPECT      = 10.0;
-const BORDER_PAD_FRAC = 0.005; // very thin border exclusion
+// ─── Core image ops ───────────────────────────────────────────────────────────
 
-// ─── Otsu's threshold ─────────────────────────────────────────────────────────
 function otsuThreshold(gray: Uint8Array): number {
   const hist = new Int32Array(256);
   for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
@@ -31,7 +24,6 @@ function otsuThreshold(gray: Uint8Array): number {
   return threshold;
 }
 
-// ─── Gaussian blur 3×3 ────────────────────────────────────────────────────────
 function blur3(gray: Uint8Array, w: number, h: number): Uint8Array {
   const k = [1,2,1,2,4,2,1,2,1];
   const out = new Uint8Array(gray.length);
@@ -48,9 +40,40 @@ function blur3(gray: Uint8Array, w: number, h: number): Uint8Array {
   return out;
 }
 
-// ─── Morphological ops ────────────────────────────────────────────────────────
+// Histogram equalization — helps low-contrast scenes (dark shoes on dark table)
+function histEq(gray: Uint8Array): Uint8Array {
+  const hist = new Int32Array(256);
+  for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
+  const cdf = new Int32Array(256);
+  cdf[0] = hist[0];
+  for (let i = 1; i < 256; i++) cdf[i] = cdf[i-1] + hist[i];
+  const minCdf = cdf.find(v => v > 0) ?? 1;
+  const scale  = 255 / (gray.length - minCdf);
+  const out = new Uint8Array(gray.length);
+  for (let i = 0; i < gray.length; i++)
+    out[i] = Math.round((cdf[gray[i]] - minCdf) * scale);
+  return out;
+}
+
+// Sobel magnitude — edge-based; works when colour contrast is low
+function sobelMag(gray: Uint8Array, w: number, h: number): Uint8Array {
+  const out = new Uint8Array(gray.length);
+  for (let y = 1; y < h-1; y++) {
+    for (let x = 1; x < w-1; x++) {
+      const gx =
+        -gray[(y-1)*w+(x-1)] - 2*gray[y*w+(x-1)] - gray[(y+1)*w+(x-1)] +
+         gray[(y-1)*w+(x+1)] + 2*gray[y*w+(x+1)] + gray[(y+1)*w+(x+1)];
+      const gy =
+        -gray[(y-1)*w+(x-1)] - 2*gray[(y-1)*w+x] - gray[(y-1)*w+(x+1)] +
+         gray[(y+1)*w+(x-1)] + 2*gray[(y+1)*w+x] + gray[(y+1)*w+(x+1)];
+      out[y*w+x] = Math.min(255, Math.round(Math.sqrt(gx*gx + gy*gy)));
+    }
+  }
+  return out;
+}
+
 function morphOp(src: Uint8Array, w: number, h: number, r: number, dilate: boolean): Uint8Array {
-  const out = new Uint8Array(src.length);
+  const out    = new Uint8Array(src.length);
   const target = dilate ? 1 : 0;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -72,7 +95,8 @@ function morphClose(bin: Uint8Array, w: number, h: number, r: number): Uint8Arra
   return morphOp(morphOp(bin, w, h, r, true), w, h, r, false);
 }
 
-// ─── Connected components (union-find) ────────────────────────────────────────
+// ─── Connected components ─────────────────────────────────────────────────────
+
 interface Component {
   minX: number; maxX: number; minY: number; maxY: number; area: number;
 }
@@ -93,7 +117,7 @@ function connectedComponents(bin: Uint8Array, w: number, h: number): Component[]
   let nextLabel = 1;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      const idx = y*w+x;
+      const idx  = y*w+x;
       if (!bin[idx]) continue;
       const up   = y > 0 ? labels[(y-1)*w+x] : 0;
       const left = x > 0 ? labels[idx-1]      : 0;
@@ -119,14 +143,14 @@ function connectedComponents(bin: Uint8Array, w: number, h: number): Component[]
   return Array.from(comps.values());
 }
 
-// ─── Vertical valley split ────────────────────────────────────────────────────
-// If two shoes merged into one blob, find the vertical column with least
-// foreground pixels between x0 and x1, split there.
+// ─── Valley split ─────────────────────────────────────────────────────────────
+
 function findValley(bin: Uint8Array, w: number, minX: number, maxX: number, minY: number, maxY: number): number {
-  let valleyX = Math.floor((minX + maxX) / 2);
-  let minFill = Infinity;
-  const mid = Math.floor((minX + maxX) / 2);
-  const searchW = Math.floor((maxX - minX) * 0.25); // search middle 50%
+  // Search middle 60% of blob width for the thinnest vertical column
+  const mid      = Math.floor((minX + maxX) / 2);
+  const searchW  = Math.floor((maxX - minX) * 0.30);
+  let valleyX    = mid;
+  let minFill    = Infinity;
   for (let x = mid - searchW; x <= mid + searchW; x++) {
     let fill = 0;
     for (let y = minY; y <= maxY; y++) fill += bin[y * w + x];
@@ -135,61 +159,65 @@ function findValley(bin: Uint8Array, w: number, minX: number, maxX: number, minY
   return valleyX;
 }
 
-// ─── Expand bbox to include sole ─────────────────────────────────────────────
-// The dark upper detection doesn't capture the white sole.
-// Extend the bbox bottom to near the frame bottom to include the full shoe height.
 function expandToSole(bbox: BBox, frameH: number, borderY: number): BBox {
   return { ...bbox, h: (frameH - borderY) - bbox.y };
 }
 
-// ─── Public detector ──────────────────────────────────────────────────────────
-export function detectShoes(frame: ImageData): ShoeDetectionResult {
-  const { width: w, height: h } = frame;
+// ─── Blob → shoe pair extraction ─────────────────────────────────────────────
+// Given a set of valid blobs, try to find left+right shoe pair.
+// Returns [left, right] or null.
+
+interface AttemptResult {
+  left: DetectedShoe;
+  right: DetectedShoe;
+  confidence: number;
+}
+
+function blobsToShoes(
+  comps: Component[],
+  closed: Uint8Array,
+  w: number,
+  h: number,
+  borderY: number,
+  minAreaFrac: number,
+  maxAreaFrac: number,
+  minAspect: number,
+  maxAspect: number,
+  borderX: number,
+  label: string,
+): AttemptResult | null {
   const frameArea = w * h;
-  const borderX   = Math.round(w * BORDER_PAD_FRAC);
-  const borderY   = Math.round(h * BORDER_PAD_FRAC);
 
-  const gray    = frameToGrayscale(frame);
-  const blurred = blur3(gray, w, h);
-
-  // Use Otsu to find the dark/light split, but cap at 140 to avoid
-  // thresholding bright soles and wall as foreground.
-  const t      = Math.min(otsuThreshold(blurred), 140);
-  const binary = new Uint8Array(w * h);
-  for (let i = 0; i < blurred.length; i++) binary[i] = blurred[i] <= t ? 1 : 0;
-
-  const closed = morphClose(binary, w, h, CLOSE_RADIUS);
-  const comps  = connectedComponents(closed, w, h);
-
-  // Filter: pick blobs that could be one shoe OR a merged pair
   const valid = comps.filter(c => {
     const bw = c.maxX - c.minX + 1;
     const bh = c.maxY - c.minY + 1;
     const aspect = bw / bh;
     return (
-      c.area > frameArea * MIN_AREA_FRAC &&
-      c.area < frameArea * MAX_AREA_FRAC &&
-      aspect > MIN_ASPECT &&
-      aspect < MAX_ASPECT &&
-      c.minX > borderX    &&
-      c.maxX < w - borderX &&
-      c.minY > borderY
+      c.area > frameArea * minAreaFrac &&
+      c.area < frameArea * maxAreaFrac &&
+      aspect >= minAspect &&
+      aspect <= maxAspect &&
+      c.minX >= borderX &&
+      c.maxX <= w - borderX
     );
   });
 
-  // Sort by area descending
   valid.sort((a, b) => b.area - a.area);
 
-  let left: DetectedShoe | null  = null;
-  let right: DetectedShoe | null = null;
-
-  // Helper: does blob A horizontally contain blob B (B is a sub-region of A)?
-  function contains(a: Component, b: Component): boolean {
-    return b.minX >= a.minX - 10 && b.maxX <= a.maxX + 10;
+  if (process.env.NODE_ENV === "development") {
+    console.debug(`[detector:${label}] valid blobs=${valid.length}`, valid.slice(0,5).map(c => ({
+      w: c.maxX-c.minX+1, h: c.maxY-c.minY+1,
+      aspect: +((c.maxX-c.minX+1)/(c.maxY-c.minY+1)).toFixed(2),
+      areaFrac: +(c.area/frameArea*100).toFixed(1)+'%',
+    })));
   }
 
-  // Case A: two truly separate blobs — neither contains the other
-  // Must be non-overlapping in X (each shoe occupies its own half)
+  // Helper
+  function contains(a: Component, b: Component): boolean {
+    return b.minX >= a.minX - 20 && b.maxX <= a.maxX + 20;
+  }
+
+  // Case A: two separate non-overlapping blobs
   const nonContained = valid.filter((c, i) =>
     !valid.slice(0, i).some(bigger => contains(bigger, c))
   );
@@ -198,49 +226,202 @@ export function detectShoes(frame: ImageData): ShoeDetectionResult {
     const top2 = nonContained.slice(0, 2);
     top2.sort((a, b) => (a.minX + a.maxX) - (b.minX + b.maxX));
     const [l, r] = top2;
-    // Check they don't significantly overlap in X
     const overlapX = Math.max(0, l.maxX - r.minX);
     const minWidth = Math.min(l.maxX - l.minX, r.maxX - r.minX);
-    if (overlapX < minWidth * 0.3) {
-      left  = { bbox: expandToSole({ x: l.minX, y: l.minY, w: l.maxX-l.minX+1, h: l.maxY-l.minY+1 }, h, borderY), confidence: 1 };
-      right = { bbox: expandToSole({ x: r.minX, y: r.minY, w: r.maxX-r.minX+1, h: r.maxY-r.minY+1 }, h, borderY), confidence: 1 };
+    if (overlapX < minWidth * 0.5) {  // was 0.3 — allow more overlap (shoes close together)
+      if (process.env.NODE_ENV === "development")
+        console.debug(`[detector:${label}] Case A success — two separate blobs`);
+      return {
+        left:  { bbox: expandToSole({ x: l.minX, y: l.minY, w: l.maxX-l.minX+1, h: l.maxY-l.minY+1 }, h, borderY), confidence: 0.95 },
+        right: { bbox: expandToSole({ x: r.minX, y: r.minY, w: r.maxX-r.minX+1, h: r.maxY-r.minY+1 }, h, borderY), confidence: 0.95 },
+        confidence: 0.95,
+      };
     }
   }
 
-  // Case B: largest blob is a merged pair (wide aspect) — valley split
-  if ((!left || !right) && valid.length >= 1) {
+  // Case B: single wide merged blob — valley split
+  if (valid.length >= 1) {
     const merged = valid[0];
     const bw = merged.maxX - merged.minX + 1;
-    const bh = merged.maxY - merged.minY + 1;
-    // A merged pair fills most of the frame width and has high aspect ratio
-    if (bw > w * 0.30) {
+    if (bw > w * 0.20) {  // was 0.30 — try split even on narrower merged blobs
       const valleyX = findValley(closed, w, merged.minX, merged.maxX, merged.minY, merged.maxY);
-      const lBbox = expandToSole({ x: merged.minX, y: merged.minY, w: valleyX - merged.minX,      h: bh }, h, borderY);
-      const rBbox = expandToSole({ x: valleyX,     y: merged.minY, w: merged.maxX - valleyX + 1,  h: bh }, h, borderY);
-      if (lBbox.w > w * 0.10 && rBbox.w > w * 0.10) {
-        left  = { bbox: lBbox, confidence: 0.85 };
-        right = { bbox: rBbox, confidence: 0.85 };
+      const lBbox = expandToSole({ x: merged.minX, y: merged.minY, w: valleyX - merged.minX,     h: merged.maxY-merged.minY+1 }, h, borderY);
+      const rBbox = expandToSole({ x: valleyX,     y: merged.minY, w: merged.maxX - valleyX + 1, h: merged.maxY-merged.minY+1 }, h, borderY);
+      if (lBbox.w > w * 0.07 && rBbox.w > w * 0.07) {  // was 0.10
+        if (process.env.NODE_ENV === "development")
+          console.debug(`[detector:${label}] Case B success — valley split at x=${valleyX}`);
+        return {
+          left:  { bbox: lBbox, confidence: 0.80 },
+          right: { bbox: rBbox, confidence: 0.80 },
+          confidence: 0.80,
+        };
       }
     }
   }
 
-  if (!left || !right) return { found: false, left: null, right: null };
-  return { found: true, left, right };
+  if (process.env.NODE_ENV === "development")
+    console.debug(`[detector:${label}] No pair found`);
+  return null;
 }
 
-// ─── Foreground mask for heel measurement ────────────────────────────────────
-// Uses local Otsu within the shoe bbox to find the dark shoe body.
+// ─── Preprocessing strategies ────────────────────────────────────────────────
+
+interface Strategy {
+  label:       string;
+  makeBinary:  (gray: Uint8Array, w: number, h: number) => Uint8Array;
+  closeRadius: number;
+  minAreaFrac: number;
+  maxAreaFrac: number;
+  minAspect:   number;
+  maxAspect:   number;
+  borderXFrac: number;
+}
+
+function makeBinaryOtsu(gray: Uint8Array, cap: number, invert: boolean): Uint8Array {
+  const t   = Math.min(otsuThreshold(gray), cap);
+  const bin = new Uint8Array(gray.length);
+  for (let i = 0; i < gray.length; i++)
+    bin[i] = invert ? (gray[i] > t ? 1 : 0) : (gray[i] <= t ? 1 : 0);
+  return bin;
+}
+
+function makeBinaryFixed(gray: Uint8Array, t: number, invert: boolean): Uint8Array {
+  const bin = new Uint8Array(gray.length);
+  for (let i = 0; i < gray.length; i++)
+    bin[i] = invert ? (gray[i] > t ? 1 : 0) : (gray[i] <= t ? 1 : 0);
+  return bin;
+}
+
+function makeBinaryEdge(gray: Uint8Array, w: number, h: number, edgeT: number): Uint8Array {
+  const mag = sobelMag(gray, w, h);
+  const bin = new Uint8Array(gray.length);
+  for (let i = 0; i < mag.length; i++) bin[i] = mag[i] > edgeT ? 1 : 0;
+  return bin;
+}
+
+// ─── Public detector ──────────────────────────────────────────────────────────
+
+export function detectShoes(frame: ImageData): ShoeDetectionResult {
+  const { width: w, height: h } = frame;
+  const gray    = frameToGrayscale(frame);
+  const blurred = blur3(gray, w, h);
+  const equalized = histEq(blurred);
+
+  // All strategies run in order; first success wins.
+  // Filters relax progressively so we accept more variation each pass.
+  const strategies: Strategy[] = [
+    {
+      // Pass 1: standard — dark objects on light background (Otsu capped at 140)
+      label: "otsu-dark-obj",
+      makeBinary:  (g) => makeBinaryOtsu(g, 140, false),
+      closeRadius: 6,
+      minAreaFrac: 0.020, maxAreaFrac: 0.70,
+      minAspect:   0.5,   maxAspect:   12,
+      borderXFrac: 0.005,
+    },
+    {
+      // Pass 2: hist-eq then Otsu — rescues low-contrast scenes (dark shoe on dark table)
+      label: "histeq-otsu",
+      makeBinary:  (_g, _w, _h) => makeBinaryOtsu(equalized, 160, false),
+      closeRadius: 6,
+      minAreaFrac: 0.015, maxAreaFrac: 0.75,
+      minAspect:   0.4,   maxAspect:   14,
+      borderXFrac: 0.002,
+    },
+    {
+      // Pass 3: inverted — light objects on dark background (white/light shoes)
+      label: "otsu-light-obj",
+      makeBinary:  (g) => makeBinaryOtsu(g, 220, true),
+      closeRadius: 6,
+      minAreaFrac: 0.015, maxAreaFrac: 0.75,
+      minAspect:   0.4,   maxAspect:   14,
+      borderXFrac: 0.002,
+    },
+    {
+      // Pass 4: fixed dark threshold 100 — catches very dark shoes any background
+      label: "fixed-dark-100",
+      makeBinary:  (g) => makeBinaryFixed(g, 100, false),
+      closeRadius: 8,
+      minAreaFrac: 0.010, maxAreaFrac: 0.80,
+      minAspect:   0.3,   maxAspect:   16,
+      borderXFrac: 0.0,
+    },
+    {
+      // Pass 5: fixed dark threshold 80 — very dark shoes / harsh shadows
+      label: "fixed-dark-80",
+      makeBinary:  (g) => makeBinaryFixed(g, 80, false),
+      closeRadius: 8,
+      minAreaFrac: 0.008, maxAreaFrac: 0.80,
+      minAspect:   0.3,   maxAspect:   18,
+      borderXFrac: 0.0,
+    },
+    {
+      // Pass 6: hist-eq + fixed threshold 120
+      label: "histeq-fixed-120",
+      makeBinary:  () => makeBinaryFixed(equalized, 120, false),
+      closeRadius: 7,
+      minAreaFrac: 0.010, maxAreaFrac: 0.80,
+      minAspect:   0.3,   maxAspect:   18,
+      borderXFrac: 0.0,
+    },
+    {
+      // Pass 7: edge-based — works when colour contrast is very low but shoe outline visible
+      label: "edge-sobel",
+      makeBinary:  (g, gw, gh) => makeBinaryEdge(g, gw, gh, 20),
+      closeRadius: 5,
+      minAreaFrac: 0.008, maxAreaFrac: 0.85,
+      minAspect:   0.3,   maxAspect:   20,
+      borderXFrac: 0.0,
+    },
+    {
+      // Pass 8: edge-based, very sensitive — last resort
+      label: "edge-sobel-loose",
+      makeBinary:  (g, gw, gh) => makeBinaryEdge(g, gw, gh, 12),
+      closeRadius: 6,
+      minAreaFrac: 0.005, maxAreaFrac: 0.90,
+      minAspect:   0.2,   maxAspect:   24,
+      borderXFrac: 0.0,
+    },
+  ];
+
+  const borderY = Math.round(h * 0.002);
+
+  for (const s of strategies) {
+    const borderX = Math.round(w * s.borderXFrac);
+    const binary  = s.makeBinary(blurred, w, h);
+    const closed  = morphClose(binary, w, h, s.closeRadius);
+    const comps   = connectedComponents(closed, w, h);
+
+    const result = blobsToShoes(
+      comps, closed, w, h, borderY,
+      s.minAreaFrac, s.maxAreaFrac,
+      s.minAspect,   s.maxAspect,
+      borderX,       s.label,
+    );
+
+    if (result) {
+      if (process.env.NODE_ENV === "development")
+        console.info(`[detector] SUCCESS via strategy "${s.label}" confidence=${result.confidence}`);
+      return { found: true, left: result.left, right: result.right };
+    }
+  }
+
+  if (process.env.NODE_ENV === "development")
+    console.warn("[detector] All 8 strategies failed — returning NO_SHOES");
+  return { found: false, left: null, right: null };
+}
+
+// ─── Foreground mask for heel measurement (unchanged) ─────────────────────────
 export function extractForeground(frame: ImageData, bbox: BBox): Uint8Array {
   const { data, width: fw } = frame;
   const { x: bx, y: by, w: bw, h: bh } = bbox;
 
   const samples = new Uint8Array(bw * bh);
-  for (let ry = 0; ry < bh; ry++) {
+  for (let ry = 0; ry < bh; ry++)
     for (let rx = 0; rx < bw; rx++) {
       const fi = ((by+ry)*fw + (bx+rx)) * 4;
       samples[ry*bw+rx] = (data[fi]*77 + data[fi+1]*150 + data[fi+2]*29) >> 8;
     }
-  }
 
   const t = Math.min(otsuThreshold(samples), 140);
   const mask = new Uint8Array(bw * bh);

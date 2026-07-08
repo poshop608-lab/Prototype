@@ -33,23 +33,36 @@ function drawBbox(ctx: CanvasRenderingContext2D, bbox: BBox, color: string) {
   ctx.strokeRect(bbox.x,bbox.y,bbox.w,bbox.h); ctx.setLineDash([]);
 }
 
-// Draw heel annotation for one shoe
-function drawHeel(ctx: CanvasRenderingContext2D, m: HeelMeasurement, side: "left"|"right", passed: boolean) {
+// Draw heel annotation for one shoe.
+// Arrow is drawn inside the heelBbox (not outside), so it stays on the correct shoe
+// regardless of whether the heel faces inward or outward.
+// Label is centred on the full shoe bbox so it never overlaps the opposite shoe.
+function drawHeel(
+  ctx:      CanvasRenderingContext2D,
+  m:        HeelMeasurement,
+  shoeBbox: BBox,
+  side:     "left"|"right",
+  passed:   boolean,
+) {
   const hb  = m.heelBbox;
   const col = passed ? C.green : C.red;
-  const fs  = Math.max(12, Math.round(hb.w * 0.18));
+  // Font size based on shoe width so it scales with frame resolution
+  const fs  = Math.max(14, Math.round(shoeBbox.w * 0.08));
 
   // Heel zone highlight
   ctx.fillStyle = `${C.cyan}22`;
   ctx.fillRect(hb.x, hb.y, hb.w, hb.h);
   drawBbox(ctx, hb, C.cyan);
 
-  // Top line (heel collar) and bottom line (outsole)
-  hLine(ctx, m.topY,    hb.x, hb.x+hb.w, C.cyan);
-  hLine(ctx, m.bottomY, hb.x, hb.x+hb.w, C.green);
+  // Top line (heel collar) and bottom line (outsole) — span full shoe width
+  hLine(ctx, m.topY,    shoeBbox.x, shoeBbox.x+shoeBbox.w, C.cyan);
+  hLine(ctx, m.bottomY, shoeBbox.x, shoeBbox.x+shoeBbox.w, C.green);
 
-  // Arrow
-  const ax = side === "left" ? hb.x - 18 : hb.x + hb.w + 18;
+  // Arrow drawn INSIDE the heelBbox, near its outer edge
+  // "outer edge" = the edge away from the gap between shoes:
+  //   left shoe heel faces right  → outer edge is hb.x (left side of heelBbox)
+  //   right shoe heel faces left  → outer edge is hb.x + hb.w (right side of heelBbox)
+  const ax = side === "left" ? hb.x + 14 : hb.x + hb.w - 14;
   ctx.strokeStyle=C.yellow; ctx.lineWidth=2;
   ctx.shadowColor=C.yellow; ctx.shadowBlur=5;
   ctx.beginPath(); ctx.moveTo(ax, m.topY); ctx.lineTo(ax, m.bottomY); ctx.stroke();
@@ -64,10 +77,11 @@ function drawHeel(ctx: CanvasRenderingContext2D, m: HeelMeasurement, side: "left
     ctx.closePath(); ctx.fillStyle=C.yellow; ctx.fill();
   }
 
-  // Label
+  // Label centred on the full shoe bbox so it sits on the shoe body, not the gap
   const midY = (m.topY + m.bottomY) / 2;
   const label = `${side === "left" ? "L" : "R"} ${m.heightMm}mm`;
-  pill(ctx, label, hb.x+hb.w/2, midY, "rgba(0,0,0,0.85)", col, fs);
+  const labelX = shoeBbox.x + shoeBbox.w / 2;
+  pill(ctx, label, labelX, midY, "rgba(0,0,0,0.85)", col, fs);
 }
 
 // When skipDraw=true the caller has already written pixels; skip resize+drawImage.
@@ -98,9 +112,9 @@ export function drawResultOverlay(
   if (detection.left)  drawBbox(ctx, detection.left.bbox,  C.cyan);
   if (detection.right) drawBbox(ctx, detection.right.bbox, C.cyan);
 
-  // Heel annotations
-  drawHeel(ctx, left,  "left",  result.passed);
-  drawHeel(ctx, right, "right", result.passed);
+  // Heel annotations — pass shoe bbox so label anchors to shoe body, not heelBbox
+  drawHeel(ctx, left,  detection.left!.bbox,  "left",  result.passed);
+  drawHeel(ctx, right, detection.right!.bbox, "right", result.passed);
 
   // Result banner at top
   const resultColor = result.passed ? C.green : C.red;

@@ -70,8 +70,8 @@ export async function processImage(
   const scaleX = fw / dsW;
   const scaleY = fh / dsH;
 
-  const leftDetection  = { ...detection.left,  bbox: scaleBbox(detection.left.bbox,  scaleX, scaleY) };
-  const rightDetection = { ...detection.right, bbox: scaleBbox(detection.right.bbox, scaleX, scaleY) };
+  const leftDetection  = { ...detection.left,  bbox: scaleBbox(detection.left.bbox,  scaleX, scaleY), blobMaxY: Math.round(detection.left.blobMaxY  * scaleY) };
+  const rightDetection = { ...detection.right, bbox: scaleBbox(detection.right.bbox, scaleX, scaleY), blobMaxY: Math.round(detection.right.blobMaxY * scaleY) };
   // Scale splitX to full resolution — this is the hard boundary between shoes
   const splitX = Math.round(detection.splitX * scaleX);
   const fullDetection  = { found: true, left: leftDetection, right: rightDetection, splitX };
@@ -93,8 +93,8 @@ export async function processImage(
     "| R heel side:", rightRegion.side,
     "heelBbox x:", rightRegion.heelBbox.x, "w:", rightRegion.heelBbox.w);
 
-  const leftM  = measureHeel(fullFrame, leftRegion.heelBbox,  leftDetection.bbox,  pxPerMm);
-  const rightM = measureHeel(fullFrame, rightRegion.heelBbox, rightDetection.bbox, pxPerMm);
+  const leftM  = measureHeel(fullFrame, leftRegion.heelBbox,  leftDetection.blobMaxY,  pxPerMm);
+  const rightM = measureHeel(fullFrame, rightRegion.heelBbox, rightDetection.blobMaxY, pxPerMm);
 
   if (!leftM || !rightM) {
     return {

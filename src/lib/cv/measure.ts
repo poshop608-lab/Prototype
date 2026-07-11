@@ -1,7 +1,7 @@
 import type { BBox, HeelMeasurement } from "./types";
 
-const MIN_COLUMNS  = 3;
-const NOISE_SKIP   = 2;
+const MIN_COLUMNS = 3;
+const NOISE_SKIP  = 2;
 
 function median(arr: number[]): number {
   if (!arr.length) return 0;
@@ -39,19 +39,6 @@ function otsu(gray: Uint8Array): number {
   return t;
 }
 
-// ── Row-width profile ─────────────────────────────────────────────────────────
-//
-// For each row in the heelBbox, count how many columns are foreground.
-// Returns array of length bh, each entry = foreground pixel count for that row.
-//
-// The heel collar rim is the row where the heel body is at MAXIMUM width.
-// Anatomy:
-//   Above collar rim → shoe narrows into ankle / throat
-//   At collar rim    → widest point of heel upper  ← TARGET
-//   Below collar rim → heel cup, then outsole
-//
-// This is independent of absolute pixel brightness and works for any shoe colour.
-
 function rowWidthProfile(gray: Uint8Array, bw: number, bh: number, darkT: number): Int32Array {
   const profile = new Int32Array(bh);
   for (let ry = 0; ry < bh; ry++) {
@@ -64,7 +51,6 @@ function rowWidthProfile(gray: Uint8Array, bw: number, bh: number, darkT: number
   return profile;
 }
 
-// ── Smooth a 1-D array with a simple box filter ───────────────────────────────
 function smooth(arr: Int32Array, radius: number): Float64Array {
   const out = new Float64Array(arr.length);
   for (let i = 0; i < arr.length; i++) {
@@ -81,77 +67,102 @@ function smooth(arr: Int32Array, radius: number): Float64Array {
 export function measureHeel(
   frame:     ImageData,
   heelBbox:  BBox,
-  _shoeBbox: BBox,
+  blobMaxY:  number,  // actual bottom row of shoe blob from detection (pre-expandToSole)
   pxPerMm:   number,
 ): HeelMeasurement | null {
   const { x: bx, y: by, w: bw, h: bh } = heelBbox;
 
   const gray  = regionGray(frame, heelBbox);
   const darkT = Math.min(otsu(gray), 160);
-  const bgT   = 210;
 
-  // ── Step 1: Bottom of outsole — scan each column bottom-up ───────────────
-  // The outsole bottom is the last non-background pixel per column.
-  // Background = wall/table (very light) OR empty space below shoe.
-  // We use bgT = 210 as "definitely background".
-  const soleRows: number[] = [];
-  for (let rx = 0; rx < bw; rx++) {
-    for (let ry = bh - 1 - NOISE_SKIP; ry >= NOISE_SKIP; ry--) {
-      if (gray[ry * bw + rx] < bgT) {
-        soleRows.push(by + ry);
-        break;
+  // ── Step 1: Bottom of outsole ──────────────────────────────────────────────
+  //
+  // Cap the bottom scan to blobMaxY — the actual shoe blob boundary from
+  // detection. heelBbox.h was extended to frameH by expandToSole, so without
+  // this cap we scan into the shoebox / table surface below the shoe.
+  //
+  // The outsole = last row with ≥20% dark pixel fill scanning top-down.
+
+  // Convert blobMaxY to heelBbox-local row, cap to valid range
+  const scanBottomRow = Math.min(bh - 1 - NOISE_SKIP, blobMaxY - by);
+
+  // Find the last row (scanning top-down) with fill >= 20% of bbox width.
+  // "Last" = closest to the ground = bottom of the outsole.
+  const fillThreshold = Math.max(2, Math.round(bw * 0.20));
+  let soleRow = -1;
+  for (let ry = scanBottomRow; ry >= NOISE_SKIP; ry--) {
+    let count = 0;
+    for (let rx = 0; rx < bw; rx++) {
+      if (gray[ry * bw + rx] <= darkT) count++;
+    }
+    if (count >= fillThreshold) { soleRow = ry; break; }
+  }
+
+  // Fallback: per-column bottom scan capped to blob bottom
+  if (soleRow < 0) {
+    const soleRows: number[] = [];
+    for (let rx = 0; rx < bw; rx++) {
+      for (let ry = scanBottomRow; ry >= NOISE_SKIP; ry--) {
+        if (gray[ry * bw + rx] <= darkT) { soleRows.push(by + ry); break; }
       }
     }
+    if (soleRows.length < MIN_COLUMNS) return null;
+    const topY = computeTopY(gray, bw, bh, darkT, by, NOISE_SKIP);
+    if (topY === null) return null;
+    return buildResult(Math.round(median(soleRows)), heelBbox, pxPerMm, topY);
   }
-  if (soleRows.length < MIN_COLUMNS) return null;
-  const medBottomY = Math.round(median(soleRows));
 
-  // ── Step 2: Heel collar top — first row where profile reaches ≥70% of peak ──
-  //
-  // The row-width profile rises from near-zero (ankle/throat area above collar)
-  // to a plateau (the full heel body width). The collar rim = the first row
-  // where the profile crosses 70% of the peak value found in the upper half.
-  //
-  // Using first-threshold-crossing is more stable than argmax because:
-  //   - argmax chases the single noisiest peak (jumps scan-to-scan)
-  //   - The 70% crossing point is on the rising edge which is consistent
-  //     regardless of slight shoe position shifts
-  //
-  // Search window: shoeTopRow → shoeTopRow + 50% of bbox height
-  // (collar is always in the upper half of the heel bbox)
+  const medBottomY = by + soleRow;
 
+  // ── Step 2: Heel collar top ────────────────────────────────────────────────
+  //
+  // Row-width profile from shoeTopRow downward. The collar rim is the first
+  // row that crosses 70% of the peak width in the upper half of the shoe body.
+  // This catches the transition from narrow ankle area → full heel body width.
+
+  const topY = computeTopY(gray, bw, bh, darkT, by, NOISE_SKIP);
+  if (topY === null) return null;
+
+  return buildResult(medBottomY, heelBbox, pxPerMm, topY);
+}
+
+function computeTopY(
+  gray: Uint8Array, bw: number, bh: number, darkT: number, by: number, noiseSkip: number,
+): number | null {
   const profile  = rowWidthProfile(gray, bw, bh, darkT);
-  const smoothed = smooth(profile, 5); // wider smooth for stability
+  const smoothed = smooth(profile, 5);
 
-  // Find topmost row with any dark pixels
   let shoeTopRow = -1;
-  for (let ry = NOISE_SKIP; ry < bh - NOISE_SKIP; ry++) {
+  for (let ry = noiseSkip; ry < bh - noiseSkip; ry++) {
     if (profile[ry] >= 2) { shoeTopRow = ry; break; }
   }
   if (shoeTopRow < 0) return null;
 
-  const searchEnd = Math.min(bh - NOISE_SKIP, shoeTopRow + Math.round(bh * 0.55));
+  const searchEnd = Math.min(bh - noiseSkip, shoeTopRow + Math.round(bh * 0.55));
 
-  // Find peak width in search window
   let peakWidth = 0;
   for (let ry = shoeTopRow; ry <= searchEnd; ry++) {
     if (smoothed[ry] > peakWidth) peakWidth = smoothed[ry];
   }
+  if (peakWidth === 0) return null;
 
-  // First row that reaches 70% of peak = collar rim
+  // 70% threshold: collar rim is the rising edge of the heel body
   const threshold = peakWidth * 0.70;
   let collarRow   = shoeTopRow;
   for (let ry = shoeTopRow; ry <= searchEnd; ry++) {
     if (smoothed[ry] >= threshold) { collarRow = ry; break; }
   }
 
-  const medTopY = by + collarRow;
+  return by + collarRow;
+}
 
-  const heightPx = medBottomY - medTopY;
+function buildResult(
+  medBottomY: number, heelBbox: BBox, pxPerMm: number, topY: number,
+): HeelMeasurement | null {
+  const heightPx = medBottomY - topY;
   if (heightPx <= 0) return null;
-
   return {
-    topY:     medTopY,
+    topY,
     bottomY:  medBottomY,
     heightPx,
     heightMm: parseFloat((heightPx / pxPerMm).toFixed(1)),

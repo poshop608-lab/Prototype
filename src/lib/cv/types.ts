@@ -6,7 +6,8 @@ export interface BBox {
 }
 
 export interface DetectedShoe {
-  bbox:       BBox;
+  bbox:      BBox;    // expanded bbox (h extends to frame bottom for heel scan)
+  blobMaxY:  number;  // actual bottom row of shoe blob from detection (pre-expandToSole)
   confidence: number;
 }
 

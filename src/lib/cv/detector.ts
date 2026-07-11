@@ -243,8 +243,8 @@ function makePair(
   splitX: number,
 ): AttemptResult {
   return {
-    left:  { bbox: expandToSole({ x: lMinX, y: lMinY, w: lMaxX-lMinX+1, h: lMaxY-lMinY+1 }, h, borderY), confidence: conf },
-    right: { bbox: expandToSole({ x: rMinX, y: rMinY, w: rMaxX-rMinX+1, h: rMaxY-rMinY+1 }, h, borderY), confidence: conf },
+    left:  { bbox: expandToSole({ x: lMinX, y: lMinY, w: lMaxX-lMinX+1, h: lMaxY-lMinY+1 }, h, borderY), blobMaxY: lMaxY, confidence: conf },
+    right: { bbox: expandToSole({ x: rMinX, y: rMinY, w: rMaxX-rMinX+1, h: rMaxY-rMinY+1 }, h, borderY), blobMaxY: rMaxY, confidence: conf },
     confidence: conf,
     splitX,
   };

@@ -48,3 +48,12 @@ export function isCalibrated(): boolean {
   const cal = readLocal();
   return cal !== null && cal.pxPerMm > 0;
 }
+
+export async function resetCalibration(stationId: string): Promise<void> {
+  try { localStorage.removeItem(LOCAL_KEY); } catch { /* quota */ }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  await (createClient() as any)
+    .from(TABLE)
+    .delete()
+    .eq("station_id", stationId);
+}

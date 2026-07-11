@@ -12,7 +12,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { CheckCircle2, AlertTriangle, Loader2, ArrowLeft } from "lucide-react";
 import { useCamera } from "@/hooks/use-camera";
 import { extractFrame, frameToGrayscale } from "@/lib/cv/frame";
-import { saveCalibration } from "@/lib/calibration";
+import { saveCalibration, resetCalibration, isCalibrated } from "@/lib/calibration";
 import type { CalibrationData } from "@/lib/cv/types";
 
 const STATION_ID = "station-1";
@@ -61,16 +61,17 @@ const PRESETS = [
   { label: "Ruler (30cm)", mm: 300 },
 ];
 
-type Phase = "idle" | "busy" | "done" | "error";
+type Phase = "idle" | "busy" | "done" | "error" | "resetting";
 
 export default function CalibratePage() {
   const router = useRouter();
   const { videoRef, status: camStatus } = useCamera();
 
-  const [refMm,    setRefMm]    = useState("85.6");
-  const [phase,    setPhase]    = useState<Phase>("idle");
-  const [errMsg,   setErrMsg]   = useState("");
-  const [result,   setResult]   = useState<{ pxPerMm: number; widthPx: number } | null>(null);
+  const [refMm,         setRefMm]         = useState("85.6");
+  const [phase,         setPhase]         = useState<Phase>("idle");
+  const [errMsg,        setErrMsg]        = useState("");
+  const [result,        setResult]        = useState<{ pxPerMm: number; widthPx: number } | null>(null);
+  const [hasCalibration, setHasCalibration] = useState(() => isCalibrated());
 
   const handleCalibrate = useCallback(async () => {
     const video = videoRef.current;
@@ -109,12 +110,25 @@ export default function CalibratePage() {
     try {
       await saveCalibration(cal);
       setResult({ pxPerMm, widthPx: edges.widthPx });
+      setHasCalibration(true);
       setPhase("done");
     } catch (err) {
       setErrMsg(err instanceof Error ? err.message : "Save failed.");
       setPhase("error");
     }
   }, [videoRef, camStatus, refMm]);
+
+  const handleReset = useCallback(async () => {
+    setPhase("resetting");
+    try {
+      await resetCalibration(STATION_ID);
+      setHasCalibration(false);
+      setResult(null);
+      setPhase("idle");
+    } catch {
+      setPhase("idle");
+    }
+  }, []);
 
   return (
     <div className="max-w-lg mx-auto space-y-5 pb-10">
@@ -213,13 +227,25 @@ export default function CalibratePage() {
 
             <button
               onClick={handleCalibrate}
-              disabled={camStatus !== "ready" || phase === "busy"}
+              disabled={camStatus !== "ready" || phase === "busy" || phase === "resetting"}
               className="w-full py-3.5 rounded-xl text-sm font-bold text-black disabled:opacity-40 flex items-center justify-center gap-2"
               style={{ background:"linear-gradient(135deg,#06b6d4,#3b82f6)" }}
             >
               {phase === "busy" && <Loader2 className="w-4 h-4 animate-spin" />}
               {phase === "busy" ? "Detecting…" : "Calibrate Station"}
             </button>
+
+            {hasCalibration && (
+              <button
+                onClick={handleReset}
+                disabled={phase === "resetting"}
+                className="w-full py-2 rounded-xl text-xs font-semibold disabled:opacity-40 flex items-center justify-center gap-1.5"
+                style={{ color:"#ef4444", background:"rgba(239,68,68,0.08)", border:"1px solid rgba(239,68,68,0.2)" }}
+              >
+                {phase === "resetting" && <Loader2 className="w-3 h-3 animate-spin" />}
+                {phase === "resetting" ? "Resetting…" : "Reset to Default (2.4 px/mm)"}
+              </button>
+            )}
           </motion.div>
         )}
 
@@ -253,6 +279,14 @@ export default function CalibratePage() {
               className="block w-full text-xs py-1" style={{ color:"#444" }}
             >
               Recalibrate
+            </button>
+            <button
+              onClick={handleReset}
+              disabled={phase === "resetting"}
+              className="block w-full text-xs py-1 disabled:opacity-40"
+              style={{ color:"#ef4444" }}
+            >
+              Reset to Default
             </button>
           </motion.div>
         )}

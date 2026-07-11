@@ -1,7 +1,6 @@
 import type { BBox, HeelMeasurement } from "./types";
 
-const MIN_COLUMNS = 3;
-const NOISE_SKIP  = 2;
+const NOISE_SKIP = 2;
 
 function median(arr: number[]): number {
   if (!arr.length) return 0;
@@ -67,7 +66,7 @@ function smooth(arr: Int32Array, radius: number): Float64Array {
 export function measureHeel(
   frame:     ImageData,
   heelBbox:  BBox,
-  blobMaxY:  number,  // actual bottom row of shoe blob from detection (pre-expandToSole)
+  blobMaxY:  number,
   pxPerMm:   number,
 ): HeelMeasurement | null {
   const { x: bx, y: by, w: bw, h: bh } = heelBbox;
@@ -77,49 +76,82 @@ export function measureHeel(
 
   // ── Step 1: Bottom of outsole ──────────────────────────────────────────────
   //
-  // Cap the bottom scan to blobMaxY — the actual shoe blob boundary from
-  // detection. heelBbox.h was extended to frameH by expandToSole, so without
-  // this cap we scan into the shoebox / table surface below the shoe.
+  // Problem: blob detection includes the dark table surface (dark shoes on dark
+  // table merge into one blob). blobMaxY is the bottom of the merged blob,
+  // which is the table, not the shoe outsole.
   //
-  // The outsole = last row with ≥20% dark pixel fill scanning top-down.
+  // Solution: build a per-row fill profile across the full heelBbox height,
+  // then find the outsole bottom as the LAST LOCAL PEAK before fill drops.
+  //
+  // Profile shape (top → bottom):
+  //   near-zero     → empty air above shoe
+  //   rising         → ankle/throat area
+  //   plateau        → heel body (shoe)
+  //   sharp drop     → outsole bottom edge / transition to surface
+  //   rises again    → table/surface pixels  ← DO NOT INCLUDE
+  //
+  // We find the outsole bottom by scanning upward from blobMaxY and stopping
+  // at the first row where: (a) fill is >= shoe-body fill level AND
+  // (b) the rows immediately above have significantly higher fill (peak).
+  //
+  // Concretely: build smoothed fill profile, scan bottom-up from blobMaxY,
+  // find where the profile transitions from low (table gap or transition) to
+  // the shoe body — that boundary row is the outsole bottom.
+  //
+  // If no table is present (light background), the profile drops to near-zero
+  // below the outsole and the scan correctly finds the lowest non-zero row.
 
-  // Convert blobMaxY to heelBbox-local row, cap to valid range
   const scanBottomRow = Math.min(bh - 1 - NOISE_SKIP, blobMaxY - by);
 
-  // Find the last row (scanning top-down) with fill >= 20% of bbox width.
-  // "Last" = closest to the ground = bottom of the outsole.
-  const fillThreshold = Math.max(2, Math.round(bw * 0.20));
-  let soleRow = -1;
-  for (let ry = scanBottomRow; ry >= NOISE_SKIP; ry--) {
+  // Build per-row fill profile for the full heelBbox
+  const fillProfile = new Int32Array(bh);
+  for (let ry = 0; ry < bh; ry++) {
     let count = 0;
     for (let rx = 0; rx < bw; rx++) {
       if (gray[ry * bw + rx] <= darkT) count++;
     }
-    if (count >= fillThreshold) { soleRow = ry; break; }
+    fillProfile[ry] = count;
+  }
+  const smoothedFill = smooth(fillProfile, 4);
+
+  // Find the shoe body's characteristic fill level = median of the middle 40%
+  // of the heelBbox (where the heel body rows are most reliably sampled)
+  const midStart = Math.floor(bh * 0.20);
+  const midEnd   = Math.floor(bh * 0.60);
+  const midFills: number[] = [];
+  for (let ry = midStart; ry <= midEnd; ry++) midFills.push(smoothedFill[ry]);
+  const shoeBodyFill = median(midFills.map(Math.round));
+
+  // Minimum threshold to count as "shoe pixel row" = 25% of shoe body fill
+  const soleThresh = Math.max(2, shoeBodyFill * 0.25);
+
+  // Scan upward from blobMaxY. Find the lowest row that:
+  //   1. Has fill >= soleThresh (is part of the shoe, not empty air)
+  //   2. Is followed above by at least 3 consecutive rows also above threshold
+  //      (prevents landing on a table-edge noise row)
+  let soleRow = -1;
+  for (let ry = scanBottomRow; ry >= NOISE_SKIP + 3; ry--) {
+    if (smoothedFill[ry] >= soleThresh) {
+      // Check that rows above are also shoe rows (not a noise spike)
+      let consecutiveAbove = 0;
+      for (let k = 1; k <= 4; k++) {
+        if (ry - k >= 0 && smoothedFill[ry - k] >= soleThresh) consecutiveAbove++;
+      }
+      if (consecutiveAbove >= 3) { soleRow = ry; break; }
+    }
   }
 
-  // Fallback: per-column bottom scan capped to blob bottom
+  // Fallback: lowest row with any dark pixels, capped to blobMaxY
   if (soleRow < 0) {
-    const soleRows: number[] = [];
-    for (let rx = 0; rx < bw; rx++) {
-      for (let ry = scanBottomRow; ry >= NOISE_SKIP; ry--) {
-        if (gray[ry * bw + rx] <= darkT) { soleRows.push(by + ry); break; }
-      }
+    for (let ry = scanBottomRow; ry >= NOISE_SKIP; ry--) {
+      if (fillProfile[ry] >= 2) { soleRow = ry; break; }
     }
-    if (soleRows.length < MIN_COLUMNS) return null;
-    const topY = computeTopY(gray, bw, bh, darkT, by, NOISE_SKIP);
-    if (topY === null) return null;
-    return buildResult(Math.round(median(soleRows)), heelBbox, pxPerMm, topY);
   }
+  if (soleRow < 0) return null;
 
   const medBottomY = by + soleRow;
 
   // ── Step 2: Heel collar top ────────────────────────────────────────────────
-  //
-  // Row-width profile from shoeTopRow downward. The collar rim is the first
-  // row that crosses 70% of the peak width in the upper half of the shoe body.
-  // This catches the transition from narrow ankle area → full heel body width.
-
   const topY = computeTopY(gray, bw, bh, darkT, by, NOISE_SKIP);
   if (topY === null) return null;
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { Camera, Loader2, AlertTriangle, ArrowLeft } from "lucide-react";
@@ -12,15 +12,16 @@ import { useScanStore } from "@/store/scan";
 import type { ScanResult } from "@/lib/cv/types";
 
 const STATION_ID    = "station-1";
-const FALLBACK_PXMM = 3.5;
+const FALLBACK_PXMM = 2.4;
 
 export default function ScanPage() {
   const router = useRouter();
   const { videoRef, status: camStatus, error: camError } = useCamera();
   const { setCaptured, setConfig } = useScanStore();
 
-  const [processing, setProcessing] = useState(false);
-  const [errMsg,     setErrMsg]     = useState<string | null>(null);
+  const [processing,    setProcessing]    = useState(false);
+  const [errMsg,        setErrMsg]        = useState<string | null>(null);
+  const [isCalibrated,  setIsCalibrated]  = useState<boolean | null>(null);
   const calibLoadedRef = useRef(false);
   const pxPerMmRef     = useRef<number>(FALLBACK_PXMM);
 
@@ -28,10 +29,13 @@ export default function ScanPage() {
     if (calibLoadedRef.current) return;
     calibLoadedRef.current = true;
     const local = getLocalCalibration();
-    if (local) { pxPerMmRef.current = local.pxPerMm; return; }
+    if (local) { pxPerMmRef.current = local.pxPerMm; setIsCalibrated(true); return; }
     const remote = await loadCalibration(STATION_ID);
-    if (remote) pxPerMmRef.current = remote.pxPerMm;
+    if (remote) { pxPerMmRef.current = remote.pxPerMm; setIsCalibrated(true); }
+    else { setIsCalibrated(false); }
   }, []);
+
+  useEffect(() => { loadCal(); }, [loadCal]);
 
   const handleCapture = useCallback(async () => {
     const video = videoRef.current;
@@ -146,6 +150,30 @@ export default function ScanPage() {
             </p>
           </div>
         </div>
+
+        {/* Calibration warning — shown when no calibration saved */}
+        {isCalibrated === false && (
+          <div
+            className="pointer-events-auto mx-4 mt-1 rounded-xl px-3 py-2 flex items-center gap-2"
+            style={{
+              background: "rgba(245,158,11,0.18)",
+              border: "1px solid rgba(245,158,11,0.45)",
+              backdropFilter: "blur(8px)",
+            }}
+          >
+            <AlertTriangle className="w-4 h-4 flex-shrink-0" style={{ color: "#f59e0b" }} />
+            <p className="text-xs flex-1" style={{ color: "#fcd34d" }}>
+              Station not calibrated — mm values may be inaccurate.
+            </p>
+            <button
+              onClick={() => router.push("/admin/calibrate")}
+              className="text-xs font-bold flex-shrink-0"
+              style={{ color: "#f59e0b" }}
+            >
+              Fix
+            </button>
+          </div>
+        )}
 
         {/* Framing guides — only when camera ready and not processing */}
         {camStatus === "ready" && !processing && (

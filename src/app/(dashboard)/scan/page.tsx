@@ -150,12 +150,13 @@ export default function ScanPage() {
         {/* Framing guides — only when camera ready and not processing */}
         {camStatus === "ready" && !processing && (
           <>
-            {/* Corner brackets */}
+            {/* Corner brackets — positioned where shoes appear when phone
+                is held upright at ~50cm from shoes on a surface */}
             {([
-              { pos: { top: "20%",    left:  "6%" }, t:true,  l:true,  r:false, b:false },
-              { pos: { top: "20%",    right: "6%" }, t:true,  l:false, r:true,  b:false },
-              { pos: { bottom: "28%", left:  "6%" }, t:false, l:true,  r:false, b:true  },
-              { pos: { bottom: "28%", right: "6%" }, t:false, l:false, r:true,  b:true  },
+              { pos: { top: "52%",    left:  "4%" }, t:true,  l:true,  r:false, b:false },
+              { pos: { top: "52%",    right: "4%" }, t:true,  l:false, r:true,  b:false },
+              { pos: { bottom: "14%", left:  "4%" }, t:false, l:true,  r:false, b:true  },
+              { pos: { bottom: "14%", right: "4%" }, t:false, l:false, r:true,  b:true  },
             ]).map(({ pos, t, l, r, b }, i) => (
               <div
                 key={i}
@@ -178,18 +179,18 @@ export default function ScanPage() {
               className="absolute"
               style={{
                 left: "50%",
-                top: "20%",
-                bottom: "28%",
+                top: "52%",
+                bottom: "14%",
                 width: "1px",
                 transform: "translateX(-0.5px)",
                 background: "repeating-linear-gradient(to bottom, rgba(6,182,212,0.5) 0px, rgba(6,182,212,0.5) 6px, transparent 6px, transparent 12px)",
               }}
             />
 
-            {/* Instruction label */}
+            {/* Instruction label — sits just above the bracket zone */}
             <div
               className="absolute inset-x-0 flex justify-center"
-              style={{ bottom: "calc(28% + 16px)" }}
+              style={{ top: "calc(52% - 36px)" }}
             >
               <span
                 className="px-3 py-1.5 rounded-full text-xs font-semibold"
@@ -200,7 +201,7 @@ export default function ScanPage() {
                   border: "1px solid rgba(255,255,255,0.1)",
                 }}
               >
-                Place both shoes with heels facing each other
+                Align both shoe heels inside the brackets
               </span>
             </div>
           </>
